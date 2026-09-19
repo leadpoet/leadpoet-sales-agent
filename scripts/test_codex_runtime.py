@@ -224,13 +224,19 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(options['cost_stop'](), 'budget_exhausted')
             receipt.finish(1)
             return 1
-        with patch('confirmed_leads.update', return_value=None) as update:
+        partial = {'exported': True, 'partial': True, 'delivery_allowed': False,
+                   'path': str(self.root / 'leads-partial.xlsx')}
+        with patch('confirmed_leads.update', return_value=None) as update, \
+                patch('research_tools.ResearchTools.export_partial', return_value=partial) as export:
             code, execute = self.run_supervisor(worker)
         self.assertEqual((code, execute.call_count), (1, 1))
         update.assert_called_once_with(self.path.resolve())
         saved = json.loads((self.root / 'worker-status.json').read_text())
         self.assertEqual(saved['reason'], 'budget_exhausted')
         self.assertEqual(saved['partial_output'], str(self.root.resolve() / 'leads.json'))
+        export.assert_called_once_with()
+        self.assertEqual(saved['partial_export'], partial)
+        self.assertFalse(saved['delivery_allowed'])
         stopped = json.loads(self.path.read_text())
         self.assertEqual(stopped['stop_reason'], 'budget_exhausted')
         self.assertTrue(stopped['stop_audit']['frontier_complete'])

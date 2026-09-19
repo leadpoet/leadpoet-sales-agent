@@ -412,6 +412,7 @@ class LocalHost:
             return {'status': 'stopped', 'delivery_allowed': False,
                 'reason': reason, 'run_file': str(run_file), 'stop_validation': audit,
                 'partial_output': str(run_file.parent / 'leads.json'),
+                'partial_export': self.export_partial(run_file, env),
                 'run_cost_report': str(save_report(request_file.parent))}
         return None
 
