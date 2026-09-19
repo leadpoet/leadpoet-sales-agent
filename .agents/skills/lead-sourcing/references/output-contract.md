@@ -1730,6 +1730,11 @@ The confirmation packet is the company QA pass: check every included contact,
 company/contact geography, spelling/grammar/capitalization, contradictions, missing
 required values, duplicates, placeholders, truncation and formatting artifacts.
 Signals and Intent Details must describe the same supported facts and timing.
+Check required numeric claims against the source's actual entity, metric,
+currency/units and time period; network or group totals do not establish a
+company-specific threshold. Keep an unsupported required metric unresolved,
+preserving verified contacts; omit an unsupported optional number without
+disqualifying the company.
 Repair actual errors before confirming; trim spaces and avoid em dashes. The exporter
 also normalizes em dashes and trailing spaces in display text without changing raw
 evidence, receipt-owned identities or source URLs. Optional gaps do not reject a lead;

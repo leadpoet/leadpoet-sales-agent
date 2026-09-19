@@ -400,8 +400,13 @@ LLM source review, not a separate rule engine:
 - **Metrics:** increased loss totals can reflect catastrophe frequency or exposure,
   not claims-cost inflation. Premium inflation is a different metric. A subsidiary's
   event only qualifies when it meets the request's entity/geography relationship.
-  Compare the actual metric, entity and time period with the selected requirement;
-  leave unsupported required signals unknown before buyer enrichment.
+  For every numeric company threshold, match the metric, entity, currency/units
+  and time period. Member-network sales, customer transaction volume and parent/group
+  revenue do not establish the target company's own revenue without evidence of
+  the requested scope. Keep a missing company-specific number unknown, not below
+  threshold. Apply this review to required company attributes as well as signals
+  before buyer enrichment; preserve verified contacts if a later correction holds
+  the account. Optional numbers need no extra qualification check.
 - **Repeated hiring:** one posting copied by several aggregators is one
   observation. Repeated-vacancy claims need distinct, dated observations.
 - **Geography:** an ambiguous aggregator location does not establish a company
