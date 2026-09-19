@@ -2689,6 +2689,31 @@ class ResearchToolTests(unittest.TestCase):
                 self.assertIsNone(billing.free_call_evidence(self.path, rid, call))
         self.assertIsNone(budget.load_ledger(self.path)["calls"][rid]["actual_credits"])
 
+    def test_nested_empty_failure_cannot_settle_from_a_free_catalog(self):
+        import billing_reconciliation as billing
+        self.provider.rate = 0
+        self.provider.raw = {"status": "completed", "job_id": "nested-error",
+            "toolResponse": {"rawV2": {"results": [], "error": "provider unavailable"}}}
+        self.tools.execute = self.unbilled_provider
+        self.start(max_usd=.75)
+        outcome = self.lookup(check(tool="contextdev_post_web_search", inputs={"query": "Fixture"}))["lookups"][0]
+        self.assertEqual(outcome["status"], "provider_error")
+        rid = outcome["route"]
+        receipt = self.path.parent / "receipts" / (rid + ".json")
+        before, calls = receipt.read_bytes(), len(self.provider.requests)
+        initial = budget.load_ledger(self.path)
+        call = initial["calls"][rid]
+        self.assertEqual(call["state"], "pending_billing")
+        self.assertIsNone(call["actual_credits"])
+        self.assertNotIn("free_evidence", call)
+        self.assertIsNone(billing.free_call_evidence(self.path, rid, call))
+        billing.reconcile(self.path, fetch=lambda: {"recent": {"entries": []}})
+        final = budget.load_ledger(self.path)
+        self.assertIsNone(final["calls"][rid]["actual_credits"])
+        self.assertEqual(final["usd_limit"], initial["usd_limit"])
+        self.assertEqual((receipt.read_bytes(), len(self.provider.requests)), (before, calls))
+        self.assertEqual(budget.audit_ledger(self.path, json.loads(self.path.read_text())), [])
+
     def test_paid_variable_conditional_or_failed_calls_cannot_use_free_contract_settlement(self):
         for label, pricing, success in [
             ("paid", {"unit": "call", "creditsPerUnit": .1}, True),

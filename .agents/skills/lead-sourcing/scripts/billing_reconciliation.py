@@ -264,6 +264,15 @@ def billing_issue(receipt, proof, contract=None):
     if _free_per_call(contract):
         return None
     rows = receipt.get("results", [])
+    # Prospeo repeat enrichments can return data for free. Its documented flag
+    # explains Deepline's zero-unit miss, but never replaces the matched bill.
+    # https://prospeo.io/api-docs/enrich-company (also enrich-person)
+    if (receipt.get("provider") == "deepline" and receipt.get("status") == "ok"
+            and receipt.get("tool") in {"prospeo_enrich_company", "prospeo_enrich_person"}
+            and isinstance(rows, list) and rows and all(
+                isinstance(row, dict) and row.get("error") is False
+                and row.get("free_enrichment") is True for row in rows)):
+        return None
     # Share the adapter's explicit no-address interpretation. Only matched
     # zero-charge billing can settle this; an empty response alone never does.
     if deepline.empty_email_finder_records(receipt.get("tool"), rows):

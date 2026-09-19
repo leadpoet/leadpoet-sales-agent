@@ -560,6 +560,11 @@ def normalize_evidence(
     # Result lists bypass the envelope parser's single-document path.
     captured = _scraped_document(row)
     source: Dict[str, Any] = captured or (row if isinstance(row, dict) else {"value": row})
+    pdl_company = tool == "peopledatalabs_company_search"
+    if pdl_company:
+        # PDL company search uses headline for its tagline and type for ownership.
+        entity_type = "company"
+        source = dict(source, company_name=source.get("name"))
     if tool == "crustdata_v3_job_search" and isinstance(source.get("company"), dict):
         company = source["company"]
         info = company.get("basic_info") if isinstance(company.get("basic_info"), dict) else {}
@@ -635,7 +640,7 @@ def normalize_evidence(
     if domain_value in (None, "") and nested_company_identity:
         domain_value = _first(link, "domain", "website")
     result["domain"] = None if _is_linkedin_url(domain_value) else _domain(domain_value)
-    result["signal"] = _text(_first(source, "signal", "signal_type", "intent", "type", "category"))
+    result["signal"] = None if pdl_company else _text(_first(source, "signal", "signal_type", "intent", "type", "category"))
     result["evidence_url"] = _text(_first(source, "evidence_url", "source_url", "url", "link", "source"))
     result["evidence_date"] = _text(_first(source, "evidence_date", "date", "published_at", "published", "timestamp"))
     result["evidence_text"] = _text(_first(source, "evidence_text", "text", "snippet", "description", "evidence", "content"))
@@ -1848,6 +1853,31 @@ def _native_result_envelope(parsed, tool):
     return dict(parsed, toolResponse={"rawV2": {"results": rows}})
 
 
+def _empty_result_failure(parsed):
+    """Read explicit envelope failures after extraction found no result rows.
+
+    Follow only wrapper dictionaries, never lists or arbitrary row fields.
+    """
+    pending = [parsed] if isinstance(parsed, dict) else []
+    while pending:
+        envelope = pending.pop()
+        # Some providers encode a canonical miss as a boolean error marker.
+        # Accept only that exact shape; additional failure fields still apply.
+        if (set(envelope) == {"error", "error_code", "status"}
+                and envelope["error"] is True and envelope["error_code"] == "NO_MATCH"
+                and envelope["status"] in ("no_result", "no_results")):
+            continue
+        status = _structured_status(envelope)
+        if (status in _FAILURE_STATUSES or envelope.get("success") is False
+                or envelope.get("ok") is False):
+            error = _envelope_error(envelope)
+            return (status if status in _FAILURE_STATUSES else "provider_error"), error
+        pending.extend(envelope[key] for key in (
+            "toolResponse", "tool_response", "rawV2", "raw", "result", "response", "data", "output"
+        ) if isinstance(envelope.get(key), dict))
+    return None, None
+
+
 def _execute_output(
     parsed: Any,
     tool: str,
@@ -1895,7 +1925,8 @@ def _execute_output(
             and _envelope_error(records[0]) is not None):
         company_failure = records[0]
         selected_status = _structured_status(company_failure)
-    statuses = (outer_status, selected_status)
+    empty_status, empty_error = _empty_result_failure(parsed) if not records else (None, None)
+    statuses = (empty_status, outer_status, selected_status)
     status = next(
         (candidate for candidate in statuses if candidate in _FAILURE_STATUSES),
         "partial" if "partial" in statuses else selected_status or outer_status,
@@ -1903,8 +1934,8 @@ def _execute_output(
     if outer_status == "no_results":
         # A canonical empty outcome need not contain a row-shaped payload.
         nested = parsed.get("toolResponse", parsed.get("tool_response", {}))
-        nested_status = _envelope_status(nested)
-        error = _envelope_error(parsed)
+        nested_status = empty_status or _envelope_status(nested)
+        error = empty_error or _envelope_error(parsed)
         # Email finders echo the searched name/domain and MX metadata even
         # when no address was found. These are not contradictory positive rows.
         empty_finder = empty_email_finder_records(tool, records)
@@ -1933,7 +1964,7 @@ def _execute_output(
             "results": [],
             "evidence": [],
         }
-        error = _envelope_error(parsed)
+        error = empty_error or _envelope_error(parsed)
         if error:
             body["error"] = error
         if entity_type:
@@ -1964,7 +1995,7 @@ def _execute_output(
         "evidence": evidence,
     }
     if final_status in _FAILURE_STATUSES:
-        error = _envelope_error(parsed) or (
+        error = empty_error or _envelope_error(parsed) or (
             _envelope_error(envelope) if structured else None
         ) or _envelope_error(company_failure)
         if error:
@@ -2061,29 +2092,71 @@ def _completed_execute_output(parsed: Any, tool: str) -> Any:
     """Interpret observed raw API results without changing the captured receipt.
 
     The CLI and a hosted transport can return the same completed-job envelope.
-    Keep generated answers separate from cited evidence and only classify the
-    exact observed empty-company outcomes. Other shapes use the normal parser.
+    Keep generated answers separate from cited evidence and recognize only
+    validated provider-specific result shapes. Other shapes use the normal parser.
     """
     if (not isinstance(parsed, dict)
             or parsed.get("status") != "completed"
             or not isinstance(parsed.get("job_id"), str) or not parsed["job_id"].strip()):
         return parsed
     result, response = parsed.get("result"), parsed.get("toolResponse")
-    if (not set(parsed) - {"billing", "job_id", "result", "status"}
+    if (not set(parsed) - {"billing", "job_id", "request_id", "requestId", "result", "status"}
             and isinstance(result, dict) and set(result) == {"data"}):
         data = result["data"]
-    elif (tool in {"harvestapi_get_company", "ai_ark_company_search", "serper_google_search", "limadata_search_web"}
-            and not set(parsed) - {"billing", "job_id", "toolResponse", "status"}
+    elif (tool in {"harvestapi_get_company", "ai_ark_company_search", "serper_google_search", "limadata_search_web",
+                   "builtwith_domain_lookup", "scrapecreators_instagram_profile"}
+            and not set(parsed) - {"billing", "job_id", "request_id", "requestId", "toolResponse", "status"}
             and isinstance(response, dict) and not set(response) - {"rawV2", "view"}
             and response.get("view", "rawV2") in {"rawV2", "data"}):
-        # The CLI wraps the same company outcome differently from the API.
+        # The CLI wraps the same provider result differently from the API.
         data = response.get("rawV2")
     else:
         return parsed
     if not isinstance(data, dict):
         return parsed
     status, rows = None, []
-    if (tool == "ai_ark_company_search" and isinstance(data.get("content"), list)
+    if (tool == "builtwith_domain_lookup" and set(data) == {"data", "meta"}
+            and isinstance(data["meta"], dict) and data["meta"].get("status") == 200
+            and isinstance(data["data"], dict) and set(data["data"]) == {"Results", "Errors"}
+            and data["data"]["Errors"] == [] and isinstance(data["data"]["Results"], list)):
+        for row in data["data"]["Results"]:
+            if (not isinstance(row, dict) or not isinstance(row.get("Lookup"), str) or not row["Lookup"].strip()
+                    or not isinstance(row.get("Result"), dict) or not isinstance(row["Result"].get("Paths"), list)):
+                return parsed
+            for path in row["Result"]["Paths"]:
+                if (not isinstance(path, dict) or not isinstance(path.get("Technologies"), list)
+                        or any(not isinstance(tech, dict) for tech in path["Technologies"])):
+                    return parsed
+            try:
+                lookup = row["Lookup"].strip()
+                address = urlparse(lookup if "://" in lookup else "https://" + lookup)
+                if (address.scheme not in {"http", "https"} or not address.hostname
+                        or address.username is not None or any(char.isspace() for char in lookup)
+                        or address.port is not None):
+                    return parsed
+                domain = _domain(lookup)
+                if (len(domain) > 253 or not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain)
+                        or any(len(label) > 63 or label.startswith("-") or label.endswith("-")
+                               for label in domain.split("."))):
+                    return parsed
+            except ValueError:
+                return parsed
+            meta = row.get("Meta") if isinstance(row.get("Meta"), dict) else {}
+            rows.append(dict(row, domain=domain, company_name=meta.get("CompanyName")))
+        status = "ok" if rows else "no_results"
+    elif (tool == "scrapecreators_instagram_profile" and set(data) == {"success", "data"}
+            and data["success"] is True and isinstance(data["data"], dict) and set(data["data"]) == {"user"}):
+        user = data["data"]["user"]
+        if (not isinstance(user, dict) or not isinstance(user.get("id"), str) or not user["id"].strip()
+                or not isinstance(user.get("username"), str) or not re.fullmatch(r"[A-Za-z0-9._]{1,30}", user["username"])
+                or (user.get("biography") is not None and not isinstance(user["biography"], str))):
+            return parsed
+        # A social account can represent an organization. Keep its full_name
+        # inside the profile so it does not become a purported business contact.
+        rows = [{"instagram_profile": user, "evidence_url": "https://www.instagram.com/" + user["username"] + "/",
+                 "evidence_text": user.get("biography") or ""}]
+        status = "ok"
+    elif (tool == "ai_ark_company_search" and isinstance(data.get("content"), list)
             and type(data.get("numberOfElements")) is int
             and data["numberOfElements"] == len(data["content"])
             and all(isinstance(row, dict) and row.get("id") and isinstance(row.get("summary"), dict)
@@ -2157,7 +2230,7 @@ def _completed_execute_output(parsed: Any, tool: str) -> Any:
     if status is None:
         return parsed
     return {"status": status, "results": rows,
-            **{key: parsed[key] for key in ("billing", "job_id") if key in parsed}}
+            **{key: parsed[key] for key in ("billing", "job_id", "request_id", "requestId") if key in parsed}}
 
 
 def _firecrawl_batch_output(parsed, tool):

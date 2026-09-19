@@ -271,6 +271,72 @@ class BillingReconciliationTests(unittest.TestCase):
         self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
         billing.reconcile(self.path, refresh=True, fetch=lambda: self.fail('Already settled'))
 
+    def prospeo_free_enrichment(self, tool='prospeo_enrich_company'):
+        # Observed successful repeat enrichment: Prospeo explicitly says free,
+        # while Deepline's final zero-charge usage row labels the outcome a miss.
+        self.receipt.update(tool=tool, status='ok', results=[{
+            'error': False, 'free_enrichment': True, 'company': 'Example'}])
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        doc = budget.read_object(self.path)
+        doc['routes'][0]['tool'] = tool
+        self.path.write_text(json.dumps(doc))
+        self.row.update(provider='prospeo', operation=tool, credits=0, delta=0,
+                        charge_state='free', outcome='miss', provider_units=0,
+                        pricing_basis='result', reason='operation_attempt')
+
+    def test_prospeo_free_enrichment_requires_exact_final_billing(self):
+        for actual_cost in (False, True):
+            for tool in ('prospeo_enrich_company', 'prospeo_enrich_person'):
+                with self.subTest(actual_cost=actual_cost, tool=tool):
+                    self.setUp(actual_cost=actual_cost)
+                    self.prospeo_free_enrichment(tool)
+                    before = self.receipt_path.read_bytes()
+                    initial = budget.load_ledger(self.path)
+                    billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': []}})
+                    self.assertIsNone(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'])
+                    result = billing.reconcile(self.path, refresh=True,
+                        fetch=lambda: {'recent': {'entries': [self.row]}})
+                    self.assertEqual(result['unmatched'], [])
+                    ledger = budget.load_ledger(self.path)
+                    self.assertEqual(ledger['calls']['call-1']['actual_credits'], '0')
+                    self.assertIsNone(ledger['calls']['call-1']['billing_issue'])
+                    self.assertEqual({k: v for k, v in initial.items() if k != 'calls'},
+                                     {k: v for k, v in ledger.items() if k != 'calls'})
+                    self.assertEqual(self.receipt_path.read_bytes(), before)
+                    self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+                    billing.reconcile(self.path, refresh=True, fetch=lambda: self.fail('Already settled'))
+
+    def test_prospeo_free_flag_does_not_relax_billing_identity_or_finality(self):
+        self.prospeo_free_enrichment()
+        for change in ({'request_id': 'other'}, {'provider': 'other'}, {'operation': 'other'},
+                       {'charge_state': 'held'}, {'status': 'pending'}, {'credits': None},
+                       {'credits': True}, {'delta': None}, {'credits': .5, 'delta': -.5},
+                       {'metadata': {'chargeGroupIds': ['request-1', 'other']}}):
+            with self.subTest(change=change):
+                self.assertIsNone(billing.matching_charge(self.receipt, [dict(self.row, **change)]))
+        self.assertIsNone(billing.matching_charge(self.receipt, [self.row, self.row]))
+
+    def test_only_successful_explicit_prospeo_free_enrichments_avoid_contradiction(self):
+        self.prospeo_free_enrichment()
+        record = self.receipt['results'][0]
+        variants = [dict(self.receipt, **change) for change in (
+            {'tool': 'prospeo_search_company'}, {'tool': 'fixture_enrich_company'},
+            {'provider': 'other'}, {'status': 'partial'}, {'status': 'provider_error'})]
+        variants += [dict(self.receipt, results=[dict(record, **change)]) for change in (
+            {'free_enrichment': False}, {'free_enrichment': 'true'}, {'free_enrichment': 1},
+            {'free_enrichment': None}, {'error': True}, {'error': 0}, {'error': None})]
+        variants.append(dict(self.receipt, results=[record, dict(record, free_enrichment=False)]))
+        for receipt in variants:
+            with self.subTest(receipt=receipt):
+                self.assertIsNotNone(billing.billing_issue(receipt, self.row))
+
+    def test_prospeo_free_flag_never_overrides_a_positive_posted_charge(self):
+        self.prospeo_free_enrichment()
+        paid = dict(self.row, charge_state='posted', credits=.55, delta=-.55, outcome='hit', provider_units=1)
+        billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': [paid]}})
+        self.assertEqual(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'], '0.55')
+        self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+
     def test_missing_or_invalid_free_charge_never_becomes_zero(self):
         catalog = self.prospector(0)
         for change in ({'credits': None}, {'credits': .1, 'delta': -.1}, {'charge_state': 'pending'},
