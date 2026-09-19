@@ -39,6 +39,20 @@ class SourceExcerptTests(unittest.TestCase):
         self.assertTrue(excerpt.endswith('[Excerpt; full text in saved receipt.]'))
         self.assertNotIn('**', excerpt)
 
+    def test_linked_images_keep_labels_and_urls_without_broken_markup(self):
+        excerpt = source_excerpt('[![Factory](https://example.com/photo.png)](https://example.com/about)\n![](https://example.com/logo.png)')
+        self.assertIn('Factory (https://example.com/photo.png) (https://example.com/about)', excerpt)
+        self.assertIn('Image (https://example.com/logo.png)', excerpt)
+        self.assertNotIn('![', excerpt)
+        self.assertNotIn('](', excerpt)
+
+    def test_short_lines_cannot_hide_the_excerpt_disclosure_below_excel_row_limit(self):
+        text = '\n\n'.join(f'Supported source statement {i}.' for i in range(80))
+        excerpt = source_excerpt(text)
+        self.assertTrue(excerpt.endswith('[Excerpt; full text in saved receipt.]'))
+        lines = sum(max(1, (len(line) + 73) // 74) for line in excerpt.split('\n'))
+        self.assertLessEqual(lines, 25)
+
 
 if __name__ == '__main__':
     unittest.main()

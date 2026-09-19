@@ -461,7 +461,7 @@ export async function exportXlsx(document, destination, options = {}) {
   }
 
   const partialStatus = options.partial ? [
-    ["Status", "Partial — research incomplete"],
+    ["Status", "Partial: research incomplete"],
     ["Confirmed leads", validated.confirmed_count],
     ["Requested leads", validated.target_count],
     ["Remaining", validated.shortfall],
