@@ -38,6 +38,39 @@ class RawDeeplineResultsTests(unittest.TestCase):
             self.request(tool), {"body": raw, "exit_code": 0, **transport})
         return result
 
+    def test_datagma_people_are_recovered_once_with_profile_urls_and_billing(self):
+        person = {'name': 'Ada Example', 'firstName': 'Ada', 'lastName': 'Example',
+                  'jobTitle': 'President', 'company': 'Example Engineering',
+                  'linkedInUrl': 'https://www.linkedin.com/in/ada-example',
+                  'location': 'Birmingham, Alabama, United States'}
+        raw = cli_completed({'persons': [person], 'employees': [dict(person, firstname='Ada')]})
+        before = copy.deepcopy(raw)
+        result = self.normalize('datagma_find_people', raw)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(len(result['results']), 1)
+        row = result['results'][0]
+        self.assertEqual(row['contact_name'], 'Ada Example')
+        self.assertEqual(row['contact_title'], 'President')
+        self.assertEqual(row['contact_url'], person['linkedInUrl'])
+        self.assertEqual(row['company'], person['company'])
+        self.assertEqual(row['content_kind'], 'unverified')
+        self.assertEqual(result['billing'], raw['billing'])
+        self.assertEqual(result['job_id'], raw['job_id'])
+        self.assertEqual(raw, before)
+
+    def test_native_people_lists_distinguish_empty_malformed_and_failed_responses(self):
+        for tool, key in (('datagma_find_people', 'persons'), ('lusha_search_contacts', 'contacts')):
+            with self.subTest(tool=tool):
+                self.assertEqual(self.normalize(tool, cli_completed({key: []}))['status'], 'no_results')
+                for payload in ({}, {key: None}, {key: 'bad'}, {key: ['bad']},
+                                {key: [], 'success': False}, {key: [], 'status': 'failed'}):
+                    result = self.normalize(tool, cli_completed(payload))
+                    self.assertNotIn(result['status'], {'ok', 'no_results'})
+                    self.assertFalse(result['results'])
+                raw = cli_completed({key: []})
+                raw['status'] = 'failed'
+                self.assertEqual(self.normalize(tool, raw)['status'], 'provider_error')
+
     def test_crustdata_job_lists_preserve_company_context_without_inventing_event_dates(self):
         job = {"company": {"basic_info": {"name": "Example Manufacturing", "primary_domain": "example.test"},
                            "headcount": {"range": "51-200", "total": 72},

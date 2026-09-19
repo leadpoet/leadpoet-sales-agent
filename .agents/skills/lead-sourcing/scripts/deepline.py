@@ -1739,12 +1739,14 @@ def empty_email_finder_records(tool, records):
 
 def _native_result_envelope(parsed, tool):
     """Unwrap observed native outputs; retain IDs/billing and the raw receipt."""
-    if (tool not in {"company_titles", "search_contact", "forager_person_role_search", "crustdata_people_search", "crustdata_v3_job_search", "firecrawl_search", "fullenrich_people_search"}
+    lists = {"crustdata_v3_job_search": "job_listings", "datagma_find_people": "persons",
+             "lusha_search_contacts": "contacts"}
+    if (tool not in {"company_titles", "search_contact", "forager_person_role_search", "crustdata_people_search", "firecrawl_search", "fullenrich_people_search", *lists}
             or not isinstance(parsed, dict)
             or parsed.get("status") != "completed" or _structured_status(parsed) != "ok"):
         return parsed
     raw = parsed.get("toolResponse", {}).get("rawV2") if isinstance(parsed.get("toolResponse"), dict) else None
-    if tool == "crustdata_v3_job_search":
+    if tool in lists:
         for part in (parsed, parsed.get("toolResponse"), raw):
             if not isinstance(part, dict):
                 continue
@@ -1752,9 +1754,13 @@ def _native_result_envelope(parsed, tool):
             if status in _FAILURE_STATUSES or part.get("success") is False or part.get("ok") is False:
                 return dict(parsed, status=status if status in _FAILURE_STATUSES else "provider_error",
                             error=_envelope_error(part), results=[])
-        rows = raw.get("job_listings") if isinstance(raw, dict) else None
+        rows = raw.get(lists[tool]) if isinstance(raw, dict) else None
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            return dict(parsed, status="schema_error", results=[], error="Expected Crustdata job_listings array of objects")
+            return dict(parsed, status="schema_error", results=[], error=f"Expected {tool} {lists[tool]} array of objects")
+        if tool == "datagma_find_people":
+            # persons and employees repeat the same people; use the canonical
+            # list once and preserve the provider's case-sensitive URL field.
+            rows = [dict(row, contact_url=row.get("linkedInUrl")) for row in rows]
         return dict(parsed, results=rows)
     if tool == "firecrawl_search":
         # Native search returns web/news lists without a CLI list preview.
