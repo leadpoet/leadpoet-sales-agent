@@ -426,7 +426,10 @@ class ArenaQuotaGuard:
                     return False
             elif provider["remaining"] <= 0:
                 self._finalization_closed = True
-                return False
+                # Let this real Codex request reach the Arena once. The broker
+                # rejects it before provider dispatch and records the quota stop.
+                # Closing first keeps retries local.
+                return True
             return True
 
 

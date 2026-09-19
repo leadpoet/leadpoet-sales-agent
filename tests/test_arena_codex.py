@@ -1524,7 +1524,7 @@ def test_quota_guard_uses_host_limit_and_reserves_finalization_headroom(monkeypa
         assert guard() is True
         used[0] += 1
     assert used[0] == openrouter_limit
-    assert guard() is False
+    assert guard() is True
     assert guard() is False
 
 
@@ -1551,6 +1551,7 @@ def test_finalization_can_finish_after_reference_and_packet_review_with_host_ret
     while used[0] < 200:
         assert guard() is True
         used[0] += 1
+    assert guard() is True
     assert guard() is False
 
 
