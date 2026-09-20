@@ -154,6 +154,8 @@ def linkedin_receipt_errors(document, run_file, *, fill_missing=False):
     if not isinstance(document, dict) or not isinstance(document.get("accepted", []), list):
         return ["results must be an object with an accepted array"]
     errors = []
+    from validate_run import ready_contact_indexes  # Imported here: validate_run imports this module.
+    request = document.get("request") if isinstance(document.get("request"), dict) else {}
     for index, row in enumerate(document.get("accepted", [])):
         if not isinstance(row, dict):
             continue
@@ -163,10 +165,16 @@ def linkedin_receipt_errors(document, run_file, *, fill_missing=False):
         contacts += [(f"{base}.backup_contacts[{i}]", c) for i, c in enumerate(backups if isinstance(backups, list) else [])]
         entities = [(f"{base}.company", row.get("company"), "company", "employee_range_evidence", ("employee_range",))]
         entities += [(p, c, "in", "location_evidence", ("country", "state", "city")) for p, c in contacts]
-        # Email work required this identity check before spending; a saved email keeps the same proof
-        # at delivery. Pending profiles without an email are outside the saved contact output.
-        for path, contact in contacts:
-            if isinstance(contact, dict) and contact.get("email") and isinstance(row.get("company"), dict):
+        # The contract asks every contact for a current role at its company, with or without contact data.
+        # Delivery rechecks each exported contact and each saved email against its recorded profile;
+        # unexported pending profiles stay outside it.
+        try:
+            exported = set(ready_contact_indexes(row, request))
+        except TypeError:
+            exported = set()  # The request contract reports malformed contact_fields; saved emails are still checked.
+        for position, (path, contact) in enumerate(contacts):
+            if (isinstance(contact, dict) and (contact.get("email") or position in exported)
+                    and isinstance(row.get("company"), dict)):
                 errors.extend(f"{path}: {error}" for error in
                               contact_verification_errors(document, run_file, row["company"], contact, roles=False))
         for path, entity, kind, evidence_field, fields in entities:

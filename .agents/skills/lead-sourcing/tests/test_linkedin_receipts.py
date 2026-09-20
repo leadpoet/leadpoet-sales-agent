@@ -268,6 +268,65 @@ class LinkedInReceiptTests(unittest.TestCase):
         broken["accepted"][0]["primary_contact"]["location_evidence"] = "not an object"
         self.assertIn("Verify the selected person's LinkedIn profile", " ".join(linkedin_receipt_errors(broken, self.path)))
 
+    def test_exported_contact_without_requested_email_still_needs_a_current_role_at_the_company(self):
+        # The request opts out of contact data, so no email gate ever ran for this exported contact.
+        self.doc["request"]["contact_fields"] = []
+        contact = self.doc["accepted"][0]["primary_contact"]
+        for key in ("email", "email_validation", "email_source"):
+            contact.pop(key, None)
+        self.doc["routes"] = [r for r in self.doc["routes"] if r.get("phase") != "email_validation"]
+        saved = {r["route_id"] for r in self.doc["routes"]}
+        frontier = self.doc["stop_audit"]["route_frontier"]
+        self.doc["stop_audit"]["route_frontier"] = [f for f in frontier if f["route_id"] in saved]
+        run_attempt.refresh(self.doc)
+        genuine = self.receipt_path().read_bytes()
+        node, modules = os.environ.get("TYCHE_WORKSPACE_NODE"), os.environ.get("TYCHE_WORKSPACE_NODE_MODULES")
+
+        def deliver(document, receipt=genuine):
+            self.receipt_path().write_bytes(receipt)
+            self.path.write_text(json.dumps(document))
+            code, result = self.strict_check()
+            rows = None
+            if node and modules:
+                workbook = self.path.parent / "leads.xlsx"
+                workbook.unlink(missing_ok=True)
+                exported = subprocess.run([node, str(EXPORTER_PATH), str(self.path), str(workbook),
+                    "--node-modules", modules], capture_output=True, text=True, timeout=90)
+                rows = len(read_first_sheet_rows(workbook)) - 1 if exported.returncode == 0 else 0
+            return code, " ".join(result["errors"]), rows
+
+        self.assertIn(deliver(self.doc), ((0, "", 1), (0, "", None)))  # A valid no-email contact stays deliverable.
+        elsewhere = json.loads(genuine)
+        elsewhere["provider_response"]["body"]["element"]["currentPositions"] = [{
+            "companyName": "Another Retailer", "companyLinkedinUrl": "https://www.linkedin.com/company/another-retailer",
+            "position": contact["current_title"], "current": True}]
+        for name, field, value, receipt, expected in (
+                ("name", "full_name", "Someone Else", genuine, "full_name must match"),
+                ("title", "current_title", "Previous Role", genuine, "current_title must match"),
+                ("employer", None, None, json.dumps(elsewhere).encode(), "current company")):
+            with self.subTest(name):
+                document = copy.deepcopy(self.doc)
+                if field:
+                    document["accepted"][0]["primary_contact"][field] = value
+                code, errors, rows = deliver(document, receipt)
+                self.assertEqual(code, 2)
+                self.assertIn(expected, errors)
+                self.assertIn(rows, (0, None))  # The saved workbook is never written for it.
+        # An extra profile that is not exported stays outside the check and does not disturb delivery.
+        pending = copy.deepcopy(self.doc)
+        extra = {k: v for k, v in contact.items() if k != "current_title"}
+        pending["accepted"][0]["backup_contacts"] = [dict(extra, full_name="Pending Person")]
+        self.assertIn(deliver(pending), ((0, "", 1), (0, "", None)))
+        # An exported backup without an email is checked like the primary.
+        backup = copy.deepcopy(self.doc)
+        backup["accepted"][0]["backup_contacts"] = [dict(contact, current_title="Previous Role")]
+        errors = " ".join(linkedin_receipt_errors(backup, self.path))
+        self.assertIn("backup_contacts[0]: current_title must match", errors)
+        # Malformed contact fields are the request contract's to report; this check must not raise.
+        malformed = copy.deepcopy(self.doc)
+        malformed["request"]["contact_fields"] = [["email"]]
+        self.assertEqual(linkedin_receipt_errors(malformed, self.path), [])
+
 
 if __name__ == "__main__":
     unittest.main()
