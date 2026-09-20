@@ -824,7 +824,7 @@ def test_projection_uses_explicit_email_source_separate_from_location_profile(la
 
 
 @pytest.mark.parametrize(("failure", "message"), [
-    ("missing", "explicit saved discovery source"),
+    ("malformed", "invalid explicit saved discovery source"),
     ("unsupported", "completed successful HarvestAPI response"),
     ("wrong_person", "exactly one matching LinkedIn entity"),
     ("email_absent", "email is absent from the selected provider profile"),
@@ -838,8 +838,8 @@ def test_projection_rejects_invalid_explicit_email_source(lab, monkeypatch, fail
     email_route = person["email_source"]["source"]["route_id"]
     monkeypatch.setattr(arena_output, "accepted_preflight", lambda *_args, **_kwargs: [])
 
-    if failure == "missing":
-        person.pop("email_source")
+    if failure == "malformed":
+        person["email_source"] = {}
     elif failure == "unsupported":
         person["email_source"]["source"]["tool"] = "zerobounce_validate"
     elif failure == "wrong_person":
@@ -873,6 +873,18 @@ def test_projection_rejects_invalid_explicit_email_source(lab, monkeypatch, fail
 
     with pytest.raises(ValueError, match=message):
         arena_output._project_companies(run_file, document, ICP, require_review=False)
+
+
+def test_projection_preserves_legacy_same_receipt_without_explicit_email_source(lab):
+    runtime.run(ICP)
+    run_file = lab.research[0].research.path
+    document = json.loads(run_file.read_text())
+    document["accepted"][0]["primary_contact"].pop("email_source")
+
+    rows = arena_output._project_companies(run_file, document, ICP, require_review=False)
+
+    assert rows[0]["contact"]["email_source"] == {
+        "provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": "profile-123"}
 
 
 @pytest.mark.parametrize(("remaining", "expected"), [
