@@ -562,12 +562,7 @@ class LabTools:
             return result
         return {**result, "status": "checkpoint_saved", "checkpoint_saved": True,
                 "arena_checkpoint": saved,
-                "next": (
-                    "Reviewed companies are saved. Continue research toward the original target. "
-                    "If fresh authoritative sourcing-cost guidance makes preserving this reviewed "
-                    "partial preferable, you may explicitly call tyche_finish with "
-                    "finish_reason=preserve_reviewed_partial; Arena scoring still decides eligibility."
-                )}
+                "next": "Reviewed companies are saved. Continue research toward the original target, then tyche_finish."}
 
     def _inspect_lab_tool(self, arguments):
         """Use native field/paging semantics with the exact served Arena contract."""
@@ -655,9 +650,7 @@ class LabTools:
                         if result.get("status") == "confirmed_leads_saved":
                             result["next"] = (
                                 "Confirmed leads are saved to /output/companies.json. Continue toward the original "
-                                "target. If fresh authoritative sourcing-cost guidance makes preserving this reviewed "
-                                "partial preferable, you may explicitly call tyche_finish with "
-                                "finish_reason=preserve_reviewed_partial; this is not an eligibility promise."
+                                "target; cost/time limits retain this partial list. Use tyche_finish to close a completed run."
                             )
                 if (reviewed_holds and result.get("status") != "needs_repair"
                         and self.research.environment.get("TYCHE_FINALIZATION_ONLY") == "1"):

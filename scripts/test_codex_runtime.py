@@ -370,13 +370,14 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(len(list((self.root / 'model-usage').glob('*.json'))), 4)
 
-    def test_two_consecutive_actual_worker_failures_with_only_metadata_changes_are_blocked(self):
+    def test_two_consecutive_worker_failures_stop_even_after_saved_progress(self):
         calls = 0
         def worker(command, cwd, env, receipt, **options):
             nonlocal calls
             calls += 1
             document = json.loads(self.path.read_text())
-            document.setdefault('summary', {})['last_worker_attempt'] = calls
+            document.setdefault('unresolved', []).append({
+                'company': {'domain': f'progress-{calls}.example'}, 'stage': 'contact'})
             self.path.write_text(json.dumps(document))
             receipt.finish(1)
             return 1
@@ -386,27 +387,6 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(status['reason'], 'repeated_worker_failure')
         self.assertFalse(status['delivery_allowed'])
 
-    def test_failed_exits_with_verified_saved_progress_continue_to_review_and_delivery(self):
-        calls = 0
-        def worker(command, cwd, env, receipt, **options):
-            nonlocal calls
-            calls += 1
-            if calls <= 2:
-                document = json.loads(self.path.read_text())
-                document.setdefault('unresolved', []).append({
-                    'company': {'domain': f'progress-{calls}.example'}, 'stage': 'contact'})
-                self.path.write_text(json.dumps(document))
-                if calls == 2:
-                    self.progress.return_value = {'stop': 'target_met', 'operational_block': None}
-                receipt.finish(1)
-                return 1
-            self.assertEqual(env['TYCHE_FINALIZATION_ONLY'], '1')
-            self.status.update(status='complete', delivery_allowed=True)
-            receipt.finish(0)
-            receipt.data['status'] = 'complete'
-            return 0
-        code, execute = self.run_supervisor(worker)
-        self.assertEqual((code, execute.call_count), (0, 3))
 
     def test_successful_exit_resets_consecutive_failure_counter(self):
         codes = iter([1, 0, 1, 0])

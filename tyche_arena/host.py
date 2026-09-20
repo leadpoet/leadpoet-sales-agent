@@ -461,10 +461,6 @@ def instructions():
         "Native tools adapt the shared sourcing workflow to this contract. Approved leads are "
         "checkpointed automatically; tyche_finish writes reviewed /output/companies.json in place "
         "of local workbook/preview artifacts. Final prose is not company output. "
-        "After at least one reviewed checkpoint, authoritative_sourcing_cost is guidance: when "
-        "continuing could consume the provisional per-pair allowance, you may explicitly call "
-        "tyche_finish(finish_reason='preserve_reviewed_partial') to stop research and enter separate "
-        "final review. This is a model choice, not an automatic stop or an eligibility promise. "
         "Use the shared research and review rules; preserve all saved state on interruption."
     )
 

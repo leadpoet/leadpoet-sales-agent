@@ -6769,3 +6769,12 @@ def test_bundle_contains_the_main_runner_and_no_duplicate(tmp_path):
     assert not (destination / 'tyche_arena/runtime.py').exists()
     assert not (destination / '.runtime').exists()
     assert not (destination / 'reports').exists()
+
+
+def test_native_finish_schema_and_guidance_have_no_removed_partial_handoff():
+    rendered = runtime.instructions()
+    description, schema = LAB_TOOLS["tyche_finish"]
+
+    assert "finish_reason" not in schema["properties"]
+    assert "preserve_reviewed_partial" not in description
+    assert "preserve_reviewed_partial" not in rendered

@@ -184,7 +184,7 @@ def recover_stopped_workers(run_file, *, receipts_directory='model-usage'):
 def _supervise_worker(command, request_file, env, profile, *, resume=False, host=None):
     from research_tools import ResearchTools
     from run_attempt import recover_completed_attempts
-    from validate_run import DELIVERY_STOPS, progress_snapshot
+    from validate_run import DELIVERY_STOPS
     host = host or LocalHost()
     request_file = Path(request_file).resolve()
     run_file = request_file.parent / 'results.json'
@@ -302,7 +302,6 @@ def _supervise_worker(command, request_file, env, profile, *, resume=False, host
             return (research_deadline(request_file, env['TYCHE_RUN_STARTED_AT'])
                     if run_file.exists() else startup_until)
         before = run_file.read_bytes() if run_file.exists() else None
-        before_progress = set(progress_snapshot(json.loads(before))) if before is not None else set()
         status, execution = host.run_once(
             worker_command, request_file, worker_env, profile,
             deadline=(lambda: finishing_until) if terminal else worker_deadline,
@@ -320,17 +319,13 @@ def _supervise_worker(command, request_file, env, profile, *, resume=False, host
             status.update(status='blocked', reason=execution.get('cleanup_error') or failure)
             write_worker_status(request_file, status)
             return 1
-        after = run_file.read_bytes() if run_file.exists() else None
-        saved_progress = (bool(set(progress_snapshot(json.loads(after))) - before_progress)
-                          if after is not None else False)
-        failed_exits = (failed_exits + 1 if execution.get('exit_code')
-                        and failure != 'deadline_reached' and not saved_progress else 0)
+        failed_exits = failed_exits + 1 if execution.get('exit_code') and failure != 'deadline_reached' else 0
         if failed_exits >= 2:
             status.update(status='blocked', reason='repeated_worker_failure')
             write_worker_status(request_file, status)
             return 1
         unchanged_exits = unchanged_exits + 1 if (not execution.get('exit_code') and
-            before == after) else 0
+            before == (run_file.read_bytes() if run_file.exists() else None)) else 0
         if unchanged_exits >= MAX_UNCHANGED_EXITS:
             status.update(status='blocked', reason='repeated_worker_no_progress')
             write_worker_status(request_file, status)

@@ -47,41 +47,11 @@ def headroom_guard(reader, monkeypatch, *, clock=time.monotonic):
     )
     guard.preflight()
     assert guard() is False
-    assert guard.research_denial == host.ARENA_FINALIZATION_HEADROOM
+    assert guard.research_denial == "finalization_headroom"
     guard.set_phase("finalization")
     return guard
 
 
-def reviewed_checkpoint(directory, monkeypatch):
-    document = {
-        "request": {"original_text": "{}"},
-        "accepted": [],
-        "final_review": {"review_ref": "review-1"},
-    }
-    run_bytes = json.dumps(document, sort_keys=True).encode()
-    validation = {
-        "valid": True,
-        "scope": host.ARENA_HEADROOM_VALIDATION_SCOPE,
-        "partial": True,
-        "delivery_allowed": False,
-        "host_stop_reason": host.ARENA_FINALIZATION_HEADROOM,
-        "results_sha256": hashlib.sha256(run_bytes).hexdigest(),
-        "review_ref": "review-1",
-    }
-    files = {
-        "results.json": run_bytes,
-        "validation.json": json.dumps(validation, sort_keys=True).encode(),
-        "checkpoint-results.json": json.dumps(document, sort_keys=True).encode(),
-        "companies.json": b'{"companies":[]}',
-    }
-    for name, contents in files.items():
-        (directory / name).write_bytes(contents)
-    monkeypatch.setattr(host.run_attempt, "review_fingerprint", lambda _document: "review-1")
-    monkeypatch.setattr(host.budget_guard, "audit_ledger", lambda *_args: [])
-    monkeypatch.setattr(host, "checkpointed_companies", lambda *_args: [])
-    monkeypatch.setenv("LAB_ARENA_OUTPUT_PATH", str(directory / "companies.json"))
-    assert host.headroom_partial_delivery(directory) is True
-    return files
 
 
 def load_arena_stack():
@@ -198,7 +168,7 @@ def test_missing_output_records_one_real_refusal_after_200_dispatches(
         tmp_path, monkeypatch):
     used = [160]
     guard = headroom_guard(lambda: quota_snapshot(used[0]), monkeypatch)
-    request_guard = host.HeadroomRequestGuard(guard, tmp_path)
+    request_guard = guard
 
     with tempfile.TemporaryDirectory(prefix="arena-terminal-", dir="/tmp") as directory:
         socket_path = Path(directory) / "worker.sock"
@@ -229,17 +199,6 @@ def test_missing_output_records_one_real_refusal_after_200_dispatches(
                for call in store.calls.values()) == 200
 
 
-def test_reviewed_checkpoint_stays_closed_at_exhaustion(tmp_path, monkeypatch):
-    checkpoint = reviewed_checkpoint(tmp_path, monkeypatch)
-    used = [160]
-    guard = headroom_guard(lambda: quota_snapshot(used[0]), monkeypatch)
-    used[0] = 200
-    request_guard = host.HeadroomRequestGuard(guard, tmp_path)
-
-    assert request_guard() is False
-    assert request_guard() is False
-    assert all((tmp_path / name).read_bytes() == contents
-               for name, contents in checkpoint.items())
 
 
 def test_finalization_admits_work_then_one_exhaustion_refusal(monkeypatch):
@@ -268,7 +227,7 @@ def test_final_refusal_preserves_snapshot_failure_guards(
         return {"providers": {"openrouter": {"limit": 200}}}
 
     guard = headroom_guard(reader, monkeypatch)
-    request_guard = host.HeadroomRequestGuard(guard, tmp_path)
+    request_guard = guard
 
     if failure == "malformed":
         with pytest.raises(ValueError, match="invalid Arena quota snapshot"):
