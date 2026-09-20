@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".agents/skills/lea
 from test_research_tools import FixtureProvider
 from test_research_interface import setup_request
 from research_tools import ResearchTools
+import budget_guard
 import run_coordination as coordination
 
 
@@ -315,14 +316,19 @@ class PoolTests(unittest.TestCase):
             status = root / "operational-status.json"
             env = {"TYCHE_RUN_STARTED_AT": datetime.now(timezone.utc).isoformat()}
             provider = FixtureProvider()
-            calls, results = [], []
+            calls, results, early_stops = [], [], []
             finished = threading.Event()
-            def launch(execute):
+            def launch(execute, linger=0):
                 def worker(command, cwd, worker_env, receipt, **options):
                     calls.append(worker_env["TYCHE_WORKER_ID"])
                     if worker_env["TYCHE_WORKER_ID"] == "worker-1":
                         tools = ResearchTools(run, execute=execute, environment=worker_env)
                         results.append(tools.call("tyche_start", setup_request()))
+                    # The model is still writing its answer while the supervisor sees the block.
+                    until = time.monotonic() + linger
+                    while time.monotonic() < until:
+                        early_stops.append(options["cost_stop"]())
+                        time.sleep(.05)
                     # The model reads the result and ends its turn with usage recorded.
                     usage = dict(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0,
                                  output_tokens=10, reasoning_output_tokens=0, total_tokens=10)
@@ -343,15 +349,23 @@ class PoolTests(unittest.TestCase):
                         patch.object(ResearchTools, "_overview", progress), contextlib.redirect_stdout(io.StringIO()):
                     run_research(["codex", "exec", "Fixture ICP"], request, env, root)
 
-            # Launch 1: the free catalog times out, so startup saves a block.
+            # Launch 1: the free catalog times out, so startup saves a block. The
+            # session outlives several supervisor checks and must end its own turn.
             with self.assertRaisesRegex(RuntimeError, "run_not_initialized"):
-                launch(self.catalog_timeout)
+                launch(self.catalog_timeout, linger=2.5)
             self.assertEqual(calls, ["worker-1"])
             self.assertEqual(results[0]["status"], "operationally_blocked")
             self.assertEqual(json.loads(status.read_text())["status"], "operationally_blocked")
             self.assertFalse(run.exists())
             self.assertFalse(run.with_name("results.json.budget.json").exists())
             original_clock = json.loads((root / "company-tool.json").read_text())["started_at"]
+            self.assertGreater(len(early_stops), 20)
+            self.assertEqual(set(early_stops), {None})
+            blocked_receipt = next((root / "model-usage").glob("*.json"))
+            saved = json.loads(blocked_receipt.read_text())
+            self.assertEqual((saved["status"], saved["usage_reconciled"]), ("complete", True))
+            self.assertNotIn("capture_errors", saved)
+            blocked_bytes = blocked_receipt.read_bytes()
 
             # Launch 2: the catalog works again. The saved block must not stop
             # the initializer before tyche_start rechecks the free prerequisites.
@@ -366,8 +380,14 @@ class PoolTests(unittest.TestCase):
             state = coordination.snapshot(run)
             self.assertTrue(state["ready"])
             self.assertEqual(state["phase"], "finalization")
+            # Default actual-cost accounting: every receipt closed, so the guard is quiet.
+            ledger = budget_guard.load_ledger(run)
+            self.assertEqual(ledger["version"], 2)
+            self.assertIsNone(budget_guard.spending_stop(ledger))
+            self.assertEqual(budget_guard.actual_cost_summary(ledger)["missing_model_usage"], [])
+            self.assertEqual(blocked_receipt.read_bytes(), blocked_bytes)
 
-    def test_retry_that_blocks_again_stops_on_the_new_block(self):
+    def test_blocked_startup_that_never_ends_is_stopped_after_the_wait_and_stays_blocked(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             request = root / "request.txt"
@@ -376,27 +396,101 @@ class PoolTests(unittest.TestCase):
             status = root / "operational-status.json"
             env = {"TYCHE_RUN_STARTED_AT": datetime.now(timezone.utc).isoformat()}
             ResearchTools(run)._blocked_result("Required tool unavailable: saved by an earlier launch")
-            calls, stops = [], []
-            def worker(command, cwd, worker_env, receipt, **options):
+            calls, waiting, stops = [], [], []
+            offset = [0]
+            real_time = time.time
+            def stuck(command, cwd, worker_env, receipt, **options):
                 calls.append(worker_env["TYCHE_WORKER_ID"])
                 tools = ResearchTools(run, execute=self.catalog_timeout, environment=worker_env)
                 self.assertEqual(tools.call("tyche_start", setup_request())["status"], "operationally_blocked")
-                # The model session is still open. This launch's block must end it.
+                receipt.observe({"type": "thread.started", "thread_id": receipt.path.stem})
+                # The session never ends. It keeps its bounded wait, then is stopped.
+                until = time.monotonic() + 1.5
+                while time.monotonic() < until:
+                    waiting.append(options["cost_stop"]())
+                    time.sleep(.05)
+                offset[0] = 60  # The supervisor's 45-second wait has now passed.
                 until = time.monotonic() + 10
                 while not options["cost_stop"]() and time.monotonic() < until:
                     time.sleep(.05)
                 stops.append(options["cost_stop"]())
-                receipt.finish(1)
+                receipt.finish(1)  # Killed: no final usage total was ever reported.
                 return 1
-            with patch("run_costs.execute_with_usage", side_effect=worker), contextlib.redirect_stdout(io.StringIO()):
+            with patch("run_costs.execute_with_usage", side_effect=stuck), \
+                    patch("parallel_sourcing.time.time", side_effect=lambda: real_time() + offset[0]), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, "run_not_initialized"):
                     run_research(["codex", "exec", "Fixture ICP"], request, env, root)
             self.assertEqual(calls, ["worker-1"])
-            # A stop reason proves the block ended the session before the fallback wait.
+            self.assertEqual(set(waiting), {None})
+            # The stop carries this launch's block, never the one saved by an earlier launch.
             self.assertIn("catalog description unavailable", stops[0])
             self.assertIn("catalog description unavailable", json.loads(status.read_text())["reason"])
             self.assertFalse(run.exists())
             self.assertFalse(run.with_name("results.json.budget.json").exists())
+            killed_receipt = next((root / "model-usage").glob("*.json"))
+            killed = json.loads(killed_receipt.read_text())
+            self.assertEqual((killed["status"], killed["usage"], killed["usage_reconciled"]), ("incomplete", None, False))
+            killed_bytes = killed_receipt.read_bytes()
+
+            # A later launch with a healthy catalog must still stop on the accounting
+            # guard: the killed session's usage is unknown and is never assumed.
+            errors = []
+            def retry(command, cwd, worker_env, receipt, **options):
+                try:
+                    ResearchTools(run, execute=FixtureProvider(), environment=worker_env).call("tyche_start", setup_request())
+                except ValueError as exc:
+                    errors.append(str(exc))
+                receipt.finish(0)
+                return 0
+            with patch("run_costs.execute_with_usage", side_effect=retry), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "run_not_initialized"):
+                    run_research(["codex", "exec", "Fixture ICP"], request, env, root)
+            self.assertIn("model_usage_pending", errors[0])
+            self.assertEqual(budget_guard.spending_stop(budget_guard.load_ledger(run)), "model_usage_pending")
+            self.assertEqual(killed_receipt.read_bytes(), killed_bytes)
+
+    def test_startup_repaired_during_the_wait_keeps_the_pool_running(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            request = root / "request.txt"
+            request.write_text("Fixture ICP")
+            run = root / "results.json"
+            env = {"TYCHE_RUN_STARTED_AT": datetime.now(timezone.utc).isoformat()}
+            stops = []
+            offset = [0]
+            real_time = time.time
+            finished = threading.Event()
+            def worker(command, cwd, worker_env, receipt, **options):
+                if worker_env["TYCHE_WORKER_ID"] == "worker-1":
+                    blocked = ResearchTools(run, execute=self.catalog_timeout, environment=worker_env)
+                    self.assertEqual(blocked.call("tyche_start", setup_request())["status"], "operationally_blocked")
+                    time.sleep(1.5)  # The supervisor sees the block and starts its wait.
+                    ResearchTools(run, execute=FixtureProvider(), environment=worker_env).call("tyche_start", setup_request())
+                    time.sleep(1.5)  # The supervisor sees the repaired startup.
+                    offset[0] = 60  # Past the original wait: a live timer would stop the pool now.
+                    until = time.monotonic() + 1.5
+                    while time.monotonic() < until:
+                        stops.append(options["cost_stop"]())
+                        time.sleep(.05)
+                    finished.set()
+                else:
+                    self.assertTrue(finished.wait(15))
+                receipt.finish(0)
+                return 0
+            original_overview = ResearchTools._overview
+            def progress(tools):
+                result = original_overview(tools)
+                if finished.is_set():
+                    result["stop"] = "target_met"
+                return result
+            with patch("run_costs.execute_with_usage", side_effect=worker), \
+                    patch("parallel_sourcing.time.time", side_effect=lambda: real_time() + offset[0]), \
+                    patch.object(ResearchTools, "_overview", progress), contextlib.redirect_stdout(io.StringIO()):
+                run_research(["codex", "exec", "Fixture ICP"], request, env, root)
+            self.assertEqual(set(stops), {None})
+            self.assertEqual(json.loads((root / "operational-status.json").read_text())["status"], "ready")
+            self.assertEqual(coordination.snapshot(run)["phase"], "finalization")
 
     def test_three_model_invocations_overlap_and_resume_one_shared_run(self):
         with tempfile.TemporaryDirectory() as folder:

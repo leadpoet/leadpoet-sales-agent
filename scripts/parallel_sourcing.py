@@ -145,6 +145,7 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
 
     pool = ThreadPoolExecutor(max_workers=count)
     drain_until = None
+    startup_drain = False
     last_progress = 0
     try:
         state = coordination.snapshot(run_file)
@@ -178,21 +179,31 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
             stop = progress.get("stop")
             fatal = progress.get("operational_block") or (
                 stop if stop in {"provider_stop", "input_or_configuration_stop"} and not pending_billing else None)
+            startup_block = None
             if not state["ready"]:
                 if status_version() not in (None, inherited_status):
                     status = json.loads(status_path.read_text())
                     if status.get("status") == "operationally_blocked":
-                        fatal = status.get("reason", "Run setup is blocked")
+                        startup_block = status.get("reason", "Run setup is blocked")
+            if startup_drain and not startup_block and not stopped.is_set():
+                # tyche_start repaired startup within the wait. Cancel the block timer.
+                drain_until, startup_drain = None, False
             terminal = (billing_drain or stop in DELIVERY_STOPS
                         or limit is not None and time.time() >= limit)
             if fatal:
                 reason = str(progress.get("operational_block") or progress.get("stop_reason") or fatal)
                 stopped.set()
+            elif startup_block and drain_until is None:
+                # The tool already refused startup. As with billing_pending, let the
+                # initializer end its own turn so its usage receipt closes normally.
+                # Killing it would strand an actual_cost run on unknown model usage.
+                drain_until, startup_drain = time.time() + 45, True
             elif terminal and drain_until is None:
                 # Tools refuse new work at the shared stop. Give researchers a
                 # bounded chance to save the judgments they already possess.
                 drain_until = time.time() + 45
             if drain_until is not None and time.time() >= drain_until:
+                reason = reason or startup_block
                 stopped.set()
             if state["ready"] and not terminal and not stopped.is_set():
                 for index in range(1, count + 1):
