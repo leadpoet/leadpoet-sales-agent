@@ -1373,9 +1373,10 @@ def test_true_quota_failures_remain_fatal_without_finalization_retry(
     assert reads[0] == expected_reads
 
 
+@pytest.mark.parametrize("research_finish_tool", [None, "tyche_checkpoint"])
 @pytest.mark.parametrize("openrouter_limit", [500, 2000])
 def test_headroom_boundary_finalizes_native_checkpoint_to_atomic_output(
-        lab, monkeypatch, arena_operations, openrouter_limit):
+        lab, monkeypatch, arena_operations, openrouter_limit, research_finish_tool):
     install_actual_checkpoint_writer(lab, monkeypatch)
     monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
     lab.openrouter_limit = openrouter_limit
@@ -1392,6 +1393,17 @@ def test_headroom_boundary_finalizes_native_checkpoint_to_atomic_output(
     )
 
     def finish_confirmed_checkpoint():
+        if research_finish_tool is None:
+            assert not lab.output.exists()
+            accepted = yield "tyche_checkpoint", {}
+            assert accepted["status"] == "review_required"
+            checkpointed = yield "tyche_review", {
+                "review_ref": accepted["review_ref"],
+                "review_findings": review_findings(accepted),
+            }
+            assert checkpointed["checkpoint_saved"]
+            assert not checkpointed["delivery_allowed"]
+            assert len(json.loads(lab.output.read_text())["companies"]) == 1
         packet = yield "tyche_finish", {}
         assert packet["status"] == "review_required"
         delivered = yield "tyche_finish", {
@@ -1401,7 +1413,7 @@ def test_headroom_boundary_finalizes_native_checkpoint_to_atomic_output(
         assert delivered["delivery_allowed"] and delivered["checkpoint_saved"]
 
     def program():
-        return (scenario("tyche_checkpoint") if lab.worker_starts == 1
+        return (scenario(research_finish_tool) if lab.worker_starts == 1
                 else finish_confirmed_checkpoint())
 
     lab.program = program
