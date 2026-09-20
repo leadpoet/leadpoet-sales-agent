@@ -260,6 +260,90 @@ class BillingReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(billing.billing_issue(
             dict(self.receipt, tool='fixture_company_search', results=[{'email': None, 'company': 'Example'}]), proof))
 
+    def test_unknown_domain_format_settles_only_with_matching_free_billing(self):
+        # Anonymized ZeroBounce response from the French 5x2 run: a no-data envelope is not a hit.
+        miss = {'domain': 'example.org', 'company_name': '', 'format': 'unknown', 'confidence': 'undetermined',
+                'did_you_mean': '', 'failure_reason': 'No data for this domain.', 'other_domain_formats': []}
+        self.receipt.update(status='ok', tool='zerobounce_domain_search', results=[miss])
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        before = self.receipt_path.read_bytes()
+        billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': []}})
+        self.assertIsNone(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'])
+        free = dict(self.row, provider='zerobounce', operation='zerobounce_domain_search', credits=0, delta=0,
+                    charge_state='free', outcome='miss', pricing_basis='result', provider_units=0)
+        billing.reconcile(self.path, refresh=True, fetch=lambda: {'recent': {'entries': [free]}})
+        call = budget.load_ledger(self.path)['calls']['call-1']
+        self.assertEqual(call['actual_credits'], '0')
+        self.assertIsNone(call['billing_issue'])
+        self.assertEqual(before, self.receipt_path.read_bytes())
+        self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+        for hit in (dict(miss, format='first.last'), dict(miss, other_domain_formats=[{'format': 'first'}]),
+                    dict(miss, email='person@example.org'), dict(miss, format=None),
+                    {k: v for k, v in miss.items() if k != 'format'},  # No explicit marker is not a miss.
+                    {'domain': 'example.org', 'data': {'format': 'first.last'}}):
+            with self.subTest(hit=hit):
+                self.assertIsNotNone(billing.billing_issue(dict(self.receipt, results=[hit]), free))
+        self.assertIsNotNone(billing.billing_issue(dict(self.receipt, tool='fixture_email_finder', results=[miss]), free))
+        # The bill itself must state a completed free miss with zero units.
+        for weak in (dict(free, charge_state='posted'), dict(free, status='no_result'),
+                     dict(free, outcome='hit'), dict(free, provider_units=None),
+                     {k: v for k, v in free.items() if k != 'provider_units'}):
+            with self.subTest(weak=weak):
+                self.assertIsNotNone(billing.billing_issue(dict(self.receipt, results=[miss]), weak))
+
+    def test_warning_saved_by_the_older_rule_stays_auditable_then_settles(self):
+        self.recover_older_warning()
+
+    def test_actual_cost_ledger_recovers_the_older_warning_and_stays_paused_until_settled(self):
+        self.setUp(actual_cost=True)
+        budget.settle(budget.ledger_path(self.path), 'call-1', {})
+        self.recover_older_warning(actual_cost=True)
+
+    def recover_older_warning(self, *, actual_cost=False):
+        miss = {'domain': 'example.org', 'format': 'unknown', 'confidence': 'undetermined',
+                'failure_reason': 'No data for this domain.', 'other_domain_formats': []}
+        self.receipt.update(status='ok', tool='zerobounce_domain_search', results=[miss])
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        free = dict(self.row, provider='zerobounce', operation='zerobounce_domain_search', credits=0, delta=0,
+                    charge_state='free', outcome='miss', pricing_basis='result', provider_units=0)
+        with patch.object(deepline, 'empty_domain_search_records', return_value=False):  # The older rule.
+            billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': [free]}})
+        call = budget.load_ledger(self.path)['calls']['call-1']
+        self.assertEqual((call['actual_credits'], call['billing_issue']), (None, billing.RESULTS_WITHOUT_CHARGE))
+        document = budget.read_object(self.path)
+        self.assertEqual(budget.audit_ledger(self.path, document), [])
+        import run_attempt  # The launcher's gate between worker invocations.
+        self.assertEqual(run_attempt.recover_completed_attempts(self.path)['errors'], [])
+        if actual_cost:
+            self.assertEqual(budget.spending_stop(budget.load_ledger(self.path)), 'billing_pending')
+        # Only that exact conservative warning on a pending call is tolerated; tampering still fails.
+        missing = object()
+        for field, value in (('billing_issue', 'edited'), ('billing_issue', None), ('actual_credits', '0'),
+                             ('actual_usd', '0')):
+            with budget.transaction(budget.ledger_path(self.path)) as saved:
+                original = saved['calls']['call-1'].get(field, missing)
+                saved['calls']['call-1'][field] = value
+            with self.subTest(field=field, value=value):
+                self.assertTrue(budget.audit_ledger(self.path, document))
+            with budget.transaction(budget.ledger_path(self.path)) as saved:
+                if original is missing:
+                    saved['calls']['call-1'].pop(field)
+                else:
+                    saved['calls']['call-1'][field] = original
+        with budget.transaction(budget.ledger_path(self.path)) as saved:
+            saved['calls']['call-1']['billing_evidence']['request_id'] = 'another-request'
+        self.assertTrue(budget.audit_ledger(self.path, document))
+        with budget.transaction(budget.ledger_path(self.path)) as saved:
+            saved['calls']['call-1']['billing_evidence']['request_id'] = 'request-1'
+        # The audit tolerance never settles anything: a read without the matching bill keeps it pending.
+        billing.reconcile(self.path, refresh=True, fetch=lambda: {'recent': {'entries': []}})
+        call = budget.load_ledger(self.path)['calls']['call-1']
+        self.assertEqual((call['actual_credits'], call['billing_issue']), (None, billing.RESULTS_WITHOUT_CHARGE))
+        billing.reconcile(self.path, refresh=True, fetch=lambda: {'recent': {'entries': [free]}})
+        call = budget.load_ledger(self.path)['calls']['call-1']
+        self.assertEqual((call['actual_credits'], call['billing_issue']), ('0', None))
+        self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+
     def test_later_posted_correction_settles_once_and_preserves_billing_history(self):
         self.prospector(1)
         billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': [self.row]}})

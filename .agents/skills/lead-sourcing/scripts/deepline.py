@@ -1749,6 +1749,15 @@ def empty_email_finder_records(tool, records):
         for record in records)
 
 
+def empty_domain_search_records(tool, records):
+    """ZeroBounce answers an unknown domain with an explicit unknown format, not a hit."""
+    return tool == "zerobounce_domain_search" and isinstance(records, list) and bool(records) and all(
+        isinstance(record, dict) and "format" in record and record["format"] in ("", "unknown")
+        and not record.get("other_domain_formats")
+        and not any(record.get(key) for key in ("email", "emails", "contact_email"))
+        for record in records)
+
+
 def _native_result_envelope(parsed, tool):
     """Unwrap observed native outputs; retain IDs/billing and the raw receipt."""
     lists = {"crustdata_v3_job_search": "job_listings", "datagma_find_people": "persons",

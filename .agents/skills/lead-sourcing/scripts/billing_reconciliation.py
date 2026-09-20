@@ -254,6 +254,9 @@ def _ledger_rows(rows):
     return result
 
 
+RESULTS_WITHOUT_CHARGE = "Results returned, but billing reports a miss or zero result units; charge remains pending."
+
+
 def billing_issue(receipt, proof, contract=None):
     """Flag billing/result contradictions, without interpreting company fit."""
     if budget.amount(proof["credits"], "posted credits") != 0 or not (proof.get("outcome") == "miss" or
@@ -287,6 +290,12 @@ def billing_issue(receipt, proof, contract=None):
     # zero-charge billing can settle this; an empty response alone never does.
     if deepline.empty_email_finder_records(receipt.get("tool"), rows):
         return None
+    # A no-data domain envelope settles only when the bill itself states a free miss.
+    if (deepline.empty_domain_search_records(receipt.get("tool"), rows)
+            and proof.get("status") == "completed" and proof.get("charge_state") == "free"
+            and proof.get("outcome") == "miss"
+            and type(proof.get("provider_units")) in (int, float) and proof["provider_units"] == 0):
+        return None
     # Some tools return one envelope even when its actual contact list is empty.
     def populated(row):
         if isinstance(row, dict):
@@ -295,7 +304,7 @@ def billing_issue(receipt, proof, contract=None):
                     return bool(row[key])
         return bool(row)
     if any(populated(row) for row in rows):
-        return "Results returned, but billing reports a miss or zero result units; charge remains pending."
+        return RESULTS_WITHOUT_CHARGE
     return None
 
 
@@ -600,10 +609,11 @@ def evidence_error(run_file, route, call):
     contract, _ = _catalog_contract(Path(run_file), receipt, proof.get("catalog_route_id"), bound_call=call)
     matched = matching_charge(receipt, [proof], contract)
     issue = billing_issue(receipt, matched, contract=contract) if matched else None
-    # Older runs may conservatively retain a now-resolvable free-call warning.
-    # Keep that saved reservation auditable until normal reconciliation settles it.
-    if matched and issue is None and call.get("billing_issue") and call["actual_credits"] is None:
-        issue = billing_issue(receipt, matched)
+    # Older code may conservatively retain this warning for a call the current rule can settle.
+    # Keep that pending reservation auditable until normal reconciliation settles it.
+    if (matched and issue is None and call["actual_credits"] is None and call.get("actual_usd") is None
+            and call.get("billing_issue") == RESULTS_WITHOUT_CHARGE):
+        issue = RESULTS_WITHOUT_CHARGE
     if (receipt.get("run_fingerprint") != budget.run_fingerprint(run_file)
             or receipt.get("request_fingerprint") != route.get("request_fingerprint")
             or matched is None or call.get("billing_issue") != issue
