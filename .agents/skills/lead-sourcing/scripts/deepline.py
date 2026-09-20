@@ -1758,6 +1758,15 @@ def empty_domain_search_records(tool, records):
         for record in records)
 
 
+def empty_contact_enrichment_records(tool, records):
+    """Lusha can echo the matched profile with explicitly empty email and phone lists: no contact data."""
+    return tool == "lusha_enrich_person" and isinstance(records, list) and bool(records) and all(
+        isinstance(record, dict) and record.get("emailAddresses") == [] and record.get("phoneNumbers") == []
+        and not any(record.get(key) for key in ("email", "emails", "contact_email", "work_email", "workEmail",
+                                                 "phone", "phones", "contact_phone", "mobile"))
+        for record in records)
+
+
 def _native_result_envelope(parsed, tool):
     """Unwrap observed native outputs; retain IDs/billing and the raw receipt."""
     lists = {"crustdata_v3_job_search": "job_listings", "datagma_find_people": "persons",

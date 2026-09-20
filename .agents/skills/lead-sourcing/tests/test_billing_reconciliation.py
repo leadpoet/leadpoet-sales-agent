@@ -287,9 +287,43 @@ class BillingReconciliationTests(unittest.TestCase):
         # The bill itself must state a completed free miss with zero units.
         for weak in (dict(free, charge_state='posted'), dict(free, status='no_result'),
                      dict(free, outcome='hit'), dict(free, provider_units=None),
-                     {k: v for k, v in free.items() if k != 'provider_units'}):
+                     {k: v for k, v in free.items() if k != 'provider_units'}, dict(free, pricing_basis='usage')):
             with self.subTest(weak=weak):
                 self.assertIsNotNone(billing.billing_issue(dict(self.receipt, results=[miss]), weak))
+
+    def test_profile_echo_without_contact_data_settles_only_with_matching_free_billing(self):
+        # Anonymized Lusha response from the French confirmation run: a matched profile with
+        # explicitly empty email and phone lists carries no billable contact data.
+        echo = {'fullName': 'Example Person', 'contact_name': 'Example Person', 'contact_title': 'Buyer',
+                'company': 'Example', 'emailAddresses': [], 'phoneNumbers': [], 'contact_email': None}
+        self.receipt.update(status='ok', tool='lusha_enrich_person', results=[echo])
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        before = self.receipt_path.read_bytes()
+        billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': []}})
+        self.assertIsNone(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'])
+        free = dict(self.row, provider='lusha', operation='lusha_enrich_person', credits=0, delta=0,
+                    charge_state='free', outcome='miss', pricing_basis='result', provider_units=0)
+        billing.reconcile(self.path, refresh=True, fetch=lambda: {'recent': {'entries': [free]}})
+        call = budget.load_ledger(self.path)['calls']['call-1']
+        self.assertEqual((call['actual_credits'], call['billing_issue']), ('0', None))
+        self.assertEqual(before, self.receipt_path.read_bytes())
+        self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+        # Any contact data, or a missing explicit marker, keeps the contradiction pending.
+        for hit in (dict(echo, emailAddresses=[{'email': 'person@example.org'}]), dict(echo, phoneNumbers=[{'number': '1'}]),
+                    dict(echo, contact_email='person@example.org'), dict(echo, contact_phone='1'),
+                    dict(echo, work_email='person@example.org'), dict(echo, mobile='1'),
+                    dict(echo, emailAddresses=None), {k: v for k, v in echo.items() if k != 'phoneNumbers'},
+                    {k: v for k, v in echo.items() if k != 'emailAddresses'}):
+            with self.subTest(hit=hit):
+                self.assertIsNotNone(billing.billing_issue(dict(self.receipt, results=[hit]), free))
+                # One hit among echoes is still a contradiction.
+                self.assertIsNotNone(billing.billing_issue(dict(self.receipt, results=[echo, hit]), free))
+        self.assertIsNotNone(billing.billing_issue(dict(self.receipt, tool='fixture_enrich_person', results=[echo]), free))
+        for weak in (dict(free, charge_state='posted'), dict(free, status='no_result'), dict(free, outcome='hit'),
+                     dict(free, provider_units=None), {k: v for k, v in free.items() if k != 'provider_units'},
+                     dict(free, pricing_basis='usage'), dict(free, pricing_basis=None)):
+            with self.subTest(weak=weak):
+                self.assertIsNotNone(billing.billing_issue(dict(self.receipt, results=[echo]), weak))
 
     def test_warning_saved_by_the_older_rule_stays_auditable_then_settles(self):
         self.recover_older_warning()

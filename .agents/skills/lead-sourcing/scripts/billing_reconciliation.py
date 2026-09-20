@@ -290,10 +290,12 @@ def billing_issue(receipt, proof, contract=None):
     # zero-charge billing can settle this; an empty response alone never does.
     if deepline.empty_email_finder_records(receipt.get("tool"), rows):
         return None
-    # A no-data domain envelope settles only when the bill itself states a free miss.
-    if (deepline.empty_domain_search_records(receipt.get("tool"), rows)
+    # A no-data envelope, or a profile echo without contact data, settles only when
+    # the bill itself states a free per-result miss.
+    if ((deepline.empty_domain_search_records(receipt.get("tool"), rows)
+         or deepline.empty_contact_enrichment_records(receipt.get("tool"), rows))
             and proof.get("status") == "completed" and proof.get("charge_state") == "free"
-            and proof.get("outcome") == "miss"
+            and proof.get("outcome") == "miss" and proof.get("pricing_basis") == "result"
             and type(proof.get("provider_units")) in (int, float) and proof["provider_units"] == 0):
         return None
     # Some tools return one envelope even when its actual contact list is empty.
