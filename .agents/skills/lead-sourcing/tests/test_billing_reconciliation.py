@@ -1,5 +1,6 @@
 """Read-only billing settlement never guesses costs or redispatches research."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -336,6 +337,88 @@ class BillingReconciliationTests(unittest.TestCase):
         billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': [paid]}})
         self.assertEqual(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'], '0.55')
         self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+
+    def usage_priced_company(self):
+        tool = 'fullenrich_company_search'
+        self.receipt.update(tool=tool, status='ok', results=[{'company': 'Example', 'domain': 'example.com'}])
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        contract = {'toolId': tool, 'provider': 'fullenrich', 'callable': True,
+                    'pricing': {'unit': 'usage', 'creditsPerUnit': None, 'usdPerUnit': None}}
+        descriptor = {'provider': 'deepline', 'operation': 'describe', 'status': 'ok', 'tool': tool,
+                      'run_fingerprint': budget.run_fingerprint(self.path), 'request_fingerprint': 'catalog',
+                      'results': [contract]}
+        catalog_path = self.path.parent / 'receipts/catalog.json'
+        catalog_path.write_text(json.dumps(descriptor))
+        doc = budget.read_object(self.path)
+        doc['routes'][0]['tool'] = tool
+        doc['routes'].insert(0, {'route_id': 'catalog', 'provider': 'deepline', 'operation': 'describe',
+                               'tool': tool, 'provider_status': 'ok', 'request_fingerprint': 'catalog',
+                               'paid_calls': 0, 'cost_credits': 0, 'cost_upper_bound_credits': 0, 'cost_basis': 'actual'})
+        self.path.write_text(json.dumps(doc))
+        with budget.transaction(budget.ledger_path(self.path)) as ledger:
+            ledger['calls']['call-1'].update(catalog_route_id='catalog',
+                catalog_sha256=hashlib.sha256(catalog_path.read_bytes()).hexdigest())
+        self.row.update(provider='fullenrich', operation=tool, charge_state='free', credits=0, delta=0,
+                        outcome='miss', provider_units=0, pricing_basis='usage', pricing_model='provider_usage')
+        return contract
+
+    def test_usage_priced_results_need_an_exact_final_bill_not_a_price_quote(self):
+        for actual_cost in (False, True):
+            with self.subTest(actual_cost=actual_cost):
+                self.setUp(actual_cost=actual_cost)
+                self.usage_priced_company()
+                before = self.receipt_path.read_bytes()
+                initial = budget.load_ledger(self.path)
+                billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': []}})
+                self.assertIsNone(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'])
+                result = billing.reconcile(self.path, refresh=True,
+                    fetch=lambda: {'recent': {'entries': [self.row]}})
+                self.assertEqual(result['unmatched'], [])
+                ledger = budget.load_ledger(self.path)
+                self.assertEqual(ledger['calls']['call-1']['actual_credits'], '0')
+                self.assertIsNone(ledger['calls']['call-1']['billing_issue'])
+                self.assertEqual({k: v for k, v in initial.items() if k != 'calls'},
+                                 {k: v for k, v in ledger.items() if k != 'calls'})
+                self.assertEqual(before, self.receipt_path.read_bytes())
+                self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+                billing.reconcile(self.path, refresh=True, fetch=lambda: self.fail('Already settled'))
+
+    def test_zero_usage_requires_consistent_catalog_and_completed_usage_billing(self):
+        catalog = self.usage_priced_company()
+        for pricing in (None, {}, {'unit': 'result'}, {'unit': 'call'}, {'unit': 'unknown'}):
+            with self.subTest(pricing=pricing):
+                self.assertIsNotNone(billing.billing_issue(self.receipt, self.row, dict(catalog, pricing=pricing)))
+        self.assertIsNotNone(billing.billing_issue(self.receipt, self.row))
+        for change in ({'pricing_basis': 'result'}, {'pricing_basis': None}, {'pricing_model': 'fixed'},
+                       {'pricing_model': None}, {'provider_units': 1}, {'provider_units': None},
+                       {'provider_units': False}, {'status': 'pending'}, {'charge_state': 'held'}):
+            with self.subTest(change=change):
+                self.assertIsNotNone(billing.billing_issue(self.receipt, dict(self.row, **change), catalog))
+        for change in ({'status': 'partial'}, {'status': 'provider_error'}, {'provider': 'other'}):
+            with self.subTest(receipt=change):
+                self.assertIsNotNone(billing.billing_issue(dict(self.receipt, **change), self.row, catalog))
+
+    def test_usage_pricing_does_not_relax_bill_identity_or_finality(self):
+        catalog = self.usage_priced_company()
+        for change in ({'request_id': 'other'}, {'provider': 'other'}, {'operation': 'other'},
+                       {'charge_state': 'held'}, {'status': 'pending'}, {'credits': None},
+                       {'credits': True}, {'delta': None}, {'credits': .5, 'delta': -.5},
+                       {'metadata': {'chargeGroupIds': ['request-1', 'other']}}):
+            with self.subTest(change=change):
+                self.assertIsNone(billing.matching_charge(self.receipt, [dict(self.row, **change)], catalog))
+        self.assertIsNone(billing.matching_charge(self.receipt, [self.row, self.row], catalog))
+
+    def test_usage_pricing_keeps_positive_bills_and_bound_catalog_integrity(self):
+        self.usage_priced_company()
+        paid = dict(self.row, charge_state='posted', credits=.55, delta=-.55, outcome='hit', provider_units=1)
+        billing.reconcile(self.path, fetch=lambda: {'recent': {'entries': [paid]}})
+        self.assertEqual(budget.load_ledger(self.path)['calls']['call-1']['actual_credits'], '0.55')
+        self.assertEqual(budget.audit_ledger(self.path, budget.read_object(self.path)), [])
+        catalog_path = self.path.parent / 'receipts/catalog.json'
+        descriptor = json.loads(catalog_path.read_text())
+        descriptor['results'][0]['pricing']['unit'] = 'result'
+        catalog_path.write_text(json.dumps(descriptor))
+        self.assertTrue(budget.audit_ledger(self.path, budget.read_object(self.path)))
 
     def test_missing_or_invalid_free_charge_never_becomes_zero(self):
         catalog = self.prospector(0)

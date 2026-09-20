@@ -263,6 +263,16 @@ def billing_issue(receipt, proof, contract=None):
     # The matched billing record is still required; a price quote alone is not spend.
     if _free_per_call(contract):
         return None
+    # Usage-priced providers can return existing data with no new billable
+    # usage. Require agreement with the saved catalog and an explicit final
+    # zero-usage bill; returned rows do not determine provider usage.
+    pricing = (contract or {}).get("pricing")
+    if (receipt.get("provider") == "deepline" and receipt.get("status") == "ok"
+            and isinstance(pricing, dict) and pricing.get("unit") == "usage"
+            and proof.get("status") == "completed" and proof.get("charge_state") == "free"
+            and proof.get("pricing_basis") == "usage" and proof.get("pricing_model") == "provider_usage"
+            and type(proof.get("provider_units")) in (int, float) and proof["provider_units"] == 0):
+        return None
     rows = receipt.get("results", [])
     # Prospeo repeat enrichments can return data for free. Its documented flag
     # explains Deepline's zero-unit miss, but never replaces the matched bill.

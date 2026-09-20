@@ -560,11 +560,18 @@ def normalize_evidence(
     # Result lists bypass the envelope parser's single-document path.
     captured = _scraped_document(row)
     source: Dict[str, Any] = captured or (row if isinstance(row, dict) else {"value": row})
-    pdl_company = tool == "peopledatalabs_company_search"
-    if pdl_company:
-        # PDL company search uses headline for its tagline and type for ownership.
+    company_search = tool in {"peopledatalabs_company_search", "crustdata_v3_company_search", "fullenrich_company_search"}
+    if company_search:
+        # Company search fields describe firms, not people or buying signals.
         entity_type = "company"
         source = dict(source, company_name=source.get("name"))
+    if tool == "crustdata_v3_company_search" and isinstance(source.get("basic_info"), dict):
+        source = dict(source, company_linkedin_url=source["basic_info"].get("professional_network_url"))
+    elif tool == "fullenrich_company_search":
+        social = source.get("social_profiles")
+        network = social.get("professional_network") if isinstance(social, dict) else None
+        if isinstance(network, dict):
+            source = dict(source, company_linkedin_url=network.get("url"))
     if tool == "crustdata_v3_job_search" and isinstance(source.get("company"), dict):
         company = source["company"]
         info = company.get("basic_info") if isinstance(company.get("basic_info"), dict) else {}
@@ -640,7 +647,7 @@ def normalize_evidence(
     if domain_value in (None, "") and nested_company_identity:
         domain_value = _first(link, "domain", "website")
     result["domain"] = None if _is_linkedin_url(domain_value) else _domain(domain_value)
-    result["signal"] = None if pdl_company else _text(_first(source, "signal", "signal_type", "intent", "type", "category"))
+    result["signal"] = None if company_search else _text(_first(source, "signal", "signal_type", "intent", "type", "category"))
     result["evidence_url"] = _text(_first(source, "evidence_url", "source_url", "url", "link", "source"))
     result["evidence_date"] = _text(_first(source, "evidence_date", "date", "published_at", "published", "timestamp"))
     result["evidence_text"] = _text(_first(source, "evidence_text", "text", "snippet", "description", "evidence", "content"))
@@ -1745,7 +1752,8 @@ def empty_email_finder_records(tool, records):
 def _native_result_envelope(parsed, tool):
     """Unwrap observed native outputs; retain IDs/billing and the raw receipt."""
     lists = {"crustdata_v3_job_search": "job_listings", "datagma_find_people": "persons",
-             "lusha_search_contacts": "contacts"}
+             "lusha_search_contacts": "contacts", "crustdata_v3_company_search": "companies",
+             "fullenrich_company_search": "companies"}
     if (tool not in {"company_titles", "search_contact", "forager_person_role_search", "crustdata_people_search", "firecrawl_search", "fullenrich_people_search", *lists}
             or not isinstance(parsed, dict)
             or parsed.get("status") != "completed" or _structured_status(parsed) != "ok"):
@@ -1892,10 +1900,12 @@ def _execute_output(
             return validation
     structured = _structured_execute_envelope(parsed)
     metadata: Dict[str, Any] = _execution_metadata(parsed)
-    if tool == "fullenrich_people_search" and isinstance(parsed, dict):
+    if tool in {"fullenrich_people_search", "fullenrich_company_search", "crustdata_v3_company_search"} and isinstance(parsed, dict):
         envelope = parsed.get("toolResponse")
         raw = envelope.get("rawV2") if isinstance(envelope, dict) else None
         page = raw.get("metadata") if isinstance(raw, dict) else None
+        if tool == "crustdata_v3_company_search" and isinstance(raw, dict):
+            page = {key: raw[key] for key in ("total_count", "next_cursor") if key in raw}
         if isinstance(page, dict):
             metadata["pagination"] = redact(page)
             if isinstance(page.get("search_after"), str) and page["search_after"]:
