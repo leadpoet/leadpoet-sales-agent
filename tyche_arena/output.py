@@ -407,7 +407,11 @@ def _project_companies(run_file, document, icp, *, require_review):
         if (len(paragraph) > 2000 or re.search(r"\n\s*\n|(?:^|\n)\s*(?:#{1,6}\s|[-*•]\s|\d+[.)]\s|>)", paragraph)
                 or "```" in paragraph or any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} and c not in "\r\n\t" for c in paragraph)):
             raise ValueError("Arena intent_details requires one plain paragraph of at most 2000 characters")
-        source = (person.get("location_evidence") or person)["source"]
+        email_attribution = person.get("email_source")
+        if (not isinstance(email_attribution, Mapping)
+                or not isinstance(email_attribution.get("source"), Mapping)):
+            raise ValueError("Arena email requires an explicit saved discovery source")
+        source = email_attribution["source"]
         profile = linkedin_receipts._saved_profile(run_file, source, person["linkedin_url"], "in",
             document["routes"], company.get("linkedin_url"))
         receipt = run_attempt.read_receipt(run_file, source["route_id"])["result"]

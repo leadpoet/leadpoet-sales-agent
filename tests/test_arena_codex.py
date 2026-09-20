@@ -39,6 +39,7 @@ import budget_guard
 import confirmed_leads
 import deepline
 import email_receipts
+import linkedin_receipts
 import run_attempt
 import scrapingdog
 
@@ -296,7 +297,7 @@ def review_findings(packet, tools=None):
     } for company in packet["companies"]]
 
 
-def scenario(finish_tool="tyche_finish"):
+def scenario(finish_tool="tyche_finish", *, separate_email_source=False):
     company = yield "tyche_lookup", lookup(
         "harvestapi_get_company", {"url": COMPANY_URL}, "account_discovery")
     company_ref = company["lookups"][0]["results"][0]["ref"]
@@ -319,13 +320,19 @@ def scenario(finish_tool="tyche_finish"):
     yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Verify selected email",
         "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
     enriched = yield "tyche_lookup", lookup("harvestapi_get_profile", {"findEmail": "true"}, "contact_discovery", contact_ref=profile_ref)
-    profile_ref = enriched["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Select enriched profile",
-        "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
+    email_profile_ref = enriched["lookups"][0]["results"][0]["ref"]
+    if not separate_email_source:
+        profile_ref = email_profile_ref
+        yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Select enriched profile",
+            "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
     email = yield "tyche_lookup", lookup("zerobounce_validate", {"email": "ada@example.com"}, "email_validation", contact_ref=profile_ref)
     email_ref = email["lookups"][0]["results"][0]["ref"]
-    accepted = yield "tyche_review", {"companies": [{"target": "example.com", "decision": "accept", "reason": "Verified company and current buyer",
-        "primary_contact": {"email_ref": email_ref, "email_source": {"ref": profile_ref}}}]}
+    accept_request = {"companies": [{"target": "example.com", "decision": "accept", "reason": "Verified company and current buyer",
+        "primary_contact": {"email_ref": email_ref, "email_source": {"ref": email_profile_ref}}}]}
+    if separate_email_source:
+        accept_request["sources"] = [{"ref": enriched["lookups"][0]["route"], "state": "exhausted",
+            "reason": "Selected email profile reviewed"}]
+    accepted = yield "tyche_review", accept_request
     if finish_tool is None:
         return
     packet = accepted if finish_tool == "tyche_checkpoint" else (yield finish_tool, {})
@@ -802,6 +809,70 @@ def test_trigger_returns_reviewed_checkpoint_with_codex_configuration(lab, monke
         lab.research[0].call("tyche_review", {})
     with pytest.raises(ValueError, match="initialized"):
         lab.research[0].call("tyche_start", {})
+
+
+def test_projection_uses_explicit_email_source_separate_from_location_profile(lab):
+    lab.program = lambda: scenario(separate_email_source=True)
+
+    rows = runtime.run(ICP)
+
+    document = json.loads(lab.research[0].research.path.read_text())
+    person = document["accepted"][0]["primary_contact"]
+    assert person["location_evidence"]["source"]["route_id"] != person["email_source"]["source"]["route_id"]
+    assert rows[0]["contact"]["email_source"] == {
+        "provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": "profile-123"}
+
+
+@pytest.mark.parametrize(("failure", "message"), [
+    ("missing", "explicit saved discovery source"),
+    ("unsupported", "completed successful HarvestAPI response"),
+    ("wrong_person", "exactly one matching LinkedIn entity"),
+    ("email_absent", "email is absent from the selected provider profile"),
+])
+def test_projection_rejects_invalid_explicit_email_source(lab, monkeypatch, failure, message):
+    lab.program = lambda: scenario(separate_email_source=True)
+    runtime.run(ICP)
+    run_file = lab.research[0].research.path
+    document = json.loads(run_file.read_text())
+    person = document["accepted"][0]["primary_contact"]
+    email_route = person["email_source"]["source"]["route_id"]
+    monkeypatch.setattr(arena_output, "accepted_preflight", lambda *_args, **_kwargs: [])
+
+    if failure == "missing":
+        person.pop("email_source")
+    elif failure == "unsupported":
+        person["email_source"]["source"]["tool"] = "zerobounce_validate"
+    elif failure == "wrong_person":
+        receipt_path = run_file.parent / "receipts" / (email_route + ".json")
+        receipt = json.loads(receipt_path.read_text())
+
+        def replace_profile_url(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "linkedinUrl" and isinstance(child, str) and "/in/" in child:
+                        value[key] = "https://www.linkedin.com/in/wrong-person"
+                    else:
+                        replace_profile_url(child)
+            elif isinstance(value, list):
+                for child in value:
+                    replace_profile_url(child)
+
+        replace_profile_url(receipt["provider_response"])
+        receipt_path.write_text(json.dumps(receipt))
+    else:
+        original = linkedin_receipts._saved_profile
+
+        def without_email(*args, **kwargs):
+            profile = original(*args, **kwargs)
+            if args[1].get("route_id") == email_route:
+                profile.pop("email", None)
+                profile["emails"] = []
+            return profile
+
+        monkeypatch.setattr(linkedin_receipts, "_saved_profile", without_email)
+
+    with pytest.raises(ValueError, match=message):
+        arena_output._project_companies(run_file, document, ICP, require_review=False)
 
 
 @pytest.mark.parametrize(("remaining", "expected"), [
