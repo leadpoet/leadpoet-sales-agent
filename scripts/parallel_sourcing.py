@@ -27,6 +27,18 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
     run_file = request_file.parent / "results.json"
     coordination.configure(run_file, count)
     startup_until = time.time() + launcher.STARTUP_SECONDS
+    status_path = request_file.parent / "operational-status.json"
+
+    def status_version():
+        # Status writes replace the file, so a new version means this launch wrote it.
+        try:
+            saved = status_path.stat()
+        except FileNotFoundError:
+            return None
+        return saved.st_ino, saved.st_mtime_ns, saved.st_size
+    # A block saved by an earlier launch is history, not this initializer's verdict.
+    # tyche_start rechecks the free prerequisites and clears it only when they pass.
+    inherited_status = status_version()
     stopped = threading.Event()
     active, failures, attempts = {}, {}, {}
     reason = None
@@ -167,8 +179,7 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
             fatal = progress.get("operational_block") or (
                 stop if stop in {"provider_stop", "input_or_configuration_stop"} and not pending_billing else None)
             if not state["ready"]:
-                status_path = request_file.parent / "operational-status.json"
-                if status_path.exists():
+                if status_version() not in (None, inherited_status):
                     status = json.loads(status_path.read_text())
                     if status.get("status") == "operationally_blocked":
                         fatal = status.get("reason", "Run setup is blocked")

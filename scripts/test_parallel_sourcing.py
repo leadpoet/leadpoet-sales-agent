@@ -300,6 +300,104 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(state["phase"], "blocked")
             self.assertEqual(state["workers"]["worker-1"]["status"], "stopped")
 
+    @staticmethod
+    def catalog_timeout(request, capture):
+        capture({"timed_out": True, "body": "", "stderr": "catalog connection stalled"})
+        return {"provider": "deepline", "operation": "describe", "tool": request["tool"],
+                "status": "timeout", "results": []}, 2
+
+    def test_explicit_retry_rechecks_startup_after_a_saved_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            request = root / "request.txt"
+            request.write_text("Fixture ICP")
+            run = root / "results.json"
+            status = root / "operational-status.json"
+            env = {"TYCHE_RUN_STARTED_AT": datetime.now(timezone.utc).isoformat()}
+            provider = FixtureProvider()
+            calls, results = [], []
+            finished = threading.Event()
+            def launch(execute):
+                def worker(command, cwd, worker_env, receipt, **options):
+                    calls.append(worker_env["TYCHE_WORKER_ID"])
+                    if worker_env["TYCHE_WORKER_ID"] == "worker-1":
+                        tools = ResearchTools(run, execute=execute, environment=worker_env)
+                        results.append(tools.call("tyche_start", setup_request()))
+                    # The model reads the result and ends its turn with usage recorded.
+                    usage = dict(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0,
+                                 output_tokens=10, reasoning_output_tokens=0, total_tokens=10)
+                    receipt.observe({"type": "thread.started", "thread_id": receipt.path.stem})
+                    receipt.observe_response({"thread_id": receipt.path.stem, "turn_id": "turn",
+                        "response_id": receipt.path.stem, "usage": usage}, env["TYCHE_RUN_STARTED_AT"], "gpt-5.6-luna")
+                    receipt.observe({"type": "turn.completed", "usage": usage})
+                    receipt.finish(0)
+                    finished.set()
+                    return 0
+                original_overview = ResearchTools._overview
+                def progress(tools):
+                    result = original_overview(tools)
+                    if finished.is_set():
+                        result["stop"] = "target_met"
+                    return result
+                with patch("run_costs.execute_with_usage", side_effect=worker), \
+                        patch.object(ResearchTools, "_overview", progress), contextlib.redirect_stdout(io.StringIO()):
+                    run_research(["codex", "exec", "Fixture ICP"], request, env, root)
+
+            # Launch 1: the free catalog times out, so startup saves a block.
+            with self.assertRaisesRegex(RuntimeError, "run_not_initialized"):
+                launch(self.catalog_timeout)
+            self.assertEqual(calls, ["worker-1"])
+            self.assertEqual(results[0]["status"], "operationally_blocked")
+            self.assertEqual(json.loads(status.read_text())["status"], "operationally_blocked")
+            self.assertFalse(run.exists())
+            self.assertFalse(run.with_name("results.json.budget.json").exists())
+            original_clock = json.loads((root / "company-tool.json").read_text())["started_at"]
+
+            # Launch 2: the catalog works again. The saved block must not stop
+            # the initializer before tyche_start rechecks the free prerequisites.
+            del calls[:]
+            finished.clear()
+            launch(provider)
+            self.assertEqual(calls[0], "worker-1")
+            self.assertNotEqual(results[1].get("status"), "operationally_blocked")
+            self.assertEqual(json.loads(status.read_text())["status"], "ready")
+            self.assertEqual(json.loads(run.read_text())["stop_check"]["started_at"], original_clock)
+            self.assertEqual({r["operation"] for r in provider.requests}, {"describe"})
+            state = coordination.snapshot(run)
+            self.assertTrue(state["ready"])
+            self.assertEqual(state["phase"], "finalization")
+
+    def test_retry_that_blocks_again_stops_on_the_new_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            request = root / "request.txt"
+            request.write_text("Fixture ICP")
+            run = root / "results.json"
+            status = root / "operational-status.json"
+            env = {"TYCHE_RUN_STARTED_AT": datetime.now(timezone.utc).isoformat()}
+            ResearchTools(run)._blocked_result("Required tool unavailable: saved by an earlier launch")
+            calls, stops = [], []
+            def worker(command, cwd, worker_env, receipt, **options):
+                calls.append(worker_env["TYCHE_WORKER_ID"])
+                tools = ResearchTools(run, execute=self.catalog_timeout, environment=worker_env)
+                self.assertEqual(tools.call("tyche_start", setup_request())["status"], "operationally_blocked")
+                # The model session is still open. This launch's block must end it.
+                until = time.monotonic() + 10
+                while not options["cost_stop"]() and time.monotonic() < until:
+                    time.sleep(.05)
+                stops.append(options["cost_stop"]())
+                receipt.finish(1)
+                return 1
+            with patch("run_costs.execute_with_usage", side_effect=worker), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "run_not_initialized"):
+                    run_research(["codex", "exec", "Fixture ICP"], request, env, root)
+            self.assertEqual(calls, ["worker-1"])
+            # A stop reason proves the block ended the session before the fallback wait.
+            self.assertIn("catalog description unavailable", stops[0])
+            self.assertIn("catalog description unavailable", json.loads(status.read_text())["reason"])
+            self.assertFalse(run.exists())
+            self.assertFalse(run.with_name("results.json.budget.json").exists())
+
     def test_three_model_invocations_overlap_and_resume_one_shared_run(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
