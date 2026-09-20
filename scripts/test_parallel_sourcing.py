@@ -387,7 +387,7 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(budget_guard.actual_cost_summary(ledger)["missing_model_usage"], [])
             self.assertEqual(blocked_receipt.read_bytes(), blocked_bytes)
 
-    def test_blocked_startup_that_never_ends_is_stopped_after_the_wait_and_stays_blocked(self):
+    def test_blocked_startup_that_never_ends_is_stopped_after_the_wait_and_preserves_unknown_usage(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             request = root / "request.txt"
@@ -433,21 +433,20 @@ class PoolTests(unittest.TestCase):
             self.assertEqual((killed["status"], killed["usage"], killed["usage_reconciled"]), ("incomplete", None, False))
             killed_bytes = killed_receipt.read_bytes()
 
-            # A later launch with a healthy catalog must still stop on the accounting
-            # guard: the killed session's usage is unknown and is never assumed.
-            errors = []
-            def retry(command, cwd, worker_env, receipt, **options):
-                try:
-                    ResearchTools(run, execute=FixtureProvider(), environment=worker_env).call("tyche_start", setup_request())
-                except ValueError as exc:
-                    errors.append(str(exc))
-                receipt.finish(0)
-                return 0
-            with patch("run_costs.execute_with_usage", side_effect=retry), contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(RuntimeError, "run_not_initialized"):
-                    run_research(["codex", "exec", "Fixture ICP"], request, env, root)
-            self.assertIn("model_usage_pending", errors[0])
-            self.assertEqual(budget_guard.spending_stop(budget_guard.load_ledger(run)), "model_usage_pending")
+            # Confirmed-cost admission permits later research, but the unknown model
+            # usage remains an exact final-accounting stop and is never assumed away.
+            restarted = ResearchTools(run, execute=FixtureProvider(), environment=env).call(
+                "tyche_start", setup_request())
+            self.assertNotEqual(restarted.get("status"), "operationally_blocked")
+            ledger = budget_guard.load_ledger(run)
+            self.assertIsNone(budget_guard.admission_stop(ledger))
+            self.assertEqual(budget_guard.spending_stop(ledger), "model_usage_pending")
+            import run_attempt
+            _, preflight = run_attempt.delivery_preflight(
+                run, json.loads(run.read_text()), check_review=False)
+            self.assertIn(
+                "final delivery requires complete cost accounting: model_usage_pending",
+                preflight["errors"])
             self.assertEqual(killed_receipt.read_bytes(), killed_bytes)
 
     def test_startup_repaired_during_the_wait_keeps_the_pool_running(self):
