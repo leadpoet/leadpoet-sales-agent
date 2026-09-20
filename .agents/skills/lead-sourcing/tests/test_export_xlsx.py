@@ -1,0 +1,557 @@
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+import xml.etree.ElementTree as ET
+import zipfile
+
+from linkedin_fixtures import add_linkedin_fields
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+EXPORTER_PATH = ROOT / "scripts" / "export_xlsx.mjs"
+CONTRACT_PATH = ROOT / "references" / "output-contract.md"
+
+EXPECTED_COLUMNS = [
+    "Name",
+    "Email",
+    "Role",
+    "Company",
+    "LinkedIn",
+    "Website",
+    "Company LinkedIn",
+    "Industry",
+    "Sub Industry",
+    "Contact City",
+    "Contact State",
+    "Contact Country",
+    "HQ State",
+    "HQ Country",
+    "Company Employee Range",
+    "Description",
+    "Intent Details",
+    "Phone",
+]
+
+ROWS_HELPER = """
+import fs from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+
+try {
+  const [modulePath, inputPath] = process.argv.slice(-2);
+  const exporter = await import(pathToFileURL(modulePath).href);
+  const document = JSON.parse(await fs.readFile(inputPath, "utf8"));
+  process.stdout.write(JSON.stringify({
+    columns: exporter.XLSX_COLUMNS,
+    rows: exporter.rowsFor(document),
+  }));
+} catch (error) {
+  process.stderr.write(JSON.stringify({
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  process.exitCode = 2;
+}
+"""
+
+
+def export_workbook(node, source, destination, node_modules):
+    # Rendering fixtures exercise the library. Full CLI delivery additionally
+    # requires the run ledger and stop policy, tested with completed run fixtures.
+    program = """
+import fs from 'node:fs/promises';
+import {pathToFileURL} from 'node:url';
+const [modulePath, source, destination, nodeModules] = process.argv.slice(-4);
+const exporter = await import(pathToFileURL(modulePath));
+const document = JSON.parse(await fs.readFile(source, 'utf8'));
+const receipt = await exporter.exportXlsx(document, destination, {resultsPath:source,nodeModules});
+console.log(JSON.stringify(receipt));
+"""
+    return subprocess.run([node, '--input-type=module', '-',
+                           str(EXPORTER_PATH), str(source), str(destination), node_modules],
+                          text=True, input=program, capture_output=True)
+
+
+def accepted_document(contact_fields: list[str] | None = None) -> dict:
+    effective_fields = ["email"] if contact_fields is None else contact_fields
+    request = {} if contact_fields is None else {"contact_fields": contact_fields}
+    contact = {
+        "full_name": "Ada Example",
+        "current_title": "Director of Supply Chain",
+        "contact_url": "https://example.com/team/ada",
+        "linkedin_url": "https://www.linkedin.com/in/ada-example",
+        "city": "Columbus",
+        "state": "Ohio",
+        "country": "United States",
+    }
+    routes = []
+    if "email" in effective_fields:
+        contact.update(
+            {
+                "email": "ada@example.com",
+                "email_validation": {
+                    "email": "ada@example.com",
+                    "status": "valid",
+                    "sub_status": None,
+                    "source": {
+                        "provider": "deepline",
+                        "validator": "zerobounce",
+                        "operation": "execute",
+                        "tool": "runtime-email-validator",
+                        "route_id": "email-validation-1",
+                    },
+                },
+            }
+        )
+        routes.append(
+            {
+                "route_id": "email-validation-1",
+                "phase": "email_validation",
+                "provider": "deepline",
+                "operation": "execute",
+                "tool": "runtime-email-validator",
+                "provider_status": "ok",
+                "paid_calls": 1,
+            }
+        )
+    if "phone" in effective_fields:
+        contact["phone"] = "+1 555 010 0200"
+
+    return add_linkedin_fields({
+        "request": request,
+        "routes": routes,
+        "accepted": [
+            {
+                "company": {
+                    "canonical_name": "Example Products, Inc.",
+                    "domain": "example.com",
+                    "website": "https://www.example.com/products",
+                    "linkedin_url": "https://www.linkedin.com/company/example-products",
+                    "industry": "Manufacturing",
+                    "sub_industry": "Consumer products",
+                    "hq_state": "Ohio",
+                    "hq_country": "United States",
+                    "employee_count": 240,
+                    "description": "Makes packaged goods, tools, and accessories.",
+                },
+                "signal_evidence": {
+                    "signal": "warehouse_system_integration",
+                    "evidence_date": "2026-08-12",
+                    "event_date": "2026-08-12",
+                    "evidence_text": (
+                        "The company connected its acquired warehouse to one WMS.\n"
+                        "The project covers inventory visibility & fulfillment."
+                    ),
+                    "evidence_url": "https://example.com/news/wms-project",
+                },
+                "primary_contact": contact,
+            }
+        ],
+    })
+
+
+def read_first_sheet_rows(workbook_path: pathlib.Path, sheet_number: int = 1) -> list[list[str]]:
+    main_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    tag = lambda name: f"{{{main_namespace}}}{name}"
+
+    with zipfile.ZipFile(workbook_path) as archive:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall(tag("si")):
+                shared_strings.append("".join(node.text or "" for node in item.iter(tag("t"))))
+
+        root = ET.fromstring(archive.read(f"xl/worksheets/sheet{sheet_number}.xml"))
+        rows: list[list[str]] = []
+        for row in root.iter(tag("row")):
+            values: list[str] = []
+            for cell in row.findall(tag("c")):
+                cell_type = cell.attrib.get("t")
+                value_node = cell.find(tag("v"))
+                if cell_type == "inlineStr":
+                    value = "".join(
+                        node.text or "" for node in cell.iter(tag("t"))
+                    )
+                elif value_node is None or value_node.text is None:
+                    value = ""
+                elif cell_type == "s":
+                    value = shared_strings[int(value_node.text)]
+                else:
+                    value = value_node.text
+                values.append(value)
+            rows.append(values)
+        return rows
+
+
+class ExportXlsxTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = os.environ.get("TYCHE_WORKSPACE_NODE") or shutil.which("node")
+
+    def run_rows_json(self, document: dict) -> subprocess.CompletedProcess[str]:
+        if not self.node:
+            self.skipTest("Node.js is not available")
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "results.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            return subprocess.run(
+                [
+                    self.node,
+                    "--input-type=module",
+                    "--eval",
+                    ROWS_HELPER,
+                    "tyche-row-test",
+                    str(EXPORTER_PATH),
+                    str(source),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+    def test_exact_header_matches_the_output_contract(self):
+        text = CONTRACT_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"## `leads\.xlsx` contract.*?```text\n([^\n]+)\n```",
+            text,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            match.group(1).split(","),
+            EXPECTED_COLUMNS[:16] + ["Signals"] + EXPECTED_COLUMNS[16:],
+        )
+
+    def test_maps_all_contact_and_company_columns(self):
+        result = self.run_rows_json(accepted_document(["email", "phone"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["columns"], EXPECTED_COLUMNS)
+        self.assertEqual(len(payload["rows"]), 1)
+        row = payload["rows"][0]
+        self.assertEqual(row["Name"], "Ada Example")
+        self.assertEqual(row["Email"], "ada@example.com")
+        self.assertEqual(row["Role"], "Director of Supply Chain")
+        self.assertEqual(row["Company"], "Example Products, Inc.")
+        self.assertEqual(row["LinkedIn"], "https://www.linkedin.com/in/ada-example")
+        self.assertEqual(row["Website"], "https://www.example.com/products")
+        self.assertEqual(
+            row["Company LinkedIn"],
+            "https://www.linkedin.com/company/example-products",
+        )
+        self.assertEqual(row["Industry"], "Manufacturing")
+        self.assertEqual(row["Sub Industry"], "Consumer products")
+        self.assertEqual(row["Contact City"], "Columbus")
+        self.assertEqual(row["Contact State"], "Ohio")
+        self.assertEqual(row["Contact Country"], "United States")
+        self.assertEqual(row["HQ State"], "Ohio")
+        self.assertEqual(row["HQ Country"], "United States")
+        self.assertEqual(row["Company Employee Range"], "201-500")
+        self.assertEqual(
+            row["Description"], "Makes packaged goods, tools, and accessories."
+        )
+        self.assertIn("Signal: warehouse_system_integration", row["Intent Details"])
+        self.assertIn("Date: 2026-08-12", row["Intent Details"])
+        self.assertIn("inventory visibility & fulfillment", row["Intent Details"])
+        self.assertEqual(row["Phone"], "+1 555 010 0200")
+
+    def test_zero_accepted_rows_returns_only_the_fixed_columns(self):
+        result = self.run_rows_json(
+            {"request": {"contact_fields": []}, "accepted": []}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload, {"columns": EXPECTED_COLUMNS, "rows": []})
+
+    def test_explicitly_unrequested_email_and_phone_stay_blank(self):
+        result = self.run_rows_json(accepted_document([]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)["rows"][0]
+        self.assertEqual(row["Email"], "")
+        self.assertEqual(row["Phone"], "")
+
+    def test_omitted_contact_fields_defaults_to_validated_email(self):
+        result = self.run_rows_json(accepted_document())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)["rows"][0]
+        self.assertEqual(row["Email"], "ada@example.com")
+        self.assertEqual(row["Phone"], "")
+
+    def test_requested_missing_contact_field_fails_closed(self):
+        document = accepted_document(["email"])
+        document["accepted"][0]["primary_contact"].pop("email")
+        result = self.run_rows_json(document)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("primary_contact requires requested email", result.stderr)
+
+    def test_missing_or_invalid_email_validation_fails_closed(self):
+        missing = accepted_document()
+        missing["accepted"][0]["primary_contact"].pop("email_validation")
+        result = self.run_rows_json(missing)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires a Deepline ZeroBounce email_validation receipt", result.stderr)
+
+        invalid = accepted_document()
+        invalid["accepted"][0]["primary_contact"]["email_validation"]["status"] = "INVALID"
+        result = self.run_rows_json(invalid)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("status must be valid", result.stderr)
+
+        unaccounted = accepted_document()
+        unaccounted["routes"][0]["paid_calls"] = 0
+        result = self.run_rows_json(unaccounted)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must record its paid Deepline call", result.stderr)
+
+    def test_only_explicit_valid_zerobounce_status_exports(self):
+        for status in ("valid", " VALID ", "Valid"):
+            with self.subTest(status=status):
+                document = accepted_document()
+                document["accepted"][0]["primary_contact"]["email_validation"]["status"] = status
+                result = self.run_rows_json(document)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["rows"][0]["Email"], "ada@example.com")
+
+        for status in ("invalid", "catch-all", "spamtrap", "abuse", "do_not_mail", "unknown", " DO_NOT_MAIL ", "new_status"):
+            with self.subTest(status=status):
+                document = accepted_document()
+                document["accepted"][0]["primary_contact"]["email_validation"]["status"] = status
+                result = self.run_rows_json(document)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("status must be valid", result.stderr)
+
+    def test_missing_optional_values_stay_blank(self):
+        document = accepted_document([])
+        company = document["accepted"][0]["company"]
+        contact = document["accepted"][0]["primary_contact"]
+        for key in (
+            "website",
+            "linkedin_url",
+            "industry",
+            "sub_industry",
+            "hq_state",
+            "hq_country",
+            "employee_count",
+            "description",
+        ):
+            company.pop(key)
+        for key in ("linkedin_url", "city", "state"):
+            contact.pop(key)
+        result = self.run_rows_json(document)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)["rows"][0]
+        self.assertEqual(row["Website"], "https://example.com")
+        self.assertEqual(row["LinkedIn"], "")
+        self.assertEqual(row["Company LinkedIn"], "")
+        self.assertEqual(row["Company Employee Range"], "201-500")
+
+    def test_malformed_accepted_row_fails_closed(self):
+        result = self.run_rows_json(
+            {"request": {"contact_fields": []}, "accepted": [{}]}
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires primary_contact", result.stderr)
+
+    def test_cli_requires_runtime_path_when_launcher_has_not_configured_it(self):
+        if not self.node:
+            self.skipTest("Node.js is not available")
+        result = subprocess.run(
+            [self.node, str(EXPORTER_PATH), "results.json", "leads.xlsx"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={k: v for k, v in os.environ.items() if k != "TYCHE_WORKSPACE_NODE_MODULES"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--node-modules is required", result.stderr)
+
+    def test_strict_cli_refuses_invalid_run_without_replacing_workbook(self):
+        if not self.node:
+            self.skipTest("Node.js is not available")
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "results.json"
+            destination = pathlib.Path(directory) / "leads.xlsx"
+            source.write_text(json.dumps(accepted_document()))
+            destination.write_bytes(b"previous workbook")
+            result = subprocess.run(
+                [self.node, str(EXPORTER_PATH), str(source), "--node-modules", directory],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Strict delivery validation failed", result.stderr)
+            self.assertEqual(destination.read_bytes(), b"previous workbook")
+            self.assertFalse((source.parent / "validation.json").exists())
+
+    def test_oversized_output_cell_does_not_replace_workbook(self):
+        from linkedin_fixtures import write_linkedin_receipts
+        node_modules = os.environ.get("TYCHE_WORKSPACE_NODE_MODULES")
+        if not self.node or not node_modules:
+            self.skipTest("Codex workbook runtime is not configured")
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "results.json"
+            destination = pathlib.Path(directory) / "leads.xlsx"
+            document = accepted_document()
+            document["accepted"][0]["company"]["description"] = "x" * 32768
+            source.write_text(json.dumps(document))
+            write_linkedin_receipts(source, document)
+            source.write_text(json.dumps(document))
+            destination.write_bytes(b"Existing workbook")
+            result = export_workbook(self.node, source, destination, node_modules)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Description exceeds Excel's 32,767-character cell limit", result.stderr)
+            self.assertEqual(destination.read_bytes(), b"Existing workbook")
+
+    def test_writes_valid_styled_workbook_when_runtime_is_configured(self):
+        from linkedin_fixtures import write_linkedin_receipts
+        node_modules = os.environ.get("TYCHE_WORKSPACE_NODE_MODULES")
+        if not self.node or not node_modules:
+            self.skipTest("Codex workbook runtime is not configured")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "results.json"
+            destination = pathlib.Path(directory) / "leads.xlsx"
+            source.write_text(
+                json.dumps(accepted_document(["email", "phone"])),
+                encoding="utf-8",
+            )
+            document = json.loads(source.read_text())
+            write_linkedin_receipts(source, document)
+            source.write_text(json.dumps(document))
+            result = export_workbook(self.node, source, destination, node_modules)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(destination.is_file())
+            self.assertFalse(pathlib.Path(f"{destination}.inspect.ndjson").exists())
+
+            with zipfile.ZipFile(destination) as archive:
+                names = set(archive.namelist())
+                self.assertIn("xl/worksheets/sheet1.xml", names)
+                self.assertIn("xl/styles.xml", names)
+                self.assertIn("xl/tables/table1.xml", names)
+                for name in names:
+                    if name.endswith(".xml"):
+                        ET.fromstring(archive.read(name))
+                worksheet_xml = archive.read("xl/worksheets/sheet1.xml")
+                table_xml = archive.read("xl/tables/table1.xml")
+                self.assertIn(b'showGridLines="0"', worksheet_xml)
+                self.assertIn(b'tableParts count="1"', worksheet_xml)
+                self.assertIn(b'name="LeadsTable"', table_xml)
+                self.assertIn(b'ref="A1:R2"', table_xml)
+
+            rows = read_first_sheet_rows(destination)
+            self.assertEqual(rows[0], EXPECTED_COLUMNS)
+            self.assertEqual(rows[1][0:4], [
+                "Ada Example",
+                "ada@example.com",
+                "Director of Supply Chain",
+                "Example Products, Inc.",
+            ])
+            self.assertIn("inventory visibility & fulfillment", rows[1][16])
+
+    def test_schema_allows_export_metadata_without_making_it_required(self):
+        blocks = re.findall(
+            r"```json\n(.*?)\n```",
+            CONTRACT_PATH.read_text(encoding="utf-8"),
+            re.S,
+        )
+        result_schema = json.loads(blocks[1])
+        company = result_schema["$defs"]["company"]
+        contact = result_schema["$defs"]["contact"]
+        self.assertEqual(company["required"], ["canonical_name", "domain", "employee_range", "employee_range_evidence"])
+        self.assertTrue(
+            {
+                "website",
+                "linkedin_url",
+                "industry",
+                "sub_industry",
+                "hq_state",
+                "hq_country",
+                "employee_count",
+                "description",
+            }.issubset(company["properties"])
+        )
+        self.assertTrue(
+            {"linkedin_url", "city", "state", "country"}.issubset(
+                contact["properties"]
+            )
+        )
+
+
+    def test_all_complete_contacts_export_in_leads_with_unchanged_company_details(self):
+        from test_contact_policy import contacts_document
+        from test_client_output import client_document
+        from linkedin_fixtures import write_linkedin_receipts
+        node_modules = os.environ.get("TYCHE_WORKSPACE_NODE_MODULES")
+        if not self.node or not node_modules:
+            self.skipTest("Codex workbook runtime is not configured")
+        for version in ("1.1", "1.2"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                source = pathlib.Path(directory) / "results.json"
+                destination = pathlib.Path(directory) / "leads.xlsx"
+                document = contacts_document(6)
+                document["schema_version"] = version
+                row = document["accepted"][0]
+                if version == "1.2":
+                    reference = client_document()
+                    document["retrieved_at"] = reference["retrieved_at"]
+                    for field in ("company", "account_fit", "intent_details", "signal_evidence"):
+                        row[field] = reference["accepted"][0][field]
+                row["backup_contacts"][0].update(current_title="Supply Chain Director",
+                                                city="Toronto", state="Ontario", country="Canada")
+                row["backup_contacts"][0]["location_evidence"]["evidence_text"] = "Toronto, Ontario, Canada"
+                for contact in [row["primary_contact"], *row["backup_contacts"]]:
+                    contact.update(company=row["company"]["canonical_name"],
+                                   source={"provider":"public_web", "operation":"execute", "route_id":"contact-role-1"},
+                                   evidence_url=contact["linkedin_url"], evidence_date="2026-09-01",
+                                   evidence_date_basis="observed_current",
+                                   evidence_text=f"{contact['full_name']} leads supply chain operations.")
+                pending = document["accepted"][0]["backup_contacts"][-1]
+                pending.pop("email")
+                pending.pop("email_validation")
+                source.write_text(json.dumps(document))
+                write_linkedin_receipts(source, document)
+                source.write_text(json.dumps(document))
+                before = source.read_bytes()
+                result = export_workbook(self.node, source, destination, node_modules)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                receipt = json.loads(result.stdout.strip().splitlines()[-1])
+                self.assertTrue(receipt["inspection"]["saved_workbook_values_verified"])
+                self.assertEqual((receipt["rows"], receipt["contacts"]), (5, 5))
+                leads = read_first_sheet_rows(destination)
+                self.assertEqual(len(leads), 6)
+                company_fields = ["Company", "Website", "Company LinkedIn", "Industry", "Sub Industry",
+                                  "HQ State", "HQ Country", "Company Employee Range", "Description", "Intent Details"]
+                if version == "1.2":
+                    company_fields.append("Signals")
+                for field in company_fields:
+                    index = leads[0].index(field)
+                    self.assertTrue(all(lead[index] == leads[1][index] for lead in leads[1:]), field)
+                contact_fields = {"Name":"full_name", "Email":"email", "Role":"current_title",
+                                  "LinkedIn":"linkedin_url", "Contact City":"city",
+                                  "Contact State":"state", "Contact Country":"country"}
+                expected_contacts = [row["primary_contact"], *row["backup_contacts"][:-1]]
+                for lead, contact in zip(leads[1:], expected_contacts):
+                    for column, field in contact_fields.items():
+                        self.assertEqual(lead[leads[0].index(column)], contact[field], column)
+                self.assertEqual(len({lead[1] for lead in leads[1:]}), 5)
+                tag = lambda name: "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}" + name
+                with zipfile.ZipFile(destination) as archive:
+                    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+                    self.assertEqual([sheet.attrib["name"] for sheet in workbook.iter(tag("sheet"))],
+                                     ["Leads", "Sources"] if version == "1.2" else ["Leads"])
+                    self.assertIn(b'A1:S6' if version == "1.2" else b'A1:R6', archive.read("xl/tables/table1.xml"))
+                if version == "1.2":
+                    sources = read_first_sheet_rows(destination, 2)
+                    fields = [source_row[2] for source_row in sources[1:]]
+                    self.assertIn("Role: Buyer 1", fields)
+                    self.assertIn("Contact Location: Buyer 1", fields)
+                    self.assertNotIn("Role: Buyer 5", fields)
+                self.assertEqual(source.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

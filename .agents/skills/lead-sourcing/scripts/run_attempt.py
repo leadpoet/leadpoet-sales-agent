@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+"""Execute a sourcing action or up to three independent company checks."""
+
+import argparse
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+import budget_guard
+import confirmed_leads
+import research_input
+from email_receipts import check_fallback, validator_for_tool, verification_finished
+from email_receipts import discovery_source, email_work, saved_result, verification_status_parent
+from linkedin_receipts import contact_verification_errors, email_identity_fields
+from provider_output import ResponseFile, load_json
+from source_receipts import read_receipt, request_fingerprint as _fingerprint
+from record_route import AUDIT_IDENTITY, IDENTITY, mutate, record
+from validate_run import (BLOCKING_PROVIDER_STATUSES, DETERMINATE_PROVIDER_STATUSES, _company_key,
+                          contact_count, contact_limits, contact_coverage, sourcing_target_met,
+                          calculate_cost_summary, calculate_review_counts, evaluate_stop, excluded_company,
+                          progress_snapshot, qualification_errors, _reviewed_company_scopes, accepted_errors,
+                          validate_run, stalled_approaches, _research_key, DELIVERY_STOPS)
+
+ATTEMPT_STATUSES = DETERMINATE_PROVIDER_STATUSES | BLOCKING_PROVIDER_STATUSES
+
+
+def review_fingerprint(document):
+    reviewed = {k: document.get(k) for k in ("request", "accepted", "unresolved", "rejected")}
+    reviewed["source_reviews"] = [{k: route.get(k) for k in ("route_id", "state", "reason", "continuation_route_ids")}
+        for route in document.get("stop_audit", {}).get("route_frontier", [])]
+    return hashlib.sha256(json.dumps(reviewed, sort_keys=True).encode()).hexdigest()
+
+
+def start_run(run_file, setup):
+    """Initialize or resume the existing records from one interpreted request."""
+    run_file = Path(run_file).resolve()
+    existing = budget_guard.read_object(run_file) if run_file.exists() else None
+    ledger_file = run_file.with_name(run_file.name + ".budget.json")
+    ledger = budget_guard.read_object(ledger_file) if ledger_file.exists() else None
+    document, options = research_input.start_document(run_file, setup, existing=existing, ledger=ledger)
+    refresh(document)
+    run_file.parent.mkdir(parents=True, exist_ok=True)
+    budget_guard.create_run(run_file, document, **options)
+    confirmed_leads.update(run_file)
+    saved = budget_guard.read_object(run_file)
+    return run_status(saved, evaluate_stop(saved, execution_budget=budget_guard.load_ledger(run_file)))
+
+
+def run_lookup(run_file, lookup, *, execute=None, plan_only=False):
+    """Adapt research choices to the one existing dispatch/recovery path."""
+    is_batch = isinstance(lookup, list)
+    values = lookup if is_batch else [lookup]
+    if not 1 <= len(values) <= 3:
+        raise ValueError("provide one lookup or at most three independent lookups")
+    specs = [research_input.prepare_lookup(value, f"lookup[{index}]") for index, value in enumerate(values)]
+    _preflight_contracts(run_file, specs, plan_only=plan_only)
+    result = (run_batch(run_file, specs, execute=execute, plan_only=plan_only) if is_batch else
+              run_attempt(run_file, specs[0], execute=execute, plan_only=plan_only))
+    if not plan_only:
+        from billing_reconciliation import settle_free_calls
+        settle_free_calls(run_file)
+    result["review_due"] = review_reminder(budget_guard.read_object(Path(run_file)))
+    return result
+
+
+def _preflight_contracts(run_file, specs, *, plan_only=False):
+    """Check all user-facing lookup inputs before any batch member is planned."""
+    for index, spec in enumerate(specs):
+        adapter, action, request = _validate_spec(spec, f"lookup[{index}]", plan_only=plan_only)
+        if action["provider"] == "deepline" and request["operation"] == "execute":
+            document = budget_guard.read_object(Path(run_file))
+            route = next((r for r in reversed(document.get("routes", [])) if r.get("provider") == "deepline"
+                          and r.get("operation") == "describe" and r.get("tool") == request["tool"]
+                          and r.get("provider_status") == "ok"), None)
+            if route is None:
+                raise ValueError(f"Describe {request['tool']} in this run before execution")
+            receipt = read_receipt(run_file, route["route_id"])["result"]
+            research_input.check_tool_contract(receipt, request)
+
+
+def refresh(document):
+    """Recompute bookkeeping only; never qualify leads or declare routes exhausted."""
+    accepted = document.get("accepted", [])
+    count, target = len(accepted), document["request"]["target_count"]
+    document.setdefault("summary", {}).update(
+        target_count=target, accepted_companies=count, accepted_contacts=count,
+        backup_contacts=sum(len(row.get("backup_contacts", [])) for row in accepted),
+        rejected_rows=len(document.get("rejected", [])), unresolved_rows=len(document.get("unresolved", [])))
+    document["summary"]["contact_coverage"] = contact_coverage(document)
+    routes = document.get("routes", [])
+    spent = {}
+    for provider in ("deepline", "scrapingdog"):
+        calls = [r for r in routes if r.get("provider") == provider and r.get("paid_calls", 0)]
+        spent[f"{provider}_credits"] = (None if any(r.get("cost_credits") is None for r in calls)
+                                        else float(sum(budget_guard.amount(r["cost_credits"], "cost") for r in calls)))
+    if isinstance(document.get("budget"), dict):
+        document["budget"].update(spent=spent, paid_calls=sum(r.get("paid_calls", 0) for r in routes),
+                                  status="unknown" if None in spent.values() else "within_budget")
+    audit = document.setdefault("stop_audit", {})
+    audit.update(calculate_review_counts(document), target_shortfall=max(0, target - count))
+    capacity = audit.setdefault("provider_call_capacity", {})
+    for provider in ("deepline", "scrapingdog"):
+        capacity.setdefault(provider, "unknown")
+        if spent[f"{provider}_credits"] is None:
+            capacity[provider] = "unknown"
+    if document.get("schema_version") in {"1.1", "1.2"}:
+        document["cost_summary"] = calculate_cost_summary(document)
+    return document
+
+
+def _contact_gate(document, action, run_file=None):
+    # Catalog reads describe available tools; they do not look up contacts.
+    if action.get("provider") == "deepline" and action.get("operation") in {"search", "describe"}:
+        return
+    if action["phase"] not in {"contact_discovery", "contact_verification", "email_validation"}:
+        return
+    # Draft problems belong to their company. Keep the full-document gate at
+    # delivery; an unrelated candidate must not block discovery or recovery.
+    scoped = dict(document, rejected=[])
+    for state in ("accepted", "unresolved"):
+        scoped[state] = [r for r in document.get(state, [])
+                         if isinstance(r, dict) and _company_key(r) == action["scope"]]
+    problems = qualification_errors(scoped, run_file=run_file)
+    if problems:
+        raise ValueError("; ".join(problems))
+    rows = [r for r in document.get("accepted", []) + document.get("unresolved", [])
+            if isinstance(r, dict) and _company_key(r) == action["scope"]
+            and (r in document.get("accepted", []) or r.get("stage") == "contact")]
+    if not rows or any(excluded_company(document["request"], r) for r in rows):
+        raise ValueError("contact lookup requires a non-excluded, account-qualified company")
+    for row in rows:
+        checks = [c for c in row.get("qualification_checks", []) if c.get("importance") == "required"]
+        fit = row.get("account_fit", {})
+        if ((checks and all(c.get("status") == "pass" and c.get("evidence") for c in checks))
+                or (fit.get("evidence_url") and fit.get("evidence_text"))):
+            return
+    raise ValueError("contact lookup requires passing account evidence; unknown stays unresolved")
+
+
+def pending_source_reviews(document):
+    """Attempted sources still open in the existing frontier, including discovery."""
+    attempted = {r["route_id"] for r in document.get("routes", [])}
+    return [{"ref": r["route_id"], "target": r.get("scope"), "reason": r.get("reason")}
+            for r in document.get("stop_audit", {}).get("route_frontier", [])
+            if r["route_id"] in attempted and r.get("state") in {"untried", "continuable"}]
+
+
+def review_reminder(document):
+    """Compact advice from the same pending sources used at finalization."""
+    pending = pending_source_reviews(document)
+    scopes = list(dict.fromkeys(r["target"] for r in pending))
+    return {"count": len(pending), "scopes": scopes[:3], "sources": pending[:3]}
+
+
+def strategy_reminder(document):
+    """Advisory history only; reuse saved reviews and the existing progress check."""
+    if sourcing_target_met(document):
+        return {"count": 0, "items": []}
+    reviewed = {r["route_id"] for r in document.get("stop_audit", {}).get("route_frontier", [])
+                if r.get("state") == "exhausted" and r.get("reason")}
+    terminal = {_company_key(r) for state in ("accepted", "rejected") for r in document.get(state, [])
+                if state == "rejected" or contact_count(r, document["request"]) >= contact_limits(document["request"])[1]}
+    groups = {}
+    for route in document.get("routes", []):
+        key = _research_key(route)
+        if (key is not None and key[0] not in terminal and route.get("entity_type") != "tool_catalog"
+                and route.get("provider_status") in {"ok", "no_results"}):
+            groups.setdefault(key, []).append(route)
+    items = []
+    progress = progress_snapshot(document)
+    for (scope, phase), routes in groups.items():
+        pair = routes[-2:]
+        if (len(pair) != 2 or any(r["route_id"] not in reviewed for r in pair)
+                or not stalled_approaches(document, pair[-1])):
+            continue
+        items.append({"target": scope, "phase": phase,
+                      "remaining_work": "verified buyer contact details" if phase == "contact_discovery"
+                          and any(f.startswith(scope + ":buyer:") for f in progress) else phase,
+                      "sources": [r["route_id"] for r in pair],
+                      "tools": list(dict.fromkeys(r.get("tool") or r.get("provider") for r in pair))})
+    result = {"count": len(items), "items": items}
+    if items:
+        result["next"] = (
+            "Two reviewed attempts added no saved milestone in these company/phases. "
+            "Check the remaining evidence gap and reuse saved results. If the same gap persists, "
+            "consult tools.md and choose another tool, source or research method. Correct a known "
+            "input error when useful; keyword/page changes alone may repeat the same method. "
+            "This is advice, not a block or proof of exhaustion; independent verification stays eligible.")
+    return result
+
+
+def _email_gate(run_file, document, action, request):
+    if not email_work(action, request):
+        return
+    _contact_gate(document, dict(action, phase="contact_discovery"), run_file)
+    rows = [r for state in ("accepted", "unresolved") for r in document.get(state, [])
+            if _company_key(r) == action["scope"]]
+    contacts = [(r.get("company", r.get("candidate", {})), c) for r in rows
+                for c in [r.get("primary_contact", {}), *r.get("backup_contacts", [])] if isinstance(c, dict)]
+    payload = request.get("payload", request)
+    name = payload.get("full_name", payload.get("fullName", payload.get("name"))) or " ".join(
+        str(payload.get(a, payload.get(b, ""))) for a, b in (("first_name", "firstName"), ("last_name", "lastName"))).strip()
+    url = payload.get("contact_linkedin", payload.get("linkedin_url", payload.get("linkedinUrl", payload.get("profile_url", payload.get("url", "")))))
+    email = payload.get("email")
+    reference = action.get("contact_ref")
+    if reference:
+        contacts = [(company, c) for company, c in contacts if c.get("profile_ref") == reference
+                    and reference.split(":")[0] == (c.get("location_evidence") or c).get("source", {}).get("route_id")]
+    elif name:
+        contacts = [(company, c) for company, c in contacts if str(c.get("full_name") or "").casefold() == name.casefold()]
+    if "linkedin.com/in/" in str(url):
+        contacts = [(company, c) for company, c in contacts
+                    if str(c.get("linkedin_url") or "").rstrip("/").casefold() == url.rstrip("/").casefold()]
+    if not reference and not name and "linkedin.com/in/" not in str(url):
+        matches = [(company, c) for company, c in contacts if isinstance(email, str)
+                   and str(c.get("email") or "").casefold() == email.casefold()]
+        # Without another selected identity, email work belongs to the saved
+        # primary contact. A verified backup cannot unlock an unverified primary.
+        contacts = matches or [(r.get("company", r.get("candidate", {})), r.get("primary_contact", {})) for r in rows]
+    errors = ["Select and review the intended contact's saved HarvestAPI profile first"]
+    if len(contacts) == 1:
+        company, contact = contacts[0]
+        errors = contact_verification_errors(document, run_file, company, contact)
+    if errors:
+        raise ValueError("Email work requires verified identity, current company and requested-role match before spending: "
+                         f"target={action['scope']!r}, contact_ref={reference!r}: " + "; ".join(errors))
+    if reference:
+        fields = email_identity_fields(document, run_file, company, contact)
+        for key in fields.keys() & payload.keys():
+            actual, expected = str(payload[key]).strip().casefold(), fields[key].strip().casefold()
+            if key in {"url", "profile_url", "linkedin_url", "linkedinUrl", "contact_linkedin"}:
+                actual, expected = actual.rstrip("/"), expected.rstrip("/")
+            if actual != expected:
+                raise ValueError(f"Email input {key} conflicts with the selected profile; omit it and use contact_ref")
+    if validator_for_tool(request.get("tool")) and not discovery_source(run_file, document.get("routes", []), email):
+        raise ValueError("Email validation requires the exact address in a saved finder/page first; "
+                         "a company email pattern is not discovery. Reuse a discovered address or find another contact.")
+    return company, contact
+
+
+def run_status(document, decision):
+    """The saved request and actionable work, without replaying the entire audit."""
+    return {"request": document["request"], "summary": document.get("summary", {}),
+            "review_due": review_reminder(document),
+            "next_actions": document.get("stop_check", {}).get("next_actions", []),
+            "pending_routes": [{k: r.get(k) for k in ("route_id", "scope", "state", "reason")}
+                               for r in document.get("stop_audit", {}).get("route_frontier", [])
+                               if r.get("state") in {"untried", "continuable"}],
+            "stop_decision": decision}
+
+
+def delivery_preflight(run_file, document, *, check_review=True):
+    """Check a proposed final state without writing, shared by review and export."""
+    document = refresh(copy.deepcopy(document))
+    ledger = budget_guard.load_ledger(run_file)
+    problems = budget_guard.audit_ledger(run_file, document, state=ledger)
+    if check_review and document.get("final_review") and document["final_review"].get("review_ref") != review_fingerprint(document):
+        problems.append("Research changed after final review; request and approve the current review packet")
+    decision = evaluate_stop(document, execution_budget=ledger)
+    problems.extend(decision["errors"])
+    stop = decision["decision"]
+    if stop not in DELIVERY_STOPS:
+        problems.append("Run still needs work: " + json.dumps(decision))
+    document["stop_reason"] = stop
+    document["stop_audit"]["frontier_complete"] = True
+    problems.extend(validate_run(document, require_stop_check=True, execution_budget=ledger, run_file=run_file))
+    return document, dict(valid=not problems, errors=list(dict.fromkeys(problems)), stop_policy="strict",
+                          delivery_allowed=not problems, stop_decision=decision,
+                          calculated_cost_summary=calculate_cost_summary(document))
+
+
+def save_stop_checkpoint(run_file):
+    """Persist a terminal audit even when evidence still prevents delivery.
+
+    The budget supervisor cannot buy another review turn. Reuse the strict
+    preflight to derive stop fields, retaining all remaining work and errors.
+    This does not approve research, change accounting or authorize an export.
+    """
+    checked = {}
+
+    def update(document):
+        document, result = delivery_preflight(run_file, document)
+        if result["stop_decision"]["decision"] not in DELIVERY_STOPS:
+            raise ValueError("A stop checkpoint requires a terminal stop decision")
+        checked.update(result, delivery_allowed=False)
+        return document
+
+    mutate(run_file, update)
+    return checked
+
+
+def finalize_run(run_file):
+    """Prepare derived completion fields only after review and full delivery checks."""
+    checked = {}
+
+    def update(document):
+        document, result = delivery_preflight(run_file, document)
+        if result["errors"]:
+            raise ValueError("; ".join(result["errors"]))
+        checked.update(result)
+        # Bind the exporter to the exact bytes validated inside the state lock.
+        saved = json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
+        checked["results_sha256"] = hashlib.sha256(saved.encode("utf-8")).hexdigest()
+        return document
+
+    mutate(run_file, update)
+    return checked
+
+
+def save_review(run_file, review):
+    """Preserve optional web observations, then atomically save judgments; never dispatch."""
+    if not isinstance(review, dict) or set(review) - {"companies", "routes", "next_actions"}:
+        raise ValueError("review accepts only companies, routes and next_actions; the saved request is authoritative")
+    for key in ("companies", "routes", "next_actions"):
+        if not isinstance(review.get(key, []), list):
+            raise ValueError(f"review.{key} must be an array")
+    review = copy.deepcopy(review)
+    observations = []
+    seen = set()
+    # Validate every attached response before saving any. Receipts are saved
+    # first so a rejected/interrupted judgment can be retried without research.
+    for index, item in enumerate(review.get("routes", [])):
+        label = f"review.routes[{index}]"
+        research_input.object_fields(item, {"route_id", "reason", "state", "continuation_route_ids", "response"}, label)
+        route_id = research_input.text(item.get("route_id"), label + ".route_id")
+        research_input.text(item.get("reason"), label + ".reason")
+        if route_id in seen:
+            raise ValueError(f"{label}.route_id duplicates {route_id}; review each route once")
+        seen.add(route_id)
+        if "response" in item:
+            response = item.pop("response")
+            try:
+                _public_web_observation(read_receipt(run_file, route_id)["result"], response)
+            except ValueError as exc:
+                raise ValueError(f"{label}.response: {exc}") from exc
+            observations.append((route_id, response))
+    for route_id, response in observations:
+        complete_public_web(run_file, route_id, response, check_stop=False)
+    result = {}
+
+    def update(document):
+        changed = set()
+        for item in review.get("companies", []):
+            if "row" not in item:
+                item = research_input.company_update(document, item)
+            state, row = item["state"], copy.deepcopy(item["row"])
+            if state not in {"accepted", "unresolved", "rejected"} or not isinstance(row, dict):
+                raise ValueError("company review requires an accepted, unresolved or rejected row")
+            if state != "accepted" and row.get("stage") not in {"account", "contact"}:
+                raise ValueError("company review requires an account or contact stage")
+            scope = _company_key(row)
+            if not scope or scope in changed:
+                raise ValueError("review each canonical company once")
+            changed.add(scope)
+            for collection in ("accepted", "unresolved", "rejected"):
+                document[collection] = [r for r in document.get(collection, [])
+                    if not (_company_key(r) == scope and (collection == "accepted" or r.get("stage") in {"account", "contact"}))]
+            document[state].append(row)
+        scoped = dict(document)
+        for state in ("accepted", "unresolved", "rejected"):
+            scoped[state] = [r for r in document.get(state, []) if _company_key(r) in changed]
+        problems = accepted_errors(scoped, run_file=run_file, fill_missing=True) + qualification_errors(scoped, run_file=run_file)
+        if problems:
+            raise ValueError("; ".join(problems))
+
+        closed, reviewed_scopes = set(), set(changed)
+        for item in review.get("routes", []):
+            if not isinstance(item, dict) or set(item) - {"route_id", "reason", "state", "continuation_route_ids"}:
+                raise ValueError("route review accepts route_id, reason, state and continuation_route_ids")
+            rid = item["route_id"]
+            entry = next(r for r in document["stop_audit"]["route_frontier"] if r["route_id"] == rid)
+            receipt = next(r for r in document["routes"] if r["route_id"] == rid)
+            reviewed_scopes.add(entry.get("scope"))
+            state = item.get("state", "exhausted")
+            links = list(dict.fromkeys(entry.get("continuation_route_ids", []) + item.get("continuation_route_ids", [])))
+            if state == "exhausted" and receipt.get("provider_status") == "partial":
+                saved = budget_guard.read_object(Path(run_file).parent / "receipts" / (rid + ".json"))
+                pending = saved.get("pending_verification")
+                if pending and not verification_finished(run_file, document, rid, pending, links):
+                    raise ValueError("pending verification needs its saved job's status continuation")
+            if state not in {"exhausted", "continuable", "blocked"}:
+                raise ValueError("review a completed attempt, not an untried route")
+            if state == "blocked" and receipt.get("provider_status") in DETERMINATE_PROVIDER_STATUSES:
+                raise ValueError("a successful receipt cannot become a provider blocker")
+            if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+                raise ValueError("route review requires the reason this source is complete or still open")
+            entry = {**entry, **item, "state": state}
+            if links:
+                entry["continuation_route_ids"] = links
+            if state == "exhausted":
+                entry["exhaustion_basis"] = ("continuation_exhausted" if entry.get("continuation_route_ids") else
+                    "no_results" if receipt.get("provider_status") == "no_results" and not receipt.get("rows_returned")
+                    else "no_new_unique_candidates")
+                closed.add(rid)
+            else:
+                entry.pop("exhaustion_basis", None)
+            document = record(document, entry)
+
+        actions = document["stop_check"]["next_actions"]
+        parked = _reviewed_company_scopes(document)
+        terminal = {_company_key(r) for state in ("accepted", "rejected") for r in document.get(state, [])
+                    if (state == "accepted" and contact_count(r, document["request"]) >= contact_limits(document["request"])[1])
+                    or (state == "rejected" and r.get("stage") == "account")}
+        supplied = review.get("next_actions", [])
+        supplied_ids = {a["id"] for a in supplied}
+        active_ids = {rid for r in document["stop_audit"]["route_frontier"]
+                      if r.get("state") in {"untried", "continuable"}
+                      for rid in [r["route_id"], *r.get("continuation_route_ids", [])]}
+        # Retire only completed work and the reviewed companies' speculative
+        # follow-ups. Explicit new actions below can reopen a concrete source.
+        actions[:] = [a for a in actions if a["id"] not in closed | supplied_ids
+                      and (a["id"] in active_ids or a.get("scope") not in reviewed_scopes & (parked | terminal))] + copy.deepcopy(supplied)
+        account_pending = {_company_key(row) for state in ("unresolved", "rejected")
+                           for row in document.get(state, []) if row.get("stage") == "account"} & changed
+        planned_ids = {row["route_id"] for row in document["stop_audit"]["route_frontier"]}
+        # A downgraded account needs evidence first. Preserve dispatched work
+        # for recovery; retire only speculative contact steps that cannot run.
+        actions[:] = [a for a in actions if a["id"] in planned_ids
+                      or a.get("scope") not in account_pending
+                      or a.get("phase") not in {"contact_discovery", "contact_verification", "email_validation"}]
+        refresh(document)
+        ledger = budget_guard.load_ledger(run_file)
+        decision = evaluate_stop(document, execution_budget=ledger)
+        # A spending pause must not discard research judgments. Keep every
+        # accounting consistency check and expose the unchanged pause in status.
+        problems = budget_guard.audit_ledger(run_file, document, state=ledger, allow_pending=True) + decision["errors"]
+        problems = [error for error in problems if error != ledger.get("blocked")]
+        if problems:
+            raise ValueError("; ".join(problems))
+        result.update(run_status(document, decision))
+        return document
+
+    mutate(run_file, update)
+    result["confirmed_leads"] = confirmed_leads.update(run_file)
+    return result
+
+
+def _validate_spec(spec, label="input", *, plan_only=False):
+    """Normalize input without touching run state, receipts, budgets or providers."""
+    if not isinstance(spec, dict):
+        raise ValueError(f"{label} must be an object containing action and request objects")
+    for field in ("action", "request"):
+        if not isinstance(spec.get(field), dict):
+            raise ValueError(f'{label}.{field} must be an object; legacy attempts use {{"action": {{...}}, "request": {{...}}}}. Use --lookup-file for research inputs without an action envelope.')
+    action, request = copy.deepcopy(spec["action"]), copy.deepcopy(spec["request"])
+    if not isinstance(action.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", action["id"]):
+        raise ValueError(f"{label}.action.id must be a safe unique route ID")
+    for field in ("scope", "description", "phase", "approach", "provider"):
+        if not isinstance(action.get(field), str) or not action[field].strip():
+            raise ValueError(f"{label}.action.{field} must be a non-empty string")
+    if action["phase"] not in {"account_discovery", "account_verification", "contact_discovery", "contact_verification", "email_validation"}:
+        raise ValueError(f"{label}.action.phase must be account_discovery, account_verification, contact_discovery, contact_verification, or email_validation")
+    provider = action["provider"]
+    if provider == "public_web" and not plan_only:
+        raise ValueError("public web: use --plan-only, then record the observed result with --complete")
+    if plan_only and provider != "public_web":
+        raise ValueError("--plan-only is for external public-web actions, not provider calls")
+    adapter, request = research_input.normalize_provider_request(provider, request, label)
+    operation = request.get("operation")
+    if not isinstance(operation, str) or not operation.strip():
+        raise ValueError(f"{label}.request.operation must be a non-empty string")
+    paid = int(provider == "scrapingdog" or (provider == "deepline" and operation == "execute"))
+    if type(action.get("paid_calls")) is not int or action["paid_calls"] != paid:
+        raise ValueError(f"{label}.action.paid_calls must match the wrapper operation (execute is reserved even if priced free)")
+    if "cost_upper_bound_credits" not in action:
+        raise ValueError(f"{label}.action.cost_upper_bound_credits is required; use null only for unknown pricing")
+    bound = action["cost_upper_bound_credits"]
+    if bound is not None:
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+            raise ValueError(f"{label}.action.cost_upper_bound_credits must be a finite nonnegative number or null")
+        budget_guard.amount(bound, f"{label}.action.cost_upper_bound_credits")
+    if provider == "public_web" and bound != 0:
+        raise ValueError(f"{label}.action.cost_upper_bound_credits must be zero for public web")
+    if "status_read" in action and type(action["status_read"]) is not bool:
+        raise ValueError(f"{label}.action.status_read must be boolean")
+    if action.get("status_read") and (provider != "deepline" or operation != "execute"
+                                     or action.get("cost_upper_bound_credits") != 0):
+        raise ValueError("status_read requires a described free Deepline job-status getter")
+    if action.get("status_read") and validator_for_tool(request.get("tool")) and not request.get("payload", {}).get("id"):
+        raise ValueError("A verification status read requires the saved pending job id and its status getter; do not resubmit the email-verification request")
+    is_verification = ("email_validation" in {request.get("entity_type"), action.get("entity_type")}
+                       or provider == "deepline" and operation == "execute"
+                       and validator_for_tool(request.get("tool")))
+    if provider == "deepline" and operation in {"search", "describe"}:
+        action["entity_type"] = "tool_catalog"
+    elif "tool_catalog" in {request.get("entity_type"), action.get("entity_type")}:
+        raise ValueError("tool_catalog is reserved for live catalog operations")
+    elif provider == "deepline" and action["phase"] == "email_validation" and not validator_for_tool(request.get("tool")):
+        raise ValueError(f"{label}: email_validation requires a supported validation operation; email finders use contact_discovery and cannot spend its protected reserve")
+    elif is_verification and action["phase"] != "email_validation":
+        raise ValueError(f"{label}.action.phase must be email_validation for an email-validation request")
+    if action.get("entity_type") and action["entity_type"] != "tool_catalog":
+        request["entity_type"] = action["entity_type"]
+    if action["phase"] == "email_validation" and action.get("entity_type") != "tool_catalog":
+        action["entity_type"] = request["entity_type"] = "email_validation"
+    action["operation"] = operation
+    if request.get("tool"):
+        action["tool"] = request["tool"]
+    action["request_fingerprint"] = _fingerprint(provider, request)
+    return adapter, action, request
+
+
+def _prepare(run_file, validated):
+    adapter, action, request = validated
+    provider, operation, fingerprint = action["provider"], action["operation"], action["request_fingerprint"]
+    finalization = os.environ.get("TYCHE_FINALIZATION_ONLY") == "1"
+    prepared = {}
+
+    def plan(document):
+        refresh(document)
+        status_parent = verification_status_parent(run_file, document, action, request)
+        catalog_recovery = (provider == "deepline" and operation == "describe" and action["paid_calls"] == 0
+                            and any(r.get("provider") == "deepline" and r.get("tool") == request.get("tool")
+                                    for r in document["routes"]))
+        if finalization and not status_parent and not catalog_recovery:
+            if not (provider == "public_web" and operation == "open" and action["phase"] == "account_verification"):
+                raise ValueError("Research is closed. Only reread a saved source or use a confirmed-free status getter for this run's existing verification job.")
+            row = next((r for r in document["accepted"] if _company_key(r) == action["scope"]), {})
+            evidence = [row.get("account_fit", {}), row.get("signal_evidence", {})] + [
+                e for check in row.get("qualification_checks", []) + row.get("supporting_findings", []) for e in check.get("evidence", [])]
+            urls = {e.get("url", e.get("evidence_url")) for e in evidence} - {None, ""}
+            if request.get("query", request.get("url")) not in urls:
+                raise ValueError("Research is closed. Reopen only the exact saved source URL for this accepted company.")
+        if not status_parent:
+            if action.get("status_read") and validator_for_tool(request.get("tool")):
+                raise ValueError("A verification status read must match this run's saved pending job and address")
+            _contact_gate(document, action, run_file)
+            _email_gate(run_file, document, action, request)
+        if provider == "deepline" and operation == "execute" and request.get("tool") == "harvestapi_get_profile":
+            for row in document.get("accepted", []) + document.get("unresolved", []):
+                company = row.get("company", row.get("candidate", {}))
+                if _company_key(row) == action["scope"] and isinstance(company, dict) and company.get("linkedin_url"):
+                    # Local normalization context only; never sent in the provider payload.
+                    request["target_company_linkedin_url"] = company["linkedin_url"]
+                    break
+        audit = document.setdefault("stop_audit", {})
+        frontier = audit.setdefault("route_frontier", [])
+        # An explicit free catalog refresh may recover a schema/price change
+        # before substantive research. Paid request deduplication is unchanged.
+        recent = [] if provider == "deepline" and operation in {"search", "describe"} else frontier
+        matches = [r for r in recent if r.get("request_fingerprint") == fingerprint]
+        if matches:
+            previous = next((r for r in document.get("routes", [])
+                             if r.get("route_id") == matches[-1]["route_id"]), {})
+            unsent_local_refusal = False
+            if (previous.get("provider_status") == "config_error"
+                    and previous.get("paid_calls") == 0):
+                saved = read_receipt(run_file, matches[-1]["route_id"])["result"]
+                ledger = budget_guard.load_ledger(run_file)
+                unsent_local_refusal = (saved.get("request_sent") is False
+                    and saved.get("error_stage") in {"pricing", "coordination"}
+                    and matches[-1]["route_id"] not in ledger.get("calls", {}))
+            # Only reread an explicitly free, completed status call that reported
+            # a job still in progress, or retry a receipted local pricing/coordination refusal
+            # that never reserved or dispatched. Uncertain calls stay blocked.
+            if not unsent_local_refusal and not (action.get("status_read") and matches[-1].get("status_read")
+                    and previous.get("provider_status") == "partial"
+                    and previous.get("cost_credits") in (None, 0)
+                    and previous.get("cost_upper_bound_credits") == 0):
+                raise ValueError(f"request already attempted or pending; saved route: {matches[-1]['route_id']}. "
+                                 "Inspect that receipt, recover its saved response if incomplete, or choose a changed request. "
+                                 "Do not redispatch the same paid request.")
+        if any(r["route_id"] == action["id"] for r in frontier):
+            raise ValueError("route ID already planned; resume its receipt instead of redispatching")
+        if provider == "deepline" and not action.get("status_read"):
+            check_fallback(run_file, document, request)
+        actions = document["stop_check"]["next_actions"]
+        actions[:] = [a for a in actions if a["id"] != action["id"]] + [action]
+        decision = evaluate_stop(document, execution_budget=budget_guard.load_ledger(run_file))
+        # Saving an already observed source for an accepted company remains
+        # possible during final review. This executes no provider call and
+        # does not reopen discovery or extend a user-specified time limit.
+        review_observation = (not decision["errors"] and
+            (decision["decision"] == "target_met" or finalization and decision["decision"] in DELIVERY_STOPS)
+            and provider == "public_web"
+            and action["phase"] == "account_verification" and action["paid_calls"] == 0
+            and action["scope"] in {_company_key(row) for row in document["accepted"]})
+        status_recovery = status_parent and decision["decision"] in DELIVERY_STOPS and not decision["errors"]
+        free_recovery = (catalog_recovery and not decision["errors"] and decision["decision"] in
+                         DELIVERY_STOPS | {"provider_stop", "input_or_configuration_stop"})
+        if action["id"] not in decision["eligible_actions"] and not review_observation and not status_recovery and not free_recovery:
+            reason = decision.get("blocked_actions", {}).get(action["id"])
+            if reason:
+                # Keep the agent's concrete, unaffordable choice for the stop
+                # audit. No route, receipt or reservation is created. Otherwise
+                # the agent has to rebuild next_actions by hand to explain why
+                # this work cannot proceed at the remaining budget.
+                prepared["refusal"] = reason
+                return document
+            raise ValueError("action not eligible: " + (reason or json.dumps(decision)))
+        metadata = {k: action[k] for k in AUDIT_IDENTITY if k in action}
+        entry = dict(route_id=action["id"], phase=action["phase"], provider=provider,
+                     operation=operation, request_summary=action["description"], state="untried",
+                     reason="Planned bounded attempt.", **metadata)
+        document = record(document, entry)
+        entry.update(state="blocked", reason="Dispatch pending; recover the saved response before any retry.")
+        document = record(document, entry)
+        if status_parent:
+            parent = next(r for r in document["stop_audit"]["route_frontier"] if r["route_id"] == status_parent)
+            parent["continuation_route_ids"] = list(dict.fromkeys(parent.get("continuation_route_ids", []) + [action["id"]]))
+        prepared.update(action=action, frontier=entry, progress_before=progress_snapshot(document),
+                        accepted_before=len(document["accepted"]))
+        return document
+
+    mutate(run_file, plan)
+    if "refusal" in prepared:
+        raise ValueError("action not eligible: " + prepared["refusal"])
+    if action["paid_calls"]:
+        request["spend"] = {"run_file": str(run_file), "route_id": action["id"],
+                            "max_cost_credits": action["cost_upper_bound_credits"],
+                            "accepted_before": prepared["accepted_before"]}
+        if "pricing_basis" in action:
+            request["spend"]["pricing_basis"] = copy.deepcopy(action["pricing_basis"])
+    return adapter, request, prepared
+
+
+def finish_attempt(run_file, route_id, body, *, check_stop=True):
+    """Record a saved response without dispatching anything (also the resume path)."""
+    def finish(document):
+        if body.get("run_fingerprint") != budget_guard.run_fingerprint(run_file):
+            raise ValueError("saved response belongs to another run or lacks run identity; preserve it and reconcile its origin")
+        ledger = budget_guard.load_ledger(run_file)
+        entry = next(r for r in document["stop_audit"]["route_frontier"] if r["route_id"] == route_id)
+        old = next((r for r in document["routes"] if r["route_id"] == route_id), None)
+        if old:
+            return document
+        action = next((a for a in document["stop_check"]["next_actions"] if a["id"] == route_id), None)
+        if action is None:
+            action = body.get("attempt", {}).get("action")
+        if not isinstance(action, dict) or action.get("id") != route_id:
+            raise ValueError("saved response lacks its original action; preserve the receipt and reservation")
+        if body.get("request_fingerprint") != entry["request_fingerprint"] or body.get("provider") != entry["provider"]:
+            raise ValueError("saved response does not match this request/provider")
+        status = body.get("status")
+        if status not in ATTEMPT_STATUSES:
+            raise ValueError("save a normalized response with a determinate provider status")
+        paid = action["paid_calls"]
+        call = ledger.get("calls", {}).get(route_id) if ledger else None
+        if paid and call is None and body.get("request_sent") is False:
+            paid = 0
+        if paid and call is None:
+            raise ValueError("paid response has no dispatch record; preserve it and reconcile, never redispatch")
+        actual = budget_guard.report_amount(call["actual_credits"]) if call and call["actual_credits"] is not None else (0 if not paid else None)
+        bound = actual
+        if actual is None:
+            held = call.get("held_credits") if ledger["version"] == 2 and call.get("tariff") else call.get("maximum_credits")
+            bound = budget_guard.report_amount(held) if held is not None else None
+        results = body.get("results", [])
+        if not isinstance(results, list):
+            raise ValueError("normalized results must be an array")
+        receipt = {k: entry[k] for k in IDENTITY}
+        receipt.update({k: entry[k] for k in AUDIT_IDENTITY if k in entry})
+        receipt.update(hypothesis=action["description"], pilot_max_rows=10, paid_calls=paid,
+                       rows_returned=len(results), rows_usable=0, provider_status=status,
+                       cost_credits=actual, cost_upper_bound_credits=bound,
+                       cost_basis="actual" if actual is not None else ("estimated" if bound is not None else "unknown"),
+                       cost_usd=budget_guard.report_amount(call["actual_usd"]) if call and call.get("actual_usd") is not None else None,
+                       accepted_leads_before_call=body["accepted_before"], progress_before=body["progress_before"])
+        if call and call.get("tariff"):
+            receipt["billing_basis"] = body.get("billing", {}).get("basis", "documented_tariff_hold")
+        if action.get("tool"):
+            receipt["tool"] = action["tool"]
+        entry = dict(entry, state="continuable" if status in DETERMINATE_PROVIDER_STATUSES else "blocked",
+                     reason="Response saved; assess evidence and choose the next useful action." if status in DETERMINATE_PROVIDER_STATUSES else "Provider failure; retain receipt and change route.")
+        if status == "no_results" and not results:
+            entry.update(state="exhausted", exhaustion_basis="no_results",
+                         reason="This exact request returned no results; broader discovery remains open.")
+        if (status == "ok"
+                and action.get("tool") == "harvestapi_get_profile" and action.get("contact_ref")
+                and body.get("attempt", {}).get("request", {}).get("payload", {}).get("findEmail") == "true"
+                and len(results) == 1 and results[0].get("emails") == []
+                and not results[0].get("contact_email") and not results[0].get("email_candidates")
+                and not body.get("pending_verification")
+                and read_receipt(run_file, route_id)["result"].get("receipt_status") == "complete"):
+            entry.update(state="exhausted", exhaustion_basis="no_new_unique_candidates",
+                         reason="This completed profile email lookup returned no email. Reuse the verified contact with another email source, or choose another contact/company when useful. The saved profile and charges are unchanged.")
+        if (status == "ok" and action["phase"] == "email_validation"
+                and validator_for_tool(action.get("tool")) and len(results) == 1
+                and not body.get("pending_verification")):
+            email = body.get("attempt", {}).get("request", {}).get("payload", {}).get("email")
+            if isinstance(email, str) and email.strip():
+                try:
+                    source = {k: receipt[k] for k in ("provider", "operation", "tool", "route_id")}
+                    verdict = saved_result(run_file, document["routes"] + [receipt], source, email)
+                except (ValueError, OSError):
+                    pass  # Unbound or incomplete results still require inspection.
+                else:
+                    if verdict.get("status"):
+                        entry.update(state="exhausted", exhaustion_basis="no_new_unique_candidates",
+                                     reason="Single-address verification completed; reuse its saved verdict. Contact selection and eligible fallback remain separate decisions.")
+        if action.get("entity_type") == "tool_catalog" and status in {"ok", "no_results"}:
+            entry.update(state="exhausted", exhaustion_basis="no_new_unique_candidates",
+                         reason="Catalog response saved; live capabilities are available for route choice.")
+        if action.get("entity_type") == "tool_catalog":
+            document["stop_check"].setdefault("catalog_review_route_ids", []).append(route_id)
+        document = record(document, entry, receipt)
+        document["stop_check"]["next_actions"] = [a for a in document["stop_check"]["next_actions"] if a["id"] != route_id]
+        return refresh(document)
+    mutate(run_file, finish)
+    if check_stop:
+        document = budget_guard.read_object(run_file)
+        return evaluate_stop(document, execution_budget=budget_guard.load_ledger(run_file))
+
+
+def _recover_captured_response(run_file, rid, saved, call):
+    """Finish an interrupted local write from raw evidence, never from a retry."""
+    raw = saved.get("provider_response")
+    if (saved.get("receipt_status") != "response_received" or not isinstance(raw, dict)
+            or not ({"body", "transport_status"} & raw.keys())):
+        return saved
+    provider = call["provider"]
+    request = saved.get("attempt", {}).get("request")
+    action = saved.get("attempt", {}).get("action", {})
+    if (provider not in {"deepline", "scrapingdog"} or saved.get("provider") != provider
+            or action.get("id") != rid or action.get("provider") != provider
+            or not isinstance(request, dict) or _fingerprint(provider, request) != saved.get("request_fingerprint")):
+        raise ValueError("captured response does not match the original dispatched request")
+    adapter, request = research_input.normalize_provider_request(provider, request, "saved response")
+    body, _ = adapter.normalize_response(request, raw)
+    if provider == "scrapingdog":
+        # Only a dispatch-bound tariff can settle a new ScrapingDog request.
+        # Historical receipts without one keep their original accounting.
+        if not call.get("tariff"):
+            return saved
+        import scrapingdog_billing
+        body.update(tariff=call["tariff"], **scrapingdog_billing.outcome(call["tariff"], raw))
+    recovered = dict(saved, **body)
+    spend_state = ("settled" if budget_guard.settlement_billing(body) else
+                   "reserved" if provider == "scrapingdog" or "state" not in call else "pending_billing")
+    recovered.update(receipt_status="complete", spend_receipt={"route_id": rid,
+                     "ledger": str(budget_guard.ledger_path(run_file)), "state": spend_state})
+    path = run_file.parent / "receipts" / (rid + ".json")
+    with budget_guard.transaction(path) as current:
+        if current != saved:
+            raise ValueError("captured response changed during recovery; preserve it for inspection")
+        current.update(recovered)
+    return recovered
+
+
+def _settle_recovered_response(run_file, rid, saved, call):
+    billing = budget_guard.settlement_billing(saved)
+    if not billing:
+        with budget_guard.transaction(budget_guard.ledger_path(run_file)) as ledger:
+            current = ledger["calls"][rid]
+            if ledger["version"] == 2 and current.get("state") == "in_flight":
+                current["state"] = "reserved" if current.get("tariff") and current.get("held_credits") is not None else "pending_billing"
+        return
+    if call.get("billing_evidence") or call.get("free_evidence"):
+        return
+    if call.get("actual_credits") is None and call.get("actual_usd") is None:
+        budget_guard.settle(budget_guard.ledger_path(run_file), rid, billing)
+        return
+    for field, key in (("actual_credits", "credits_charged"), ("actual_usd", "cost_usd")):
+        if ((call.get(field) is None) != (billing.get(key) is None)
+                or call.get(field) is not None and budget_guard.amount(call[field], field) != budget_guard.amount(billing[key], key)):
+            raise ValueError("saved response billing differs from the settled ledger")
+
+
+def recover_completed_attempts(run_file):
+    """Reconcile saved dispatches between worker invocations; never call a provider."""
+    run_file = Path(run_file)
+    ledger = budget_guard.load_ledger(run_file)
+    if ledger is None:
+        return {"recovered": [], "pending": [], "errors": []}
+    document = budget_guard.read_object(run_file)
+    recorded = {r["route_id"] for r in document.get("routes", [])}
+    recovered, pending = [], []
+    planned = {row["route_id"] for row in document.get("stop_audit", {}).get("route_frontier", [])
+               if row.get("request_fingerprint") and (run_file.parent / "receipts" / (row["route_id"] + ".json")).is_file()}
+    for rid in sorted((set(ledger["calls"]) | planned) - recorded):
+        saved = read_receipt(run_file, rid)["result"]
+        if rid in ledger["calls"]:
+            saved = _recover_captured_response(run_file, rid, saved, ledger["calls"][rid])
+        if saved.get("receipt_status") == "complete" and saved.get("status") in ATTEMPT_STATUSES:
+            if rid not in ledger["calls"] and saved.get("request_sent") is not False:
+                continue  # No proof of an unsent attempt; retain its original state.
+            if rid in ledger["calls"]:
+                _settle_recovered_response(run_file, rid, saved, ledger["calls"][rid])
+            finish_attempt(run_file, rid, saved, check_stop=False)
+            recovered.append(rid)
+        elif rid in ledger["calls"]:
+            pending.append({"ref": rid, "receipt_status": saved.get("receipt_status"),
+                            "reason": "No complete response saved; retain pending accounting and never repeat this paid request."})
+    document = budget_guard.read_object(run_file)
+    return {"recovered": recovered, "pending": pending,
+            "errors": budget_guard.audit_ledger(run_file, document)}
+
+
+def _start_attempt(run_file, validated):
+    budget_guard.load_ledger(run_file)  # Refuse imported state before planning or dispatch.
+    adapter, request, prepared = _prepare(run_file, validated)
+    receipts = run_file.parent / "receipts"
+    receipts.mkdir(exist_ok=True)
+    output = receipts / (prepared["action"]["id"] + ".json")
+    redact = adapter.redact if adapter else lambda value: value
+    metadata = {k: prepared[k] for k in ("progress_before", "accepted_before")}
+    metadata.update(run_fingerprint=budget_guard.run_fingerprint(run_file),
+                    request_fingerprint=prepared["action"]["request_fingerprint"], provider=prepared["action"]["provider"])
+    # Keep audit identity recoverable even if the main draft is damaged.
+    metadata["attempt"] = copy.deepcopy({"action": prepared["action"],
+                           "request": {k: v for k, v in request.items() if k != "spend"}})
+    capture = ResponseFile(output, redact, metadata=metadata)
+    return adapter, request, capture
+
+
+def _dispatch(adapter, request, capture, *, execute=None, plan_only=False):
+    metadata = capture.metadata
+    if plan_only:
+        if not capture.finish(dict(metadata, status="pending")):
+            raise OSError("public-web plan could not be saved; recover its receipt before dispatch")
+        return {"pending": True, "receipt_file": str(capture.path), **metadata}
+    body, code = (execute or adapter.run)(request, capture.capture)
+    # Adapters can return valid JSON with exit 0 for a provider-level failure.
+    # Keep their nonzero codes, but never report a failed attempt as success.
+    code = code or (0 if body.get("status") in DETERMINATE_PROVIDER_STATUSES else 2)
+    body.update(metadata)
+    if not capture.finish(body):
+        raise OSError("response could not be saved; recover the captured response, do not repeat the provider call")
+    return {"receipt_file": str(capture.path), "provider_status": body.get("status"),
+            "exit_code": code, "result": body}
+
+
+def run_attempt(run_file, spec, *, execute=None, plan_only=False):
+    run_file = Path(run_file).resolve(strict=True)
+    prepared = _start_attempt(run_file, _validate_spec(spec, plan_only=plan_only))
+    result = _dispatch(*prepared, execute=execute, plan_only=plan_only)
+    if not plan_only:
+        result["stop_decision"] = finish_attempt(run_file, spec["action"]["id"], result["result"])
+    return result
+
+
+def run_batch(run_file, specs, *, execute=None, plan_only=False):
+    """One writer plans/records; at most three workers dispatch to their own receipts."""
+    run_file = Path(run_file).resolve(strict=True)
+    if not isinstance(specs, list) or not 1 <= len(specs) <= 3:
+        raise ValueError("a batch requires 1-3 independent company checks")
+    ids, scopes, inputs = set(), set(), []
+    for index, spec in enumerate(specs):
+        validated = _validate_spec(spec, f"batch[{index}]", plan_only=plan_only)
+        action = validated[1]
+        rid, scope = action["id"], action["scope"]
+        scope = scope.strip().lower()
+        catalog = action.get("entity_type") == "tool_catalog"
+        if rid in ids or not catalog and scope in scopes:
+            raise ValueError("batch actions need unique route IDs and distinct canonical company scopes")
+        if not catalog and action["phase"] not in {"account_verification", "contact_discovery", "contact_verification", "email_validation"}:
+            raise ValueError("batch mode is for company checks; run discovery pilots separately as a single lookup object, not an array")
+        ids.add(rid)
+        if not catalog:
+            scopes.add(scope)
+        inputs.append(validated)
+
+    results, prepared = [], []
+    # Save every plan before any network work. A refused member does not discard
+    # its siblings, and a failed dispatch is never automatically resubmitted.
+    for validated in inputs:
+        result = {"route_id": validated[1]["id"], "exit_code": 0}
+        results.append(result)
+        try:
+            prepared.append((result, _start_attempt(run_file, validated)))
+        except Exception as exc:
+            result.update(exit_code=2, error=str(exc), error_stage="prepare")
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_dispatch, *args, execute=execute, plan_only=plan_only): result
+                   for result, args in prepared}
+        for future in as_completed(futures):
+            result = futures[future]
+            stage = "dispatch"
+            try:
+                result.update(future.result())
+                if not plan_only:
+                    stage = "record"
+                    finish_attempt(run_file, result["route_id"], result["result"], check_stop=False)
+            except Exception as exc:
+                result.update(exit_code=2, error=str(exc), error_stage=stage,
+                              receipt_file=str(run_file.parent / "receipts" / (result["route_id"] + ".json")))
+    document = budget_guard.read_object(run_file)
+    return {"attempts": results, "exit_code": 2 if any(r["exit_code"] for r in results) else 0,
+            "stop_decision": evaluate_stop(document, execution_budget=budget_guard.load_ledger(run_file))}
+
+
+def _harvest_display(value):
+    """Project known LinkedIn rows for review, keeping a path to complete receipts."""
+    omitted = {"similarOrganizations", "logo", "logos", "backgroundCover",
+               "backgroundCovers", "profilePicture", "coverPicture", "photo"}
+    if isinstance(value, dict):
+        if value.get("entity_type") in {"contact", "person", "company", "account", "organization"}:
+            fields = {"entity_type", "provider", "tool", "company", "company_linkedin_url", "domain",
+                      "name", "linkedinUrl", "employee_range", "employeeCountRange", "employeeCount",
+                      "description", "tagline", "industries", "specialities", "companyType", "foundedOn",
+                      "locations", "location", "location_text", "country", "state", "city",
+                      "contact_name", "contact_url", "contact_title", "contact_email", "headline",
+                      "current_positions", "position_review", "email_candidates", "missing_fields",
+                      "role_title", "is_current", "start_date", "end_date", "organization", "current_employers",
+                      "evidence_url", "evidence_date", "evidence_text", "signal"}
+            projected = {key: _harvest_display(item) for key, item in value.items() if key in fields}
+            projected["omitted_fields"] = sorted(set(value) - fields)
+        else:
+            projected = {key: _harvest_display(item) for key, item in value.items() if key not in omitted}
+        if "employeeCount" in projected and re.search(r"linkedin\.com/company/", str(
+                value.get("linkedinUrl") or value.get("company_linkedin_url") or ""), re.IGNORECASE):
+            projected["linkedin_associated_member_count"] = projected.pop("employeeCount")
+        return projected
+    if isinstance(value, list):
+        return [_harvest_display(item) for item in value]
+    return value
+
+
+def cli_output(result):
+    """Trim repeated audit metadata only from stdout; saved receipts stay complete."""
+    output = {k: v for k, v in result.items() if k != "progress_before"}
+    if "attempts" in output:
+        output["attempts"] = [cli_output(attempt) for attempt in output["attempts"]]
+    if isinstance(output.get("result"), dict):
+        body = {k: v for k, v in output["result"].items()
+                if k not in {"progress_before", "accepted_before", "request_fingerprint", "attempt", "provider_response"}}
+        if "results" in body and body.get("evidence") == body["results"]:
+            body.pop("evidence", None)
+        if output.get("receipt_file") and str(body.get("tool", "")).startswith("harvestapi_"):
+            for field in ("results", "evidence"):
+                if field in body:
+                    body[field] = _harvest_display(body[field])
+            body["display_note"] = "Compact LinkedIn facts; omitted fields and full provider data remain in receipt_file."
+        output["result"] = body
+    return output
+
+
+def _public_web_observation(body, response):
+    """Validate an observation against the original plan without changing it."""
+    try:
+        research_input.object_fields(response, {"status", "operation", "results", "error"}, "web response")
+    except ValueError as exc:
+        raise ValueError(f"{exc}; receipt metadata is helper-owned") from exc
+    if response.get("status") not in ATTEMPT_STATUSES or not isinstance(response.get("results"), list):
+        raise ValueError("web response needs an observed result or failure status and a results array; pending outcomes must be recovered")
+    if response["status"] == "no_results" and response["results"]:
+        raise ValueError("no_results cannot contain result rows")
+    if body.get("provider") != "public_web":
+        raise ValueError("observed responses are only for planned public-web checks; recover provider receipts with --complete")
+    operation = body["attempt"]["request"]["operation"]
+    observed = dict(response, operation=response.get("operation", operation))
+    if observed["operation"] != operation:
+        raise ValueError("web response operation does not match the planned request")
+    if body.get("status") != "pending" and any(body.get(key) != value for key, value in observed.items()):
+        raise ValueError("a saved response cannot be replaced; use --complete to recover it")
+    return observed
+
+
+def complete_public_web(run_file, route_id, response, *, check_stop=True):
+    """Attach observed web results to their saved plan, never to a paid receipt."""
+    run_file = Path(run_file).resolve(strict=True)
+    receipt = read_receipt(run_file, route_id)
+    path = Path(receipt["receipt_file"])
+    with budget_guard.transaction(path) as body:
+        # Recheck identity while holding the receipt lock. Save before recording
+        # run state so --complete can recover without another search.
+        read_receipt(run_file, route_id)
+        observed = _public_web_observation(body, response)
+        if body.get("status") == "pending":
+            body.update(observed, receipt_status="complete")
+    return finish_attempt(run_file, route_id, body, check_stop=check_stop)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("results", type=Path)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--start-file", type=Path, help="initialize/resume from {request, max_usd}; - reads stdin")
+    mode.add_argument("--lookup-file", type=Path, help="research target/purpose/provider request, or up to three; - reads stdin")
+    mode.add_argument("--input-file", type=Path, help="one action/request object or an array of 1-3 independent company checks")
+    mode.add_argument("--batch-files", type=Path, nargs="+", help="1-3 company checks, as attempt files or one JSON array")
+    mode.add_argument("--complete", help="record this route's saved normalized receipt, without dispatch")
+    mode.add_argument("--receipt", help="read a saved route's compact evidence without dispatching or writing")
+    mode.add_argument("--review-file", type=Path, help="save company decisions, observed web responses and route reviews together; - reads stdin")
+    mode.add_argument("--status", action="store_true", help="show the authoritative request and compact current work")
+    mode.add_argument("--finalize", action="store_true", help="prepare reviewed completion metadata and run strict delivery validation")
+    parser.add_argument("--plan-only", action="store_true", help="reserve public-web work before using the browser/search tool")
+    parser.add_argument("--response-file", type=Path, help="with --complete, attach observed web results without editing receipt metadata")
+    args = parser.parse_args()
+    if args.response_file and (not args.complete or args.plan_only):
+        parser.error("--response-file requires --complete and cannot be used with --plan-only")
+    if args.plan_only and not (args.lookup_file or args.input_file or args.batch_files):
+        parser.error("--plan-only requires a lookup or attempt input")
+    try:
+        def read_input(path):
+            try:
+                return load_json(sys.stdin.read() if str(path) == "-" else path.read_text(encoding="utf-8"))
+            except FileNotFoundError as exc:
+                raise ValueError(f"Input file does not exist: {path}. Pass - and supply JSON on stdin to avoid a temporary file.") from exc
+        if args.start_file:
+            result = start_run(args.results, read_input(args.start_file))
+        elif args.lookup_file:
+            result = run_lookup(args.results, read_input(args.lookup_file), plan_only=args.plan_only)
+        elif args.finalize:
+            result = finalize_run(args.results)
+        elif args.status:
+            document = budget_guard.read_object(args.results)
+            result = run_status(document, evaluate_stop(document, execution_budget=budget_guard.load_ledger(args.results)))
+        elif args.review_file:
+            result = save_review(args.results, read_input(args.review_file))
+            result = {"request_file": str(args.results), **{k: v for k, v in result.items() if k != "request"}}
+        elif args.complete:
+            result = (complete_public_web(args.results, args.complete, read_input(args.response_file))
+                      if args.response_file else
+                      finish_attempt(args.results, args.complete, read_receipt(args.results, args.complete)["result"]))
+        elif args.receipt:
+            result = read_receipt(args.results, args.receipt)
+        elif args.batch_files:
+            specs = [load_json(path.read_text()) for path in args.batch_files]
+            if len(specs) == 1 and isinstance(specs[0], list):
+                specs = specs[0]
+            _preflight_contracts(args.results, specs, plan_only=args.plan_only)
+            result = run_batch(args.results, specs, plan_only=args.plan_only)
+        else:
+            spec = load_json(args.input_file.read_text())
+            _preflight_contracts(args.results, spec if isinstance(spec, list) else [spec], plan_only=args.plan_only)
+            execute = run_batch if isinstance(spec, list) else run_attempt
+            result = execute(args.results, spec, plan_only=args.plan_only)
+        print(json.dumps(cli_output(result), ensure_ascii=True, allow_nan=False))
+        if args.batch_files or args.input_file or args.lookup_file:
+            return result.get("exit_code", 0)
+    except (ValueError, OSError, KeyError, TypeError, StopIteration) as exc:
+        parser.exit(2, str(exc) + "\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

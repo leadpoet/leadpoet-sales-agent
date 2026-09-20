@@ -1,156 +1,264 @@
-# Evidence-first company sourcing
+# TYCHE
 
-`harness.run_icp(icp)` accepts an ICP dictionary and returns a JSON-compatible
-list of up to five companies. An empty list is valid. Credentials and execution
-settings come from the environment; provider access uses the host transport.
-No provider responses or private data are included in this source bundle.
+For the Codex integration that runs inside the Leadpoet lab, see
+[Leadpoet lab integration](docs/leadpoet-arena.md). It uses the lab runtime
+from subnet PR #198 and returns reviewed JSON through `harness.run_icp(icp)`.
 
-The default path extracts and ranks candidates from all retained search text,
-then assesses cached evidence in batches of six before confirming companies.
-Each assessment covers the required event and date, product/industry, country,
-funding stage and employees. Only grounded, in-window primary events qualify
-for paid confirmation. Cached conflicts are rejected first.
+**Open-source lead sourcing with evidence, verified contacts, and spending controls.**
 
-Confirmation prioritizes stage screening before homepage identity and requests
-a company profile only when the employee bucket remains unknown. Existing
-bounded identity redirects remain available. Venture discovery uses four event
-queries and three stage queries, each requesting eight results and 3,000 text
-characters. Original company newsroom evidence is preferred when cached; a
-funding announcement alone does not prove another event category. No separate
-newsroom discovery is added during the cache-only phase.
+TYCHE finds companies that match your ideal customer profile, checks the facts
+and buying signals you care about, then finds people in your requested roles.
+It runs in Codex and delivers an Excel lead list, structured JSON, and an audit
+report with sources and costs.
 
-Extraction and cached phase-A assessment use `google/gemini-3.1-flash-lite`,
-with bounded retries and `openai/gpt-5.6-luna` fallback. Per-company final
-assessment retains the configured model. Extraction preserves its structured
-JSON contract and retries incomplete output before falling back. The active
-path has a 138-second planning deadline, a 29-call Deepline ceiling, and an
-OpenRouter settled target of $0.225 with a $0.45 transient reservation cap.
-The extraction change targets $0.05 OpenRouter per ICP; it is not a guarantee.
-After six discovery searches, twenty extracted candidates stop further
-discovery. Fewer candidates permit the seventh search; only new cached rows
-are then extracted. Confirmation reserves ten identity calls and up to three
-workforce-proof calls; candidates without either a category primary or affirmed
-stage receive no lookup calls. A P1 workforce page skips LinkedIn size checks.
+[Quick start](#quick-start) · [Requests and defaults](#requests-and-defaults) ·
+[Outputs](#outputs) · [Build on TYCHE](#build-on-tyche)
 
-`AGENT_RULE_V20R10_COST`, `AGENT_RULE_V20R10_EVIDENCE`, and
-`AGENT_RULE_V20R10_HIRING` default to enabled. The output's one-URL-per-signal
-schema represents corroboration as at most three entries with criterion index
-zero. Only pages repeating the same selected event sentence are combined;
-these are evidence for one event, not additional event breadth. Hiring evidence
-excludes LinkedIn jobs and closed/expired postings, and requires explicit open
-hiring. Prefer company careers, ATS and press sources. Cost diagnostics report
-settled/reserved dollars and returned-based allowance estimates separately from
-independently verified qualifications.
+## What it does
 
-`AGENT_RULE_V20_TWO_PHASE`, `AGENT_RULE_V20_CHEAP_FIRST`, and
-`AGENT_RULE_V20_STAGE_SUPPLY` default to enabled. Setting each to `0` disables
-that change. Existing `AGENT_RULE_V12_*` through `AGENT_RULE_V19_*` controls
-remain available. The fallback legacy path retains its own bounded execution.
+- **Qualifies companies first.** Checks company fit and buying signals separately,
+  preserving required criteria, preferences, and missing evidence.
+- **Finds the right people.** Verifies current roles and company identity, with
+  primary and fallback role groups when requested.
+- **Validates email.** Requires a verified email by default, with explicit opt-outs
+  and receipt-backed validation.
+- **Controls run spending.** Stops new paid work at the observed provider-plus-model
+  cutoff and keeps the same budget and receipts through interruptions.
 
-Funnel diagnostics report `phase_a.assessed`, `phase_b.started`,
-`phase_b.admitted`, and `not_started_before_budget_stop`. Incomplete model
-verdicts do not count as assessed. A grounded primary still awaiting confirmation
-counts as unfinished when the slot goal has not been reached.
+- **Offers optional parallel research.** File-based runs use one researcher by
+  default. Choose `--workers 2` or `--workers 3` for the same workflow with exclusive
+  company claims and one shared budget; see [parallel research](docs/codex-isolated-testing.md#parallel-company-research).
+- **Saves confirmed leads as it goes.** Updates `leads.json` after each evidence
+  review, so a partial list is available before the full target is reached.
+- **Delivers traceable results.** Saves accepted, rejected, and unresolved outcomes;
+  validates the result and workbook before delivery.
 
-## Workforce evidence and provability
+## Quick start
 
-`AGENT_RULE_V21_SIZE_EVIDENCE`, `AGENT_RULE_V21_LINKEDIN_CHECK`, and
-`AGENT_RULE_V21_PROVABLE_FIRST` default to enabled. After admission checks,
-company-attributed employee evidence is taken from cache or from open-web
-search followed by a provider-domain search. Both request five results and
-3,000 text characters. The allowance is at most two searches per company and
-six searches per ICP, within the existing 29 physical Deepline calls.
-Department, people, email-format and organization-chart pages are rejected,
-as are another entity's counts, uncertain numerical bounds and LinkedIn hints.
+### 1. Prepare your environment
 
-A non-LinkedIn headcount source is submitted first in `fit_evidence_urls`,
-followed by the homepage and the primary event. The claimed employee bucket
-comes from that cited count. Without it, a company slug observed in a served
-homepage anchor permits one LinkedIn contents lookup, capped at 4,000 characters.
-Only the literal Company-size line can support this fallback; unobserved slugs
-are never submitted. Optional lookups leave three seconds for retaining the
-already-admissible fallback company.
+You need:
 
-Slots rank by non-LinkedIn proof (+3), an anchored LinkedIn Company-size line
-(+2), and an affirmed cached stage (+1), with the phase-A score breaking ties.
-A full set of unprovable slots may be replaced by later provable admissions
-until the existing time/call bounds or five provable slots stop confirmation.
-Known out-of-band employee evidence rejects the candidate rather than retaining
-an unsupported size prior. Returned-company traces include evidence source,
-host and quotation, anchor/size-line status, supported bucket and rank.
+- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) on `PATH`, with a reusable
+  file-based login (`codex login`). You can submit requests from Codex desktop.
+- Python 3.10 or later, plus an installed, authenticated Deepline CLI for provider
+  research, LinkedIn verification, and email validation.
+- The Codex workbook runtime: Node.js, Python, and `@oai/artifact-tool`. The launcher
+  discovers the installed desktop bundle. Other hosts must configure the
+  [runtime paths](docs/codex-isolated-testing.md#workbook-finalization-and-usage-reconciliation)
+  before sourcing; installing the Codex CLI alone does not supply the exporter.
+- A `SCRAPINGDOG_API_KEY` if you want to use ScrapingDog routes.
 
-### R2 OpenRouter admission and cache assessment
+```bash
+git clone https://github.com/gzaentz/tyche.git
+cd tyche
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+deepline health --json
+```
 
-`V20R2_EXPECTED_COST` and `V20R2_CHEAP_PHASE_A` default ON through `enabled()`.
-OpenRouter admission uses settled micro-USD plus fixed pending expectations and
-this request's expected cost, capped at 225,000. The learned ratio is completed
-settled / completed maximum reservations, initially 0.35 and clamped to
-[0.20, 1.00]. Settled plus the new request maximum must not exceed 450,000.
-At 225,000 settled, no further OpenRouter request starts. Actual overspend,
-missing billing or a charge above its maximum is an explicit overrun, not a
-successful cost gate. Deepline physical-call limits and tool ceilings are unchanged.
+Deepline executions use the direct API with `DEEPLINE_API_KEY` or the existing
+production SDK login, preserving raw error responses and billing IDs. Custom
+CLI configurations retain their CLI transport. Catalog discovery still uses
+the CLI; a separate ZeroBounce key is unnecessary. Export `SCRAPINGDOG_API_KEY`
+to enable ScrapingDog. Set `DEEPLINE_BIN` to the executable's absolute path if it
+is outside `PATH`.
 
-Extraction stays on the configured model (sol in the R2 experiment). Cache-only
-phase A starts on `google/gemini-3.1-flash-lite`, with initial output tokens
-`150 * batch + 200`. JSON truncation has one recovery at 4,096 tokens, then
-`LLMTruncated`. Non-OpenAI models receive no `reasoning_effort`. Gemini maximum
-reservations include completion plus internal reasoning, each 1.50 micro-USD
-per output token, and prompt input at 0.25 micro-USD per bounded input token.
+Local `.env` files are **not loaded automatically**. In a Bash or Zsh terminal,
+load your own file before starting Codex:
 
-Top-level OpenRouter error envelopes settle locally at zero, with code/type and
-`provider_error` telemetry. `provider_error_reserved_microusd` records the full
-reservation the validator would debit; it is informational locally. A transport
-timeout is instead conservatively charged at its full reservation and recorded
-separately. Only a real completion missing usage is unreported completion billing.
+```bash
+set -a
+source .env
+set +a
+```
 
-Each phase A call is capped at 30 seconds, preserving 20 seconds for phase B.
-Timeouts and in-body errors get one retry after two seconds on the same model,
-then a sticky fallback to `openai/gpt-5.6-luna`. If luna also exhausts its retry,
-phase A stops and phase B uses previously assessed candidates. There is no
-phase A sol or deepseek fallback. Physical-call, deadline and money guards
-apply to all retries. `money.funnel` includes timeout reservation totals,
-expected ratio, refusal reasons and extraction/phase-A/other costs.
+Keep credentials out of committed files.
 
-R3 stage supply (`V20R3_STAGE_SUPPLY`, default ON) screens phase-A eligible
-candidates in score order before identity/P1 confirmation. Stop at five affirmed
-requested stages; at most 12 stage searches per ICP and ten of the 29 physical
-Deepline calls remain reserved for confirmation. Seed/Series A queries explicitly
-search seed, pre-seed and Series A completed raises with 2,000-character text.
-News and company newsrooms remain eligible under the unchanged v19 affirmation
-and announcement-source requirements; speculative rounds still fail.
+Use that same Python environment for the launcher. Native tools and the
+`run_attempt.py` CLI check provider inputs against the saved live JSON Schema,
+including nested fields, before paid dispatch. Describe the tool in the run first.
+An invalid input returns its field path and constraint for correction; no paid
+request or spending reservation is created. Unresolved provider bills still
+block further paid work.
 
-R4 profile headcounts (`V20R4_HEADCOUNT_HINT`, default ON) are estimates.
-Sentinels 10, 0, 1 and missing values, or a count shared by at least three
-distinct profiles in the run, are unknown and supply neither a veto nor a
-claimed bucket. Confirmation profiles are gathered before size decisions so
-the first two repeated values are also handled as unknown, without refetching.
-Other profile values only conflict below half the lowest allowed lower bound
-or above twice the highest allowed upper bound. Cached headcount conflicts
-use the same margin; public P1 evidence retains its own strict validation.
-Claims prefer P1 evidence, then the nearest allowed bucket to a usable hint,
-then the v18 prior. Raw values and decisions are traced as headcount.hint;
-headcount_conflict_margin_saved counts unique candidates rescued from the old
-bucket conflict. Collection order changes, but call and money caps are retained.
+### 2. Check the launcher
 
-## Category support and stage uncertainty
+Install the same released Codex client used by Arena without changing your global CLI:
 
-`AGENT_RULE_V20R11_CATEGORY` restores category decisions from grounded model
-verdicts, including distribution/new availability of an offering. Company
-subject checks and non-funding primary headline checks remain mandatory.
-`AGENT_RULE_V20R11_T1_RECENCY` retains an already stage-affirmed T1 candidate
-when the recent-round search fails, is unavailable or cannot fit the lookup
-budget. Only a proven subsequent stage or PE/IPO contradicts its cached stage;
-uncertainty does not erase the existing fact. Other tiers retain their recency
-checks. Both flags default on; R10 cost, evidence and hiring controls remain.
+```sh
+npm install --prefix .runtime --no-audit --no-fund --save-exact @openai/codex@0.154.0
+```
 
-## Evidence hints and primary validation
+The launcher checks the version. `TYCHE_CODEX_BINARY` may select another installation
+of that exact version. Local and Arena execution call the same supervisor in
+`scripts/codex_tyche.py`; see [the Arena adapter](docs/leadpoet-arena.md).
 
-V23 defaults on through `AGENT_RULE_V23_SIZE_HINTS`, `AGENT_RULE_V23_IDENTITY`,
-`AGENT_RULE_V23_PRIMARY` and `AGENT_RULE_V23_EARLY_SUPPLY`. Workforce searches
-prefer public company-profile sources within the existing query limits. A
-company LinkedIn URL comes only from a unique homepage anchor. Missing plain
-HTTP status or final URL, non-200 responses and cross-domain redirects rank
-below clean identity observations. Capital-raising and company-renaming
-sentences cannot substitute for a non-funding primary event. Series A searches
-combine the stage with the event, and sales/marketing hiring searches describe
-the employer's software business. No additional provider-call lanes are added.
+Run this from your regular host terminal:
+
+```bash
+python3 scripts/codex_tyche.py --check
+```
+
+This checks isolation and session startup without a model turn or provider
+calls. It does not verify model-service connectivity or provider credentials.
+Use `--smoke` for an optional read-only model response with no provider calls.
+See [launcher setup and troubleshooting](docs/codex-isolated-testing.md).
+
+The [launcher](scripts/codex_tyche.py) pins **`gpt-5.6-luna`**, **`high` reasoning**,
+and the **`fast` service tier**. It loads project-local sourcing instructions in
+an isolated session while retaining the worker's sandbox and network policy.
+
+### 3. Ask for leads
+
+Open this repository in Codex and describe the companies, signals, roles, and
+budget you want. For example:
+
+```text
+Source 5 US B2B SaaS companies with 50–500 employees. Exclude agencies and
+consultancies. Each must have posted at least 3 sales openings in the last
+30 days. Find one CRO, VP Sales, or Head of Sales with a verified work email
+at each accepted company. Spend at most $5 total on sourcing providers.
+```
+
+[AGENTS.md](AGENTS.md) routes sourcing requests through the isolated launcher
+and saves each request under `reports/<run-id>/request.txt`. Code changes and
+questions stay in your ordinary Codex session.
+
+For a terminal-driven run, create a unique directory under `reports/`, save your
+request and that directory path in a UTF-8 `request.txt`, then run from the host
+terminal, replacing `<run-id>` with your directory name:
+
+```bash
+python3 scripts/codex_tyche.py --exec-file reports/<run-id>/request.txt
+```
+
+## Requests and defaults
+
+| Setting | Behavior |
+| --- | --- |
+| Companies | Give a target count, geography, industry, size, and exclusions. Distinguish must-haves from preferences. |
+| Buying signals | Specify the evidence and date window. Required signals match **any** by default; ask for **all** when each is mandatory. |
+| Contacts | One contact per company by default; request up to three. You can name primary roles and fallback roles. |
+| Contact data | Verified email by default. Explicitly request no email or phone (`contact_fields: []`) to opt out, or request phone only. |
+| Run budget | **$0.80 × requested leads** when omitted. Reported provider charges plus estimated base LLM cost. An explicit budget, including zero, overrides this default. |
+| Time | Two hours by default. An explicit time limit overrides it; speed benchmarks do not. Resuming preserves the original clock. |
+
+Every stored email must pass ZeroBounce or its eligible BounceBan fallback,
+with matching receipts. Accepted contacts require verified LinkedIn country;
+company size uses the published LinkedIn employee range. See the
+[input and output contract](.agents/skills/lead-sourcing/references/output-contract.md)
+for exact fields and evidence rules.
+
+New runs use one **soft cost cutoff**: provider charges plus estimated
+base LLM usage. Completed ScrapingDog requests use documented endpoint tariffs;
+variable or unresolved calls retain a separate documented ceiling against the budget. Check after each response and before further paid work. Calls
+already running can take the final total above the threshold. Missing billing
+without a documented ceiling pauses new paid work; it is never treated as free.
+The report separates provider charges, tariff holds, estimated LLM cost and pending calls.
+Old ledgers retain their original reservation policy. Request IDs, receipts,
+original limits and duplicate-call protection survive every continuation.
+
+TYCHE continues until it meets the qualified target, cannot fund further required
+work, or reaches the saved deadline. Exhausted searches require a strategy change;
+an early worker exit automatically continues the same saved run. Genuine runtime
+or access failures stay blocked, not completed. Shortfalls remain visible. It does not send
+outreach or write to a CRM.
+
+## Outputs
+
+Each run saves its files under `reports/<run-id>/`:
+
+| File | Contents |
+| --- | --- |
+| `leads.json` | Continuously saved confirmed companies and contacts, with evidence, target, count, and update time. Available during research. |
+| `leads.xlsx` | One row per verified contact at each accepted company, with shared company details, signals and intent, plus a **Sources** worksheet. |
+| `results.json` | Versioned accepted, rejected, and unresolved records with evidence and accounting. |
+| `report.md` | Human-readable findings, shortfalls, decisions, sources, and provider costs. |
+| `run-costs.json` | Provider and isolated-worker model usage/cost summary, including estimates and missing usage. |
+
+The run also retains validation, workbook previews, provider receipts, and
+`results.json.budget.json`. Keep the entire directory to resume with the same
+scope and accounting. Model cost excludes the outer development conversation.
+
+Delivery requires the full validator to return **`delivery_allowed: true`**,
+a verified saved workbook, and review of its preview. A process exit or model
+message alone does not establish completion. Partial files remain progress
+artifacts until they pass the delivery checks.
+
+To consume confirmed leads during research, read the `leads` array in `leads.json`.
+An atomic replacement keeps readers from seeing a half-written file. Unfinished
+candidates stay in `results.json`; later research failures preserve the confirmed
+list. Changed or withdrawn leads are removed until reviewed again. The JSON does
+not wait for all requested leads or for the final Excel export. See the
+[confirmed JSON contract](.agents/skills/lead-sourcing/references/output-contract.md#leadsjson-confirmed-leads).
+The bundled arena adapter publishes those confirmed leads to
+`/output/companies.json` on approval, so cost/time cutoffs can retain a partial list.
+
+## Build on TYCHE
+
+Codex chooses sources, queries, follow-ups, and qualification judgments. Local
+Python tools handle execution, observed-cost checks, receipts, and validation;
+the Node exporter builds the workbook.
+
+```text
+Request → isolated Codex session → research and evidence review
+                                → provider adapters + budget ledger
+                                → strict validation → JSON / report / Excel
+```
+
+File-backed runs expose five native tools over local MCP:
+
+| Tool | Purpose |
+| --- | --- |
+| `tyche_start` | Initialize or resume the request, combined cost cutoff. |
+| `tyche_lookup` | Run a selected provider tool or up to three independent checks; record spending and save receipts. |
+| `tyche_review` | Save findings, review completed leads, and automatically update confirmed JSON on approval. |
+| `tyche_inspect` | Read saved state, discover tools, and inspect schemas, pricing, or receipts. |
+| `tyche_finish` | Validate reviewed results, export and verify the workbook, and write the report. |
+
+### Where to work
+
+| Change | Start here |
+| --- | --- |
+| Research behavior and qualification | [Sourcing skill](.agents/skills/lead-sourcing/SKILL.md) and [workflow rules](.agents/skills/lead-sourcing/references/workflow-rules.md) |
+| Provider selection | [Tool guide](.agents/skills/lead-sourcing/references/tools.md) |
+| Tool inputs, adapters, and budgets | [Native tool and adapter contracts](.agents/skills/lead-sourcing/references/adapter-io.md) |
+| JSON fields and workbook layout | [Output contract](.agents/skills/lead-sourcing/references/output-contract.md) |
+| Model settings, isolation, and recovery | [Launcher](scripts/codex_tyche.py) and [runtime guide](docs/codex-isolated-testing.md) |
+| Application integration | [Platform integration design](docs/platform-integration.md) — worker hosting and a protected provider gateway are planned, not shipped. |
+
+Provider capabilities and prices are discovered live. Extend the existing
+adapters and preserve evidence gates, budget checks, and uncertain-charge
+reconciliation. The local ledger is writable by the worker; a hosted product
+must enforce authoritative spending and credential access in its backend.
+
+### Verify changes
+
+Run the local test suites from the repository root:
+
+```bash
+python3 -m unittest discover -s .agents/skills/lead-sourcing/tests -p 'test_*.py'
+python3 -m unittest discover -s scripts -p 'test_*.py'
+```
+
+Validate a saved run with:
+
+```bash
+python3 .agents/skills/lead-sourcing/scripts/validate_run.py reports/<run-id>/results.json
+```
+
+Use the full validator for delivery; `--check-stop` alone can return a successful
+exit while research still needs to continue. For exporter dependencies, manual
+export, and receipt reconciliation, see the [runtime guide](docs/codex-isolated-testing.md).
+
+## License
+
+[GNU AGPL-3.0](LICENSE).
+
+---
+
+<p align="center">
+  <img src="docs/assets/tyche-characters.svg" alt="Tyche rendered with Unicode block characters, wearing an ornate crown beside a child and a fruit-filled cornucopia." width="640">
+</p>
