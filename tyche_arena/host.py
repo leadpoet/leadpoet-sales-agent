@@ -803,7 +803,10 @@ class ArenaHost:
             execution["failure_kind"] = "deadline_reached"
         if self.quota_guard.research_denial is not None and not terminal:
             execution["failure_kind"] = (
-                "deadline_reached" if self.quota_guard.research_denial == "research_deadline"
+                "deadline_reached"
+                if self.quota_guard.research_denial in {
+                    "research_deadline", "finalization_headroom"
+                }
                 else "host_limit"
             )
         delivered = full_delivery(self.run_dir)

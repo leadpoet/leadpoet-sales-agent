@@ -1270,6 +1270,155 @@ def test_deadline_enters_bounded_finalization_only_in_same_session(tmp_path, mon
     assert "TYCHE_FINALIZATION_ONLY" in config["mcp_servers"]["tyche"]["env_vars"]
 
 
+@pytest.mark.parametrize("openrouter_limit", [500, 2000])
+def test_headroom_boundary_enters_native_finalization_and_uses_reserved_40(
+        tmp_path, monkeypatch, openrouter_limit):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "arena"\n')
+
+    @contextmanager
+    def session(**_selection):
+        yield IdleEnvironment(CODEX_HOME=str(codex_home), PYTHONPATH="/agent:/agent/source:/agent/deps")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    seed_supervisor(run_dir)
+    boundary = openrouter_limit - 40
+    used = [boundary]
+    reads = []
+
+    def quota_usage():
+        reads.append(used[0])
+        return quota_snapshot(used=used[0], openrouter_limit=openrouter_limit)
+
+    now = time.monotonic()
+    guard = quota_guard(now + 100, now + 200, quota_usage)
+    calls = []
+
+    def execute_once(_host, _directory, environment, _prompt, _timeout, _tail):
+        calls.append(environment["TYCHE_FINALIZATION_ONLY"])
+        if len(calls) == 1:
+            assert guard() is False
+            assert guard.research_denial == "finalization_headroom"
+            return 1
+        for _ in range(40):
+            assert guard() is True
+            used[0] += 1
+        return 0
+
+    monkeypatch.setattr(ResearchTools, "_overview", lambda _path: {"stop": "continue"})
+    monkeypatch.setattr(runtime, "_codex_once", execute_once)
+    monkeypatch.setattr(runtime, "full_delivery", lambda _directory: len(calls) == 2)
+
+    runtime.launch(
+        SimpleNamespace(session=session, CODEX_BINARY="codex"), run_dir,
+        now + 100, now + 200, 200, guard,
+    )
+
+    assert calls == ["0", "1"]
+    assert used[0] == openrouter_limit
+    assert reads == [boundary, boundary, *range(boundary, openrouter_limit)]
+
+
+@pytest.mark.parametrize(("denial", "expected_reads"), [
+    ("quota_unavailable", 4),
+    ("quota_regressed", 2),
+])
+def test_true_quota_failures_remain_fatal_without_finalization_retry(
+        tmp_path, monkeypatch, denial, expected_reads):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "arena"\n')
+
+    @contextmanager
+    def session(**_selection):
+        yield IdleEnvironment(CODEX_HOME=str(codex_home), PYTHONPATH="/agent:/agent/source:/agent/deps")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    seed_supervisor(run_dir)
+    reads = [0]
+
+    def quota_usage():
+        reads[0] += 1
+        if reads[0] > 1:
+            if denial == "quota_unavailable":
+                raise QuotaUnavailable("quota unavailable")
+            return quota_snapshot(used=458, openrouter_limit=500)
+        return quota_snapshot(used=459, openrouter_limit=500)
+
+    now = time.monotonic()
+    guard = quota_guard(now + 100, now + 200, quota_usage)
+    calls = []
+
+    def execute_once(_host, _directory, environment, _prompt, _timeout, _tail):
+        calls.append(environment["TYCHE_FINALIZATION_ONLY"])
+        assert guard() is False
+        return 1
+
+    monkeypatch.setattr(runtime, "QUOTA_READ_RETRY_SECONDS", .001)
+    monkeypatch.setattr(ResearchTools, "_overview", lambda _path: {"stop": "continue"})
+    monkeypatch.setattr(runtime, "_codex_once", execute_once)
+    monkeypatch.setattr(runtime, "full_delivery", lambda _directory: False)
+
+    with pytest.raises(RuntimeError, match="host_limit"):
+        runtime.launch(
+            SimpleNamespace(session=session, CODEX_BINARY="codex"), run_dir,
+            now + 100, now + 200, 200, guard,
+        )
+
+    assert calls == ["0"]
+    assert guard.research_denial == denial
+    assert reads[0] == expected_reads
+
+
+@pytest.mark.parametrize("openrouter_limit", [500, 2000])
+def test_headroom_boundary_finalizes_native_checkpoint_to_atomic_output(
+        lab, monkeypatch, arena_operations, openrouter_limit):
+    install_actual_checkpoint_writer(lab, monkeypatch)
+    monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
+    lab.openrouter_limit = openrouter_limit
+    lab.openrouter_used = openrouter_limit - 41
+    lab.mode = "headroom_continue"
+    monkeypatch.setattr(
+        sys.modules["lab_arena_checkpoint"], "quota_usage",
+        lambda: quota_snapshot(
+            used=lab.openrouter_used, openrouter_limit=openrouter_limit,
+            deepline_limit=lab.deepline_limit, deepline_used=lab.deepline_used,
+            scrapingdog_limit=lab.scrapingdog_limit,
+            scrapingdog_used=lab.scrapingdog_used,
+        ),
+    )
+
+    def finish_confirmed_checkpoint():
+        packet = yield "tyche_finish", {}
+        assert packet["status"] == "review_required"
+        delivered = yield "tyche_finish", {
+            "review_ref": packet["review_ref"],
+            "review_findings": review_findings(packet),
+        }
+        assert delivered["delivery_allowed"] and delivered["checkpoint_saved"]
+
+    def program():
+        return (scenario("tyche_checkpoint") if lab.worker_starts == 1
+                else finish_confirmed_checkpoint())
+
+    lab.program = program
+
+    rows = runtime.run(ICP)
+
+    assert len(rows) == 1
+    assert json.loads(lab.output.read_text()) == {"companies": rows}
+    assert lab.worker_starts == 3
+    assert lab.openrouter_used == openrouter_limit - 39
+    assert lab.request_guard.research_denial == "finalization_headroom"
+    assert [frame["tool"] for frame in lab.frames] == [
+        "harvestapi_get_company", "generic_http_request", "harvestapi_get_profile",
+        "harvestapi_get_profile", "zerobounce_validate",
+    ]
+
+
 def completion_review_tools(
     tmp_path, stop="time_limit_reached", *, ready=True, has_candidate=True,
 ):
@@ -1585,8 +1734,8 @@ def test_quota_guard_waits_for_fresh_authoritative_headroom(monkeypatch):
     assert snapshots == pytest.approx([100.0, 101.05, 102.1, 103.15])
 
 
-@pytest.mark.parametrize("openrouter_limit", [60, 200])
-def test_quota_guard_uses_host_limit_and_reserves_finalization_headroom(monkeypatch, openrouter_limit):
+@pytest.mark.parametrize("openrouter_limit", [60, 200, 500, 2000])
+def test_quota_guard_reserves_finalization_headroom(monkeypatch, openrouter_limit):
     used = [0]
 
     def reader():
