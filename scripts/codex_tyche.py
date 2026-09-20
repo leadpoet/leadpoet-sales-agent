@@ -65,12 +65,6 @@ def research_deadline(request_file, started_at):
     return limit.timestamp() if limit is not None else None
 
 
-def research_finalization_ready(host):
-    """Return a host's explicit planned handoff without guessing from errors."""
-    predicate = getattr(host, 'research_finalization_ready', None)
-    return bool(predicate()) if callable(predicate) else False
-
-
 def authorize_resume(request_file, until, reason):
     """Operator-only amendment: keep request, original start and ledger intact."""
     import budget_guard
@@ -243,7 +237,6 @@ def _supervise_worker(command, request_file, env, profile, *, resume=False, host
         limit = research_deadline(request_file, env['TYCHE_RUN_STARTED_AT'])
         stop = progress.get('stop')
         terminal = (stop in DELIVERY_STOPS or research_window_closed
-                    or research_finalization_ready(host)
                     or (limit is not None and time.time() >= limit)
                     or (finishing_until is not None and stop != 'continue'))
         blocked = progress.get('operational_block') or (

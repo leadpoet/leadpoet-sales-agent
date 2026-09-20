@@ -173,7 +173,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                     if status.get("status") == "operationally_blocked":
                         fatal = status.get("reason", "Run setup is blocked")
             terminal = (billing_drain or stop in DELIVERY_STOPS
-                        or launcher.research_finalization_ready(host)
                         or limit is not None and time.time() >= limit)
             if fatal:
                 reason = str(progress.get("operational_block") or progress.get("stop_reason") or fatal)
@@ -194,7 +193,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                 current, pending_billing = observe_progress()
                 billing_drain = billing_drain or pending_billing
                 terminal = (terminal or billing_drain
-                            or launcher.research_finalization_ready(host)
                             or current.get("stop") in DELIVERY_STOPS)
                 fatal = current.get("operational_block") or (
                     current.get("stop") if current.get("stop") in {"provider_stop", "input_or_configuration_stop"}
