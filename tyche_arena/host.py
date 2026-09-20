@@ -31,8 +31,11 @@ from scripts import codex_tyche as runner
 MODEL = "openai/" + runner.MODEL
 REASONING_EFFORT = runner.REASONING_EFFORT
 CODEX_VERSION = runner.CODEX_VERSION
-RUN_SECONDS = 2670
 FINALIZATION_SECONDS = runner.FINALIZATION_SECONDS
+LEGACY_HOST_WALL_CLOCK_SECONDS = 45 * 60
+HOST_SHUTDOWN_MARGIN_SECONDS = 30
+MAX_HOST_WALL_CLOCK_SECONDS = 24 * 60 * 60
+RUN_SECONDS = LEGACY_HOST_WALL_CLOCK_SECONDS - HOST_SHUTDOWN_MARGIN_SECONDS
 RESEARCH_SECONDS = RUN_SECONDS - FINALIZATION_SECONDS
 MAX_LOG_BYTES = 64 * 1024
 MCP_TOOL_TIMEOUT_SECONDS = 3 * DEEPLINE_WAIT_SECONDS + 15  # Native max-three batch plus MCP return margin.
@@ -57,6 +60,26 @@ FAILURE_DIAGNOSTIC_REASONS = {
     "two_failed_codex_exits", "unchanged_exit_limit", "invocation_limit",
     "checkpoint_unavailable", "output_validation", "unexpected",
 }
+
+
+def arena_time_limits(environment=None):
+    """Return host-bound run and research seconds, with legacy fallback."""
+
+    environment = os.environ if environment is None else environment
+    raw = environment.get("LAB_ARENA_WALL_CLOCK_SECONDS")
+    if raw is None:
+        wall_clock_seconds = LEGACY_HOST_WALL_CLOCK_SECONDS
+    else:
+        if not isinstance(raw, str) or re.fullmatch(r"[1-9][0-9]*", raw) is None:
+            raise ValueError(
+                "LAB_ARENA_WALL_CLOCK_SECONDS must be a canonical positive integer"
+            )
+        wall_clock_seconds = int(raw)
+    minimum = HOST_SHUTDOWN_MARGIN_SECONDS + FINALIZATION_SECONDS + 1
+    if not minimum <= wall_clock_seconds <= MAX_HOST_WALL_CLOCK_SECONDS:
+        raise ValueError("LAB_ARENA_WALL_CLOCK_SECONDS is outside the safe range")
+    run_seconds = wall_clock_seconds - HOST_SHUTDOWN_MARGIN_SECONDS
+    return run_seconds, run_seconds - FINALIZATION_SECONDS
 
 
 def _diagnostic_line(document):
@@ -819,10 +842,11 @@ def run(icp):
     limit = int(os.environ["LAB_ARENA_COMPANY_LIMIT"])
     if not 1 <= limit <= 5:
         raise ValueError("LAB_ARENA_COMPANY_LIMIT must be 1 through 5")
-    request = request_for(icp, limit, RESEARCH_SECONDS)
+    run_seconds, research_seconds = arena_time_limits()
+    request = request_for(icp, limit, research_seconds)
     started = time.monotonic()
-    research_deadline = started + RESEARCH_SECONDS
-    response_deadline = started + RUN_SECONDS
+    research_deadline = started + research_seconds
+    response_deadline = started + run_seconds
     checkpoint = importlib.import_module("lab_arena_checkpoint")
     quota_guard = ArenaQuotaGuard(
         checkpoint.quota_usage, checkpoint.QuotaUnavailable,

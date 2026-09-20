@@ -1417,6 +1417,7 @@ def test_slow_quota_preflight_preserves_native_and_host_deadlines(lab, monkeypat
         return original_launch(host, run_dir, deadline, response_deadline, remaining, guard)
 
     monkeypatch.setattr(runtime.time, "monotonic", lambda: clock[0])
+    monkeypatch.setenv("LAB_ARENA_WALL_CLOCK_SECONDS", "5400")
     monkeypatch.setattr(ResearchTools, "start", start)
     monkeypatch.setattr(sys.modules["lab_arena_checkpoint"], "quota_usage", quota_usage)
     monkeypatch.setattr(runtime, "launch", launch)
@@ -1426,7 +1427,7 @@ def test_slow_quota_preflight_preserves_native_and_host_deadlines(lab, monkeypat
     assert len(rows) == 1
     assert native_starts == [100.0]
     assert preflights == [{"clock": 100.0, "provider_frames": 0}]
-    assert launches == [(135.0, 2170.0, 2770.0, 2635.0, 2070)]
+    assert launches == [(135.0, 4870.0, 5470.0, 5335.0, 4770)]
     assert reads[0] >= 2
 
 
@@ -3767,6 +3768,28 @@ def test_latest_native_finalization_budget_fits_the_hard_limit():
     assert runtime.RESEARCH_SECONDS == 2070
     assert runtime.RUN_SECONDS == 2670
     assert runtime.RUN_SECONDS + 30 == 45 * 60
+
+
+@pytest.mark.parametrize(
+    "environment,expected",
+    [
+        ({}, (2670, 2070)),
+        ({"LAB_ARENA_WALL_CLOCK_SECONDS": "2700"}, (2670, 2070)),
+        ({"LAB_ARENA_WALL_CLOCK_SECONDS": "5400"}, (5370, 4770)),
+    ],
+)
+def test_arena_time_limits_use_signed_host_duration_with_legacy_fallback(
+    environment, expected,
+):
+    assert runtime.arena_time_limits(environment) == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["0", "630", "05400", "+5400", " 5400", "5400.0", "86401"]
+)
+def test_arena_time_limits_reject_noncanonical_or_unsafe_values(value):
+    with pytest.raises(ValueError, match="LAB_ARENA_WALL_CLOCK_SECONDS"):
+        runtime.arena_time_limits({"LAB_ARENA_WALL_CLOCK_SECONDS": value})
 
 
 def test_provider_deadlines_and_no_model_fallback(tmp_path):
