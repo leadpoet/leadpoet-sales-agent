@@ -64,7 +64,13 @@ def write_linkedin_receipts(run_file, document):
                 lower, upper = employee_range_bounds(entity["employee_range"])
                 profile["employeeCountRange"] = {"start": lower, "end": upper}
             else:
-                profile["firstName"] = "Fixture"
+                # Real profiles name the person and their current role at the selected company.
+                first, _, last = str(entity.get("full_name") or "Fixture").partition(" ")
+                profile.update(firstName=first, lastName=last, currentPositions=[{
+                    "companyName": row["company"].get("canonical_name", row["company"].get("name")),
+                    "companyLinkedinUrl": row["company"].get("linkedin_url"),
+                    "position": entity.get("current_title"), "current": True}])
+                profile.pop("name")
                 profile["email"] = entity.get("email")
                 document["routes"].remove(route)
                 position = next((i for i, r in enumerate(document["routes"]) if r.get("phase") == "email_validation"), len(document["routes"]))

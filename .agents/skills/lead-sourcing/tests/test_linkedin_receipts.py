@@ -175,6 +175,99 @@ class LinkedInReceiptTests(unittest.TestCase):
         errors = linkedin_receipt_errors(self.doc, self.path)
         self.assertIn("backup_contacts[0].country", " ".join(errors))
 
+    def save_profile(self, contact, positions, experience=()):
+        """Give a fixture profile the name and explicit roles HarvestAPI returns."""
+        path = self.path.parent / "receipts" / (contact["location_evidence"]["source"]["route_id"] + ".json")
+        receipt = json.loads(path.read_text())
+        first, _, last = contact["full_name"].partition(" ")
+        receipt["provider_response"]["body"]["element"].update(
+            linkedinUrl=contact["linkedin_url"], firstName=first, lastName=last,
+            currentPositions=list(positions), experience=list(experience))
+        path.write_text(json.dumps(receipt))
+
+    def test_each_buyer_needs_their_own_current_role_at_the_selected_company(self):
+        from linkedin_receipts import contact_verification_errors
+        row = self.doc["accepted"][0]
+        company, first = row["company"], row["primary_contact"]
+        # A second buyer with an independent profile receipt, as two-contact requests save them.
+        second = copy.deepcopy(first)
+        second.update(full_name="Ben Example", current_title="Decoration Buyer", role_match="approved_family",
+                      linkedin_url="https://www.linkedin.com/in/ben-example", email="ben@example.com")
+        source = dict(first["location_evidence"]["source"], route_id="harvest-fields-second-buyer")
+        second["location_evidence"] = dict(first["location_evidence"], evidence_url=second["linkedin_url"], source=source)
+        route = next(r for r in self.doc["routes"] if r["route_id"] == first["location_evidence"]["source"]["route_id"])
+        self.doc["routes"].append(dict(route, route_id=source["route_id"], request_fingerprint="second-buyer"))
+        receipt = json.loads(self.receipt_path().read_text())
+        (self.path.parent / "receipts" / (source["route_id"] + ".json")).write_text(
+            json.dumps(dict(receipt, route_id=source["route_id"], request_fingerprint="second-buyer")))
+        row["backup_contacts"] = [second]
+
+        def role(person, **changes):
+            return {"companyName": company["canonical_name"], "companyLinkedinUrl": company["linkedin_url"],
+                    "position": person["current_title"], "current": True, **changes}
+        def check(person):
+            return " ".join(contact_verification_errors(self.doc, self.path, company, person))
+        for person in (first, second):
+            self.save_profile(person, [role(person)])
+            self.assertEqual(check(person), "")
+        ended = {"endDate": {"text": "Dec 2023"}, "current": False}
+        elsewhere = "https://www.linkedin.com/company/another-retailer"
+        cases = (
+            # The LinkedIn entity identifies the employer; a parent's display name on the same page still matches.
+            ("parent name, same company page", [role(second, companyName="Example Group Purchasing")], (), ""),
+            ("another employer", [role(second, companyName="Another Retailer", companyLinkedinUrl=elsewhere)], (), "current company"),
+            ("network parent page", [role(second, companyLinkedinUrl="https://www.linkedin.com/company/example-group")], (), "current company"),
+            ("left the company", [role(second, companyName="Another Retailer", companyLinkedinUrl=elsewhere)],
+             [role(second, **ended)], "current company"),
+            ("stale title", [role(second, position="Garden Tools Buyer")], [role(second, **ended)], "current_title must match"),
+        )
+        for name, positions, experience, expected in cases:
+            with self.subTest(name):
+                self.save_profile(second, positions, experience)
+                self.assertIn(expected, check(second)) if expected else self.assertEqual(check(second), "")
+                # The first buyer's own receipt is untouched by the second buyer's profile.
+                self.assertEqual(check(first), "")
+                # Saved output carries the same proof: delivery validation rechecks every contact with an email.
+                delivery = " ".join(e for e in linkedin_receipt_errors(self.doc, self.path) if "backup_contacts[0]" in e)
+                self.assertIn(expected, delivery) if expected else self.assertEqual(delivery, "")
+        # A pending profile without an email is not saved contact output and stays outside this check.
+        pending = {k: v for k, v in second.items() if k not in {"email", "email_validation", "email_source"}}
+        row["backup_contacts"] = [pending]
+        self.assertFalse([e for e in linkedin_receipt_errors(self.doc, self.path) if "current" in e])
+
+    def test_strict_delivery_rejects_a_saved_contact_that_no_longer_matches_its_profile(self):
+        row = self.doc["accepted"][0]
+        company, contact = row["company"], row["primary_contact"]
+        self.save_profile(contact, [{"companyName": company["canonical_name"], "companyLinkedinUrl": company["linkedin_url"],
+                                     "position": contact["current_title"], "current": True}])
+        self.path.write_text(json.dumps(self.doc))
+        code, result = self.strict_check()
+        self.assertEqual((code, result["errors"]), (0, []))
+        for field, value, expected in (("full_name", "Someone Else", "full_name must match the saved current LinkedIn profile"),
+                                       ("current_title", "Previous Role", "current_title must match the saved current LinkedIn profile")):
+            with self.subTest(field=field):
+                saved = copy.deepcopy(self.doc)
+                saved["accepted"][0]["primary_contact"][field] = value
+                self.path.write_text(json.dumps(saved))
+                code, result = self.strict_check()
+                self.assertEqual(code, 2)
+                self.assertFalse(result["delivery_allowed"])
+                self.assertIn(expected, " ".join(result["errors"]))
+        # Older saved contacts carry their profile URL only in their evidence; they still resolve at delivery.
+        legacy = copy.deepcopy(self.doc)
+        legacy["accepted"][0]["primary_contact"].pop("linkedin_url")
+        self.assertFalse([e for e in linkedin_receipt_errors(legacy, self.path) if "profile" in e.casefold()])
+        legacy["accepted"][0]["primary_contact"]["full_name"] = "Someone Else"
+        self.assertIn("full_name must match", " ".join(linkedin_receipt_errors(legacy, self.path)))
+        # The fallback never masks a saved LinkedIn URL that points at someone else's profile.
+        other = copy.deepcopy(self.doc)
+        other["accepted"][0]["primary_contact"]["linkedin_url"] = "https://www.linkedin.com/in/someone-else"
+        self.assertIn("Verify the selected person's LinkedIn profile", " ".join(linkedin_receipt_errors(other, self.path)))
+        # Malformed evidence is an unverified profile, never a crash.
+        broken = copy.deepcopy(self.doc)
+        broken["accepted"][0]["primary_contact"]["location_evidence"] = "not an object"
+        self.assertIn("Verify the selected person's LinkedIn profile", " ".join(linkedin_receipt_errors(broken, self.path)))
+
 
 if __name__ == "__main__":
     unittest.main()

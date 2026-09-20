@@ -82,15 +82,22 @@ def _saved_profile(run_file, source, url, kind, routes, target_company=None):
                                       target_company_linkedin_url=target_company)
 
 
-def contact_verification_errors(document, run_file, company, contact):
-    """Reuse a selected profile receipt; role equivalence remains the researcher's judgment."""
+def contact_verification_errors(document, run_file, company, contact, *, roles=True):
+    """Reuse a selected profile receipt; role equivalence remains the researcher's judgment.
+
+    Delivery rechecks identity only (roles=False); its own contract governs saved role fields.
+    """
     if not isinstance(contact, dict) or not contact:
         return ["Select and review a saved HarvestAPI profile before email work"]
     evidence = contact.get("location_evidence") or contact
+    evidence = evidence if isinstance(evidence, dict) else {}  # Malformed evidence fails as an unverified profile.
+    source = evidence.get("source")
+    url = contact.get("linkedin_url", contact.get("contact_url"))
+    if not roles and not _linkedin_url(url, "in"):
+        url = evidence.get("evidence_url")  # Older saved contacts carry their profile URL only in its evidence.
     try:
-        profile = _saved_profile(run_file, evidence.get("source", {}),
-            contact.get("linkedin_url", contact.get("contact_url")), "in", document.get("routes", []),
-            company.get("linkedin_url"))
+        profile = _saved_profile(run_file, source if isinstance(source, dict) else {}, url, "in",
+            document.get("routes", []), company.get("linkedin_url"))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         return ["Verify the selected person's LinkedIn profile: " + str(exc)]
     errors = []
@@ -104,10 +111,12 @@ def contact_verification_errors(document, run_file, company, contact):
         errors.append("Company identity is not selected. Set company.ref to this company's saved HarvestAPI company result, then reuse the selected profile; do not repeat either lookup.")
     elif not matches:
         errors.append("LinkedIn must confirm the selected person's current company")
+    if not roles:
+        return errors
     role = _text(contact.get("requested_role"))
     requested = document.get("request", {}).get("requested_roles", [])
-    roles = {_text(r) for r in requested}
-    if not role or role not in roles:
+    saved_roles = {_text(r) for r in requested}
+    if not role or role not in saved_roles:
         errors.append(f"requested_role {contact.get('requested_role')!r} is not a saved requested role. "
                       f"Review current_title {contact.get('current_title')!r} against {json.dumps(requested)}; "
                       "save the matching requested_role and role_match, or choose another contact. "
@@ -154,6 +163,12 @@ def linkedin_receipt_errors(document, run_file, *, fill_missing=False):
         contacts += [(f"{base}.backup_contacts[{i}]", c) for i, c in enumerate(backups if isinstance(backups, list) else [])]
         entities = [(f"{base}.company", row.get("company"), "company", "employee_range_evidence", ("employee_range",))]
         entities += [(p, c, "in", "location_evidence", ("country", "state", "city")) for p, c in contacts]
+        # Email work required this identity check before spending; a saved email keeps the same proof
+        # at delivery. Pending profiles without an email are outside the saved contact output.
+        for path, contact in contacts:
+            if isinstance(contact, dict) and contact.get("email") and isinstance(row.get("company"), dict):
+                errors.extend(f"{path}: {error}" for error in
+                              contact_verification_errors(document, run_file, row["company"], contact, roles=False))
         for path, entity, kind, evidence_field, fields in entities:
             if not isinstance(entity, dict):
                 continue  # The structural contract reports missing entities.
