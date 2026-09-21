@@ -927,6 +927,9 @@ class ResearchTools:
             if not isinstance(email, str) or email.strip().casefold() not in email_receipts.discovered_addresses(
                     row, page=content_kind(row, saved) == "captured_page"):
                 raise ValueError("email_source must contain the selected exact email address")
+            if email.strip().casefold() in email_receipts.request_addresses(saved):
+                raise ValueError("email_source repeats an address its own request carried; select the finder or "
+                                 "published page that independently returned it")
         elif action.get("phase") != "account_discovery":
             raise ValueError("discovery_source requires the original account-discovery result")
         attribution = {"source": {**source, "result_index": int(reference.rsplit(":", 1)[1])}}

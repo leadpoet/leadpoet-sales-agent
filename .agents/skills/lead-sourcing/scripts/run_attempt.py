@@ -239,7 +239,8 @@ def _email_gate(run_file, document, action, request):
                 raise ValueError(f"Email input {key} conflicts with the selected profile; omit it and use contact_ref")
     if validator_for_tool(request.get("tool")) and not discovery_source(run_file, document.get("routes", []), email):
         raise ValueError("Email validation requires the exact address in a saved finder/page first; "
-                         "a company email pattern is not discovery. Reuse a discovered address or find another contact.")
+                         "a company email pattern is not discovery, and neither is a lookup that was given the "
+                         "address. Reuse a discovered address or find another contact.")
     return company, contact
 
 

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import re
+from urllib.parse import unquote, unquote_plus
 
 import budget_guard
 import deepline
@@ -45,6 +46,7 @@ def _saved_receipt(run_file, route):
 
 
 EMAIL_ADDRESS = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+")
+PLAIN_ADDRESS = re.compile(r"[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+")  # As an address appears inside a URL or a query.
 EMAIL_FIELDS = {"email", "emails", "emailaddress", "contactemail", "personemail",
                 "professionalemail", "workemail", "personalemail", "emailcandidates"}
 
@@ -74,6 +76,27 @@ def discovered_addresses(row, *, page=False):
     return addresses
 
 
+def request_addresses(saved):
+    """Addresses a saved call was itself given. A reply that repeats one of them found nothing."""
+    found = set()
+
+    def walk(value):
+        if isinstance(value, str):
+            # Inside a URL the wide pattern swallows the path and query, so the plain one is read too, also
+            # after decoding, where `+` may stand for a space. Both dot forms: a returned field keeps a
+            # trailing dot that a sentence would drop. Text without an address is not scanned at all.
+            found.update(_text(form) for text in {value, unquote(value), unquote_plus(value)} if "@" in text
+                         for pattern in (EMAIL_ADDRESS, PLAIN_ADDRESS)
+                         for match in pattern.findall(text) for form in (match, match.rstrip(".")))
+        elif isinstance(value, (dict, list)):
+            for item in value.values() if isinstance(value, dict) else value:
+                walk(item)
+    attempt = saved.get("attempt") if isinstance(saved, dict) else None
+    request = attempt.get("request") if isinstance(attempt, dict) else None
+    walk(request.get("payload", request) if isinstance(request, dict) else None)
+    return found
+
+
 def discovery_source(run_file, routes, email, *, before=None, preferred=None):
     """Find prior exact-address discovery; a saved ref only orders the checks."""
     if preferred:
@@ -90,7 +113,8 @@ def discovery_source(run_file, routes, email, *, before=None, preferred=None):
         try:
             saved = _saved_receipt(run_file, route)
             if (saved.get("receipt_status") != "complete" or saved.get("status") not in {"ok", "partial"}
-                    or any(saved.get(k) != route.get(k) for k in ("provider", "operation", "tool"))):
+                    or any(saved.get(k) != route.get(k) for k in ("provider", "operation", "tool"))
+                    or _text(email) in request_addresses(saved)):  # Its own input, repeated, is not evidence.
                 continue
             if saved.get("provider") == "deepline":
                 saved, _ = deepline.normalize_response({"limit": 10, **saved["attempt"]["request"]}, saved["provider_response"])

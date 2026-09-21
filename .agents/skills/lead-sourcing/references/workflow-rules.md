@@ -332,7 +332,8 @@ provider statuses and stable reasons belong in the receipts, while output
 
 The email gate follows the contact gate. Before validation, the exact address
 must appear in returned email fields or a captured page body; search echoes,
-diagnostics and name/domain patterns are not discovery. Saved discovery is reused.
+diagnostics and name/domain patterns are not discovery, and neither is a reply
+to a lookup or page request that was itself given the address. Saved discovery is reused.
 Check that the source actually supplies this buyer's address; occurrence alone is not identity proof.
 Acceptance requires the email, a matching
 ZeroBounce status, and a source receipt linked to its

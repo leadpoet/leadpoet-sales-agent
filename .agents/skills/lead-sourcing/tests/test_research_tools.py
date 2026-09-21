@@ -48,6 +48,8 @@ class FixtureProvider:
                 fields = ["domain"]
             if tool == "bounceban_get_single_status":
                 fields = ["id"]
+            if tool in {"fixture_person_lookup", "hunter_people_find"}:
+                fields = ["email"]  # A lookup keyed by an address the caller already holds.
             properties = {field: {"type": "string"} for field in fields}
             if tool == "search_contact":
                 properties["contact_linkedin"] = {"type": "string"}
@@ -919,6 +921,76 @@ class ResearchToolTests(unittest.TestCase):
             self.assertIsNone(email_receipts.discovery_source(self.path, routes, email))
         saved["run_fingerprint"] = "another run"; path.write_text(json.dumps(saved))
         self.assertIsNone(email_receipts.discovery_source(self.path, routes, "ada@example.test"))
+
+    def test_an_address_the_request_itself_carried_is_not_discovered_by_its_reply(self):
+        """Synthetic replies throughout: no run has recorded a person lookup keyed by email."""
+        self.start()
+        profile = self.selected_contact(email=None)
+        self.tools.inspect(tool="zerobounce_validate")  # Its free description is saved once, before the snapshot below.
+        guess = "ada@example.test"
+        validate = check(tool="zerobounce_validate", contact_ref=profile, inputs={"email": guess})
+        # The path found: a person lookup is handed a guessed address and its contact-shaped reply repeats it.
+        self.provider.raw = {"status": "ok", "data": {"first_name": "Ada", "last_name": "Example", "email": "Ada@Example.Test"}}
+        echo = self.lookup(check(tool="hunter_people_find", contact_ref=profile, inputs={"email": guess}))["lookups"][0]
+        self.assertEqual(echo["status"], "ok")
+        routes = json.loads(self.path.read_text())["routes"]
+        self.assertIsNone(email_receipts.discovery_source(self.path, routes, guess))
+        # The same guess written with a trailing dot, repeated verbatim, is the same echo.
+        self.provider.raw = {"status": "ok", "data": {"first_name": "Ada", "last_name": "Example", "email": guess + "."}}
+        self.lookup(check(tool="fixture_person_lookup", contact_ref=profile, purpose="Look the dotted guess up",
+                          inputs={"email": guess + "."}))
+        routes = json.loads(self.path.read_text())["routes"]
+        self.assertIsNone(email_receipts.discovery_source(self.path, routes, guess + "."))
+        before = self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)
+        with self.assertRaisesRegex(ValueError, "exact address.*saved finder/page"):
+            self.lookup(validate)
+        with self.assertRaisesRegex(ValueError, "repeats an address its own request carried"):
+            self.tools.review(companies=[{"target": "example.test", "decision": "hold_contact", "reason": "Echoed guess",
+                "primary_contact": {"email": guess, "email_source": {"ref": echo["results"][0]["ref"]}}}])
+        self.assertEqual((self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
+        # A page fetched by a URL that carries the guess, whose body repeats it, is the same echo.
+        for label, url in (("query", "https://example.test/search?q=" + guess), ("encoded", "https://example.test/verify/ada%40example.test"),
+                           ("plus-joined", "https://example.test/search?q=Ada+Example+" + guess)):
+            captured_page(self.tools, self.provider, url=url, text="No results for ada@example.test.")
+            routes = json.loads(self.path.read_text())["routes"]
+            with self.subTest(url=label):
+                self.assertIsNone(email_receipts.discovery_source(self.path, routes, guess))
+        # Control: the same kind of lookup, keyed by one address, independently returns another. That one is evidence.
+        self.provider.raw = {"status": "ok", "data": {"first_name": "Ada", "last_name": "Example", "email": "ada.example@example.test"}}
+        self.lookup(check(tool="fixture_person_lookup", contact_ref=profile, purpose="Find the work address from a known one",
+                          inputs={"email": "ada.personal@mail.test"}))
+        routes = json.loads(self.path.read_text())["routes"]
+        self.assertEqual(email_receipts.discovery_source(self.path, routes, "ada.example@example.test")["source"]["tool"], "fixture_person_lookup")
+        self.assertIsNone(email_receipts.discovery_source(self.path, routes, "ada.personal@mail.test"))
+        # Control: independent evidence for the guessed address still counts, and only then may it be validated.
+        page = captured_page(self.tools, self.provider, text="Email Ada at ada@example.test.")
+        found = email_receipts.discovery_source(self.path, json.loads(self.path.read_text())["routes"], guess)
+        self.assertEqual(found["source"]["route_id"], page.split(":")[0])
+        self.provider.raw = {"status": "ok", "data": {"address": guess, "status": "valid"}}
+        self.assertEqual(self.lookup(validate)["lookups"][0]["status"], "ok")
+
+    def test_a_saved_run_that_validated_an_echoed_guess_is_refused_at_delivery(self):
+        """Synthetic replies. A run saved before the rule above must not deliver on the echo alone."""
+        self.start()
+        profile = self.selected_contact(email=None)
+        guess = "ada@example.test"
+        self.provider.raw = {"status": "ok", "data": {"first_name": "Ada", "last_name": "Example", "email": guess}}
+        self.lookup(check(tool="hunter_people_find", contact_ref=profile, inputs={"email": guess}))
+        self.provider.raw = {"status": "ok", "data": {"address": guess, "status": "valid"}}
+        with patch.object(runner, "discovery_source", return_value={"source": {}}):  # As the gate behaved before.
+            verdict = self.lookup(check(tool="zerobounce_validate", contact_ref=profile,
+                                        inputs={"email": guess}))["lookups"][0]["results"][0]["ref"]
+        self.tools.review(companies=[{"target": "example.test", "decision": "hold_contact", "reason": "Historical valid verdict",
+            "primary_contact": {"email_ref": verdict}}])
+        doc = json.loads(self.path.read_text())
+        self.assertNotIn("email_source", doc["unresolved"][0]["primary_contact"])  # No source is invented for it.
+        doc["accepted"] = doc["unresolved"]
+        self.assertIn("before validation", str(email_receipts.email_receipt_errors(doc, self.path)))
+        # The shape such a run really saved: its email_source names the echo. Delivery refuses that too.
+        echo_route = next(r for r in doc["routes"] if r.get("tool") == "hunter_people_find")
+        doc["accepted"][0]["primary_contact"]["email_source"] = {"source": {
+            **{k: echo_route[k] for k in ("provider", "operation", "tool", "route_id")}, "result_index": 0}}
+        self.assertIn("before validation", str(email_receipts.email_receipt_errors(doc, self.path)))
 
     def test_discovery_attribution_preserves_selected_index_and_report_link(self):
         self.start()
