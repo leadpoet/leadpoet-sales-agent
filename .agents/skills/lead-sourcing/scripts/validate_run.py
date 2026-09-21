@@ -1961,6 +1961,21 @@ def run_deadline(document: dict) -> Optional[datetime]:
     return deadline
 
 
+def research_closes(document: dict) -> Optional[datetime]:
+    """When research stops opening. The hard deadline itself never moves.
+
+    A run may save stop_check.closing_seconds at start. Research then closes that
+    long before run_deadline, so an open turn can end and report its own usage
+    before the hard stop. Runs without the field close at their deadline.
+    """
+    deadline = run_deadline(document)
+    seconds = document.get("stop_check", {}).get("closing_seconds", 0)
+    if type(seconds) is not int or seconds < 0:
+        raise ValueError("stop_check.closing_seconds must be a non-negative integer")
+    from datetime import timedelta
+    return None if deadline is None else deadline - timedelta(seconds=seconds)
+
+
 def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_budget=None, legacy_stop_policy=False) -> dict[str, Any]:
     """Check next actions independently of self-declared exhausted route labels."""
     errors: list[str] = []
@@ -1991,7 +2006,7 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
         errors.append("max_duration_seconds must be a positive integer or null")
         return result
     try:
-        deadline = run_deadline(document)
+        closes = research_closes(document)
     except ValueError as exc:
         errors.append(str(exc))
         return result
@@ -2020,7 +2035,7 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
     if sourcing_target_met(document):
         result["decision"] = "target_met"
         return result
-    if deadline is not None and current >= deadline:
+    if closes is not None and current >= closes:
         result["decision"] = "time_limit_reached"
         return result
 

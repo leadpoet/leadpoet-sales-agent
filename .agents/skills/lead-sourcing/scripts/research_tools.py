@@ -29,7 +29,8 @@ import scrapingdog
 import run_coordination as coordination
 from source_receipts import FUNDING_TOOL, arena_public_web_capture, content_kind, funding_record, source_date
 from validate_run import (request_requirements, required_attribute_errors, company_website,
-                          industry_taxonomy, source_evidence_error, signal_age_errors, run_deadline)
+                          industry_taxonomy, source_evidence_error, signal_age_errors, run_deadline,
+                          research_closes)
 
 
 def obj(properties, required=()):
@@ -295,7 +296,7 @@ class ResearchTools:
                     coordination.check_worker(coordination.snapshot(self.path), self.worker, self.generation)
                     if request.get("operation") not in {"search", "describe"}:
                         document = self._document()
-                        deadline = run_deadline(document)
+                        deadline = research_closes(document)
                         if (len(document["accepted"]) >= document["request"]["target_count"]
                                 or deadline is not None and datetime.now(timezone.utc) >= deadline):
                             raise ValueError("Shared target or deadline reached; no new provider call dispatched")
@@ -425,6 +426,11 @@ class ResearchTools:
         with self._catalog_lock:
             if self.environment.get("TYCHE_BUDGET_POLICY"):
                 options["budget_policy"] = self.environment["TYCHE_BUDGET_POLICY"]
+            if self.environment.get("TYCHE_WIND_DOWN_SECONDS"):
+                try:
+                    options["closing_seconds"] = int(self.environment["TYCHE_WIND_DOWN_SECONDS"])
+                except ValueError as exc:
+                    raise ValueError("TYCHE_WIND_DOWN_SECONDS must be a whole number of seconds") from exc
             request = copy.deepcopy(request)
             saved_request = self._document()["request"] if self.path.exists() else None
             exclusions_file = self.path.parent / "request-exclusions.json"
@@ -486,8 +492,10 @@ class ResearchTools:
             # Await all of them before creating a ledger or allowing paid research.
             catalog_until = time.monotonic() + 120
             with ThreadPoolExecutor(max_workers=3) as pool:
+                closing = research_input.closing_window(options.get("closing_seconds"), request.get("max_duration_seconds"))
                 pending = [(tool, pool.submit(self._startup_contract, tool, filename, options["started_at"],
-                            until=catalog_until, max_duration_seconds=request.get("max_duration_seconds")))
+                            until=catalog_until, max_duration_seconds=request.get("max_duration_seconds"),
+                            closing_seconds=closing))
                            for tool, filename in prepared]
                 receipts = []
                 for tool, future in pending:
@@ -500,6 +508,14 @@ class ResearchTools:
                         if tool == "zerobounce_validate":
                             options["verification_reserve_credits"] = float(Decimal(str(price)) * request["target_count"])
                     receipts.append((tool, response))
+            if closing:
+                # Saved descriptions return without a clock check, and a retry runs late.
+                # Decide once from the settled start, before anything is written.
+                closes = research_closes({"request": {"max_duration_seconds": request.get("max_duration_seconds")},
+                                          "stop_check": {"started_at": options["started_at"], "closing_seconds": closing}})
+                if datetime.now(timezone.utc) >= closes:
+                    raise OperationalBlock("Research has already closed for this run's time limit. No run was created "
+                                           "and no paid research has started; preserve the original run clock.")
             runner.start_run(self.path, {"request": request, **options})
             for tool, response in receipts:
                 def replay(_request, capture):
@@ -510,7 +526,7 @@ class ResearchTools:
             self._clear_operational_status()
             return self.inspect()
 
-    def _startup_contract(self, tool, filename, started_at, *, until=None, max_duration_seconds=None):
+    def _startup_contract(self, tool, filename, started_at, *, until=None, max_duration_seconds=None, closing_seconds=0):
         from provider_output import ResponseFile
         def verify(body):
             contracts = [r for r in body.get("results", []) if r.get("toolId", r.get("id")) == tool]
@@ -530,8 +546,9 @@ class ResearchTools:
             except ValueError:
                 pass  # Preserve the failed receipt and its clock before retrying.
         until = min(until if until is not None else float("inf"), time.monotonic() + 120)
-        deadline = run_deadline({"request": {"max_duration_seconds": max_duration_seconds},
-                                 "stop_check": {"started_at": started_at}})
+        # Startup must finish before research closes, or no run is created at all.
+        deadline = research_closes({"request": {"max_duration_seconds": max_duration_seconds},
+                                    "stop_check": {"started_at": started_at, "closing_seconds": closing_seconds}})
         if deadline is not None:
             until = min(until, time.monotonic() + (deadline - datetime.now(timezone.utc)).total_seconds())
 

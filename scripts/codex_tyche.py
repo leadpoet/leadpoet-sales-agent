@@ -29,6 +29,7 @@ REASONING_EFFORT = 'high'
 SERVICE_TIER = 'fast'
 FINALIZATION_SECONDS = 600
 STARTUP_SECONDS = 600
+WIND_DOWN_SECONDS = 120  # Research closes this long before an explicit time limit.
 MAX_UNCHANGED_EXITS = 5
 DEFAULT_WORKERS = 1
 
@@ -68,7 +69,7 @@ def research_deadline(request_file, started_at):
 def authorize_resume(request_file, until, reason):
     """Operator-only amendment: keep request, original start and ledger intact."""
     import budget_guard
-    from validate_run import run_deadline
+    from validate_run import research_closes, run_deadline
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError('--resume-reason must record the user authorization')
     revised = datetime.fromisoformat(until.replace('Z', '+00:00'))
@@ -94,6 +95,10 @@ def authorize_resume(request_file, until, reason):
             'previous_deadline': deadline.isoformat(), 'deadline': revised.isoformat(),
             'recorded_at': datetime.now(timezone.utc).isoformat(), 'authorization': reason})
         run_deadline(document)
+        if research_closes(document) <= datetime.now(timezone.utc):
+            # Raising here leaves the saved run untouched: nothing is recorded as granted.
+            raise ValueError('--resume-until must leave research time: this run closes research '
+                             + str(document['stop_check'].get('closing_seconds', 0)) + ' seconds before its deadline')
 
 
 def cost_stop(request_file, active_model_receipt=None, *, admission=False):
@@ -581,7 +586,7 @@ def tool_configuration(run_file, *, readonly=False):
                  'DEEPLINE_NO_AUTO_UPDATE', 'DEEPLINE_SKIP_SKILLS_SYNC', 'TYCHE_WORKSPACE_NODE',
                  'TYCHE_WORKSPACE_NODE_MODULES', 'TYCHE_WORKSPACE_PYTHON', 'PYTHONDONTWRITEBYTECODE',
                  'TYCHE_RUN_STARTED_AT', 'TYCHE_REQUEST_FILE', 'TYCHE_FINALIZATION_ONLY', 'TYCHE_ACTIVE_MODEL_RECEIPT']
-    forwarded += ['TYCHE_WORKER_ID', 'TYCHE_WORKER_GENERATION', 'TYCHE_BUDGET_POLICY']
+    forwarded += ['TYCHE_WORKER_ID', 'TYCHE_WORKER_GENERATION', 'TYCHE_BUDGET_POLICY', 'TYCHE_WIND_DOWN_SECONDS']
     return ('\n[mcp_servers.tyche]\ncommand = ' + json.dumps(sys.executable) + '\nargs = ' + json.dumps(args) + '\n'
             'env_vars = ' + json.dumps(forwarded) + '\n'
             'cwd = ' + json.dumps(str(ROOT)) + '\nrequired = true\n'
@@ -754,7 +759,7 @@ def main():
         # and global skill sync can contact npm or alter context mid-run.
         env = dict(os.environ, CODEX_HOME=profile, TYCHE_ISOLATED_RUN='1',
                    DEEPLINE_NO_AUTO_UPDATE='1', DEEPLINE_SKIP_SKILLS_SYNC='1',
-                   TYCHE_RUN_STARTED_AT=launched_at)
+                   TYCHE_RUN_STARTED_AT=launched_at, TYCHE_WIND_DOWN_SECONDS=str(WIND_DOWN_SECONDS))
         env = workspace_environment(env)
         if args.budget_policy:
             env['TYCHE_BUDGET_POLICY'] = args.budget_policy

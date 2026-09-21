@@ -780,6 +780,7 @@ top-level result list or hide rejected/unresolved rows in a count.
       "required": ["started_at", "next_actions"],
       "properties": {
         "started_at": {"type": "string", "format": "date-time"},
+        "closing_seconds": {"type": "integer", "minimum": 0},
         "catalog_review_route_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
         "next_actions": {"type": "array", "items": {"$ref": "#/$defs/next_action"}}
       }
@@ -1192,8 +1193,10 @@ verification-allowance calculation as dispatch. Eligibility is a snapshot;
 the adapter must still reserve atomically before sending the call. Decisions:
 
 - `target_met`: requested company count reached and every accepted company meets its contact target. For historical requests without minimum/target fields, retain company-count stopping.
-- `time_limit_reached`: the saved default or user-specified duration expired. Target takes
-  precedence if already reached. Report any shortfall and unfinished routes.
+- `time_limit_reached`: the saved default or user-specified duration expired, or research
+  has closed `stop_check.closing_seconds` before it so an open model turn can end and report
+  its usage. The deadline itself does not move. Target takes precedence if already reached.
+  Report any shortfall and unfinished routes.
 - `continue`: at least one action fits, discovery/recovery coverage is missing,
   or pricing needs resolution. Dispatch only an `eligible_actions` entry. With
   missing coverage/prices, add the concrete free planning/research action first.

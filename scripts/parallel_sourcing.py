@@ -200,8 +200,10 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                 drain_until, startup_drain = time.time() + 45, True
             elif terminal and drain_until is None:
                 # Tools refuse new work at the shared stop. Give researchers a
-                # bounded chance to save the judgments they already possess.
-                drain_until = time.time() + 45
+                # bounded chance to save the judgments they already possess. Research
+                # that closed early for its time limit keeps the rest of that window.
+                closing = stop == "time_limit_reached" and limit is not None and limit > time.time()
+                drain_until = limit if closing else time.time() + 45
             if drain_until is not None and time.time() >= drain_until:
                 reason = reason or startup_block
                 stopped.set()

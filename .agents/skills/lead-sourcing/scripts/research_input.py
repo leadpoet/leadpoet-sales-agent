@@ -152,10 +152,18 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
     return request
 
 
+def closing_window(requested, duration):
+    """Seconds research closes before an explicit time limit; a short run keeps nine tenths of it."""
+    if not requested or not duration:
+        return 0
+    return min(budget_guard.count(requested, "closing_seconds"), duration // 10)
+
+
 def start_document(run_file, setup, *, existing=None, ledger=None):
     """Produce validated initialization inputs; budget_guard owns persistence."""
     object_fields(setup, {"request", "max_usd", "scrapingdog_usd_per_credit",
-                          "verification_reserve_credits", "started_at", "budget_policy"}, "setup")
+                          "verification_reserve_credits", "started_at", "budget_policy",
+                          "closing_seconds"}, "setup")
     existing, ledger = existing or {}, ledger or {}
     started = existing.get("stop_check", {}).get("started_at") or ledger.get("initial_started_at") or setup.get("started_at") or datetime.now(timezone.utc).isoformat()
     text(started, "started_at")
@@ -210,6 +218,9 @@ def start_document(run_file, setup, *, existing=None, ledger=None):
                                 "spent": {"deepline_credits": 0, "scrapingdog_credits": 0}, "paid_calls": 0, "status": "within_budget"},
         routes=[], accepted=[], rejected=[], unresolved=[], summary={},
         stop_check={"started_at": started, "next_actions": []}, stop_audit={"route_frontier": []})
+    closing = closing_window(setup.get("closing_seconds"), request.get("max_duration_seconds"))
+    if not existing and closing:
+        document["stop_check"]["closing_seconds"] = closing  # Saved once with the run.
     return document, options
 
 

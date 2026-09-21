@@ -331,6 +331,20 @@ usage, cancellation and failure safeguards remain active. Resuming preserves any
 saved deadline and the original start. Older saved requests retain their existing
 limits. A watchdog terminates the worker's process group at an explicit saved
 deadline even if it is silent.
+
+With an explicit time limit, the local launcher closes research shortly before
+that deadline: 120 seconds, or one tenth of a shorter limit. The window is saved
+once with the run as `stop_check.closing_seconds`, and the one stop decision
+reports `time_limit_reached` from then on, so inspection, finish and provider
+admission agree and no new provider work opens. This lets an open model turn end
+and report its own usage before the hard stop, which a terminated session cannot
+do. The deadline itself does not move and the watchdog still terminates there. A
+turn still open at the deadline leaves unknown usage, and that keeps blocking the
+run. Startup must finish before research closes, and an operator extension that
+would leave no research time before the window is refused. Runs without a time limit, runs
+saved earlier, resumes and hosts that do not ask for a window are unchanged. How
+often a turn ends inside the window has not been measured in a live run.
+
 In-flight charges remain uncertain until their saved responses or billing
 can reconcile them; killing a local process does not cancel remote charges.
 
