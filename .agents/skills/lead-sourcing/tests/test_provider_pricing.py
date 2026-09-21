@@ -40,6 +40,29 @@ class CatalogQuantityPricingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No whole-call price"):
             pricing.call_credits(self.contract, {"query": "example", "num": 10})
 
+    def test_one_person_finder_is_bounded_but_open_result_counts_are_refused(self):
+        def contract(tool, names):
+            return {"toolId": tool, "pricing": {"unit": "result", "creditsPerUnit": 5.46},
+                    "inputSchema": {"fields": [{"name": name, "type": "string"} for name in names]}}
+        person = {"domain": "example.test", "first_name": "Ada", "last_name": "Example"}
+        finder = contract("zerobounce_email_finder", ("domain", "first_name", "middle_name", "last_name"))
+        self.assertEqual(pricing.call_credits(finder, person), 5.46)
+        # Without a full name the same route is a domain-wide query, so it has no bound.
+        for unnamed in ({"domain": "example.test"}, {**person, "last_name": " "}, {**person, "first_name": None}):
+            with self.subTest(inputs=unnamed), self.assertRaisesRegex(ValueError, "No whole-call price"):
+                pricing.call_credits(finder, unnamed)
+        # A catalog that starts declaring a quantity input is no longer the one-result contract.
+        for declared in ({"fields": finder["inputSchema"]["fields"] + [{"name": "count", "type": "integer"}]},
+                         {"fields": finder["inputSchema"]["fields"], "jsonSchema": {"properties": {"limit": {"type": "integer"}}}}):
+            with self.subTest(schema=declared), self.assertRaisesRegex(ValueError, "No whole-call price"):
+                pricing.call_credits({**finder, "inputSchema": declared}, person)
+        for tool, names, inputs in (
+                ("zerobounce_domain_search", ("domain", "type"), {"domain": "example.test", "type": "all"}),
+                ("lusha_enrich_person", ("linkedin_url", "reveal_emails", "reveal_phones"), {"reveal_emails": True}),
+                ("leadmagic_email_finder", ("first_name", "last_name", "domain"), person)):
+            with self.subTest(tool=tool), self.assertRaisesRegex(ValueError, "No whole-call price"):
+                pricing.call_credits(contract(tool, names), inputs)
+
     def test_serper_override_cannot_underfund_catalog_count(self):
         with self.assertRaisesRegex(ValueError, "below the catalog-derived"):
             pricing.call_credits(self.contract, {"query": "example", "num": 10}, .19)

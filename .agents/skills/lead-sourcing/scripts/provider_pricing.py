@@ -107,6 +107,12 @@ def call_credits(contract, inputs, override=None):
         elif contract.get("toolId", contract.get("id")) in {
                 "zerobounce_validate", "bounceban_verify_single", "hunter_email_finder", "datagma_find_email"}:
             quantity = 1
+        elif (contract.get("toolId", contract.get("id")) == "zerobounce_email_finder" and not inputs_can_bound(contract)
+              and all(isinstance(inputs.get(k), str) and inputs[k].strip() for k in ("first_name", "last_name"))):
+            # One named person in, at most one address billed. Without a name it is a
+            # domain-wide query, and a catalog that starts declaring a quantity input is no
+            # longer this contract; both stay unpriced, like domain search and multi-reveal tools.
+            quantity = 1
     bound = None
     if rate is not None and type(quantity) is int and quantity > 0:
         bound = budget.amount(rate, "catalog price") * quantity
