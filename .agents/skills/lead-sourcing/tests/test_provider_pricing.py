@@ -58,10 +58,41 @@ class CatalogQuantityPricingTests(unittest.TestCase):
                 pricing.call_credits({**finder, "inputSchema": declared}, person)
         for tool, names, inputs in (
                 ("zerobounce_domain_search", ("domain", "type"), {"domain": "example.test", "type": "all"}),
-                ("lusha_enrich_person", ("linkedin_url", "reveal_emails", "reveal_phones"), {"reveal_emails": True}),
-                ("leadmagic_email_finder", ("first_name", "last_name", "domain"), person)):
+                ("lusha_enrich_person", ("linkedin_url", "reveal_emails", "reveal_phones"), {"reveal_emails": True})):
             with self.subTest(tool=tool), self.assertRaisesRegex(ValueError, "No whole-call price"):
                 pricing.call_credits(contract(tool, names), inputs)
+
+    def test_other_one_person_lookups_are_bounded_only_for_an_identified_person(self):
+        # Input names as the joint pilot's saved catalog descriptions declare them.
+        def contract(tool, rate, names, **schema):
+            return {"toolId": tool, "pricing": {"unit": "result", "creditsPerUnit": rate},
+                    "inputSchema": {"fields": [{"name": name, "type": "string"} for name in names], **schema}}
+        cases = (
+            ("leadmagic_email_finder", .34, ("first_name", "last_name", "domain", "company_name", "company_domain"),
+             {"first_name": "Ada", "last_name": "Example", "domain": "example.test"}, {"domain": "example.test", "first_name": "Ada"}),
+            ("leadmagic_profile_search", .34, ("profile_url",),
+             {"profile_url": "https://www.linkedin.com/in/ada-example/"}, {"profile_url": " "}))
+        for tool, rate, names, identified, open_query in cases:
+            with self.subTest(tool=tool, inputs=identified):
+                self.assertEqual(pricing.call_credits(contract(tool, rate, names), identified), rate)
+                with self.assertRaisesRegex(ValueError, "No whole-call price"):
+                    pricing.call_credits(contract(tool, rate, names), open_query)
+                with self.assertRaisesRegex(ValueError, "No whole-call price"):  # No longer the one-result contract.
+                    pricing.call_credits(contract(tool, rate, names, jsonSchema={"properties": {"limit": {"type": "integer"}}}), identified)
+                with self.assertRaisesRegex(ValueError, "No whole-call price"):  # A text-only rate is not a rate.
+                    pricing.call_credits(contract(tool, None, names), identified)
+        # Searches whose result count the request does not fix stay refused, as saved by the pilot.
+        # So does a person lookup by email address: its reply repeats the address it was sent.
+        for tool, rate, names, inputs in (
+                ("hunter_people_find", .3, ("email", "linkedin_handle"), {"email": "ada@example.test"}),
+                ("hunter_people_find", .3, ("email", "linkedin_handle"), {"linkedin_handle": "ada-example"}),
+                ("contactout_search_people", 1.4, ("job_title", "company", "domain", "name", "page"), {"domain": "example.test", "page": 1}),
+                ("datagma_find_people", 1.31, ("currentJobTitle", "domain", "countries"), {"domain": "example.test"}),
+                ("leadmagic_role_finder", .68, ("job_title", "company_domain"), {"job_title": "Buyer", "company_domain": "example.test"}),
+                ("wiza_reveal_person", None, ("linkedin_url", "full_name"), {"linkedin_url": "https://www.linkedin.com/in/ada-example/"}),
+                ("wiza_reveal_person", .35, ("linkedin_url", "full_name"), {"linkedin_url": "https://www.linkedin.com/in/ada-example/"})):
+            with self.subTest(tool=tool), self.assertRaisesRegex(ValueError, "No whole-call price"):
+                pricing.call_credits(contract(tool, rate, names), inputs)
 
     def test_serper_override_cannot_underfund_catalog_count(self):
         with self.assertRaisesRegex(ValueError, "below the catalog-derived"):

@@ -31,6 +31,12 @@ response with no returned results. The error response alone cannot settle it.
 Preserve IDs, receipts and the
 original limits; never repeat a paid call to discover its cost.
 
+The one-person `zerobounce_email_finder`, `leadmagic_email_finder`, and
+`leadmagic_profile_search` calls use their published one-result rate only when
+the request identifies the person and the catalog declares no numeric quantity
+input. Open searches and unclear contracts remain unpriced. This price
+calculation does not reserve money or change actual-cost admission.
+
 `run-costs.json` shows `provider_usd`, `estimated_llm_usd`, `total_usd` and
 `pending_provider_calls`. The total is the known subtotal when status is
 `incomplete`. Base LLM estimates exclude Fast premiums, hosted tools and

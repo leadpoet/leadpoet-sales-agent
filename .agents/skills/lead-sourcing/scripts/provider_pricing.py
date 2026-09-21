@@ -87,6 +87,39 @@ def validate_reservation(request):
         raise ValueError("Reservation is below the managed planning price")
 
 
+QUANTITY_INPUTS = {"limit", "page_size", "pageSize", "num", "numResults", "pages", "maxPages", "max_pages",
+                   "max_results", "maxResults", "perPage", "per_page", "count", "size"}
+
+
+def _may_be_a_number(spec):
+    kinds = (spec or {}).get("type")
+    return any(kind in (None, "integer", "number") for kind in (kinds if isinstance(kinds, list) else [kinds]))
+
+
+def inputs_can_bound(contract):
+    """Return whether the caller can choose a numeric billed quantity.
+
+    One-person lookup pricing is valid only while the catalog has no such input.
+    This check does not reserve money or change actual-cost admission.
+    """
+    schema = contract.get("inputSchema", {})
+    declared = [(f["name"], f) for f in schema.get("fields", [])]
+    declared += list(((schema.get("jsonSchema") or {}).get("properties") or {}).items())
+    chosen = any(name in QUANTITY_INPUTS and _may_be_a_number(spec) for name, spec in declared)
+    return (contract.get("pricing") or {}).get("creditsPerUnit") is not None and chosen
+
+
+# Lookups of one identified person: a published rate per result, and a request that can return
+# only that person. Each entry lists the alternative inputs that identify them. Checked per tool
+# against its saved catalog description and the provider's own documentation, not against bills.
+# Only the reviewed exact-one-result contracts are listed. Open searches and other person
+# lookups retain their existing pricing behavior.
+ONE_PERSON_LOOKUPS = {
+    "zerobounce_email_finder": (("first_name", "last_name"),),
+    "leadmagic_email_finder": (("first_name", "last_name"),),
+    "leadmagic_profile_search": (("profile_url",),),
+}
+
 def call_credits(contract, inputs, override=None):
     pricing = contract.get("pricing") or {}
     rate, unit = pricing.get("creditsPerUnit"), pricing.get("unit")
@@ -107,11 +140,12 @@ def call_credits(contract, inputs, override=None):
         elif contract.get("toolId", contract.get("id")) in {
                 "zerobounce_validate", "bounceban_verify_single", "hunter_email_finder", "datagma_find_email"}:
             quantity = 1
-        elif (contract.get("toolId", contract.get("id")) == "zerobounce_email_finder" and not inputs_can_bound(contract)
-              and all(isinstance(inputs.get(k), str) and inputs[k].strip() for k in ("first_name", "last_name"))):
-            # One named person in, at most one address billed. Without a name it is a
-            # domain-wide query, and a catalog that starts declaring a quantity input is no
-            # longer this contract; both stay unpriced, like domain search and multi-reveal tools.
+        elif (contract.get("toolId", contract.get("id")) in ONE_PERSON_LOOKUPS and not inputs_can_bound(contract)
+              and any(all(isinstance(inputs.get(k), str) and inputs[k].strip() for k in keys)
+                      for keys in ONE_PERSON_LOOKUPS[contract.get("toolId", contract.get("id"))])):
+            # One identified person in, at most one result billed. Without that identity it is
+            # an open query, and a catalog that starts declaring a quantity input is no longer
+            # this contract; both stay unpriced, like domain search and multi-reveal tools.
             quantity = 1
     bound = None
     if rate is not None and type(quantity) is int and quantity > 0:
