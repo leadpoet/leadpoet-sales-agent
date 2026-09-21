@@ -42,6 +42,7 @@ import email_receipts
 import linkedin_receipts
 import run_attempt
 import scrapingdog
+from validate_run import research_closes, run_deadline
 
 
 @pytest.fixture
@@ -4019,6 +4020,7 @@ def test_latest_native_finalization_budget_fits_the_hard_limit():
     [
         ({}, (2670, 2070)),
         ({"LAB_ARENA_WALL_CLOCK_SECONDS": "2700"}, (2670, 2070)),
+        ({"LAB_ARENA_WALL_CLOCK_SECONDS": "3600"}, (3570, 2970)),
         ({"LAB_ARENA_WALL_CLOCK_SECONDS": "5400"}, (5370, 4770)),
     ],
 )
@@ -4026,6 +4028,21 @@ def test_arena_time_limits_use_signed_host_duration_with_legacy_fallback(
     environment, expected,
 ):
     assert runtime.arena_time_limits(environment) == expected
+
+
+def test_arena_hour_keeps_one_research_boundary_without_local_wind_down(tmp_path):
+    run_seconds, research_seconds = runtime.arena_time_limits({"LAB_ARENA_WALL_CLOCK_SECONDS": "3600"})
+    assert (run_seconds, research_seconds) == (3570, 2970)
+    run_file = tmp_path / "results.json"
+    broker = Broker(tmp_path / "unused.sock", time.monotonic() + research_seconds)
+    tools = ResearchTools(run_file, execute=broker.execute, environment={})
+    tools.start(request=request_for(ICP, 1, research_seconds), max_usd=.5)
+    saved = json.loads(run_file.read_text())
+    assert saved["request"]["max_duration_seconds"] == research_seconds
+    assert "closing_seconds" not in saved["stop_check"]
+    assert research_closes(saved) == run_deadline(saved)
+    budget_guard.bind_arena_confirmed_costs(run_file)
+    assert budget_guard.admission_stop(budget_guard.load_ledger(run_file)) is None
 
 
 @pytest.mark.parametrize(

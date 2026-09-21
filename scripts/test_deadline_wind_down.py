@@ -91,7 +91,10 @@ class DeadlineWindDownTests(unittest.TestCase):
         env = dict(os.environ, TYCHE_RUN_STARTED_AT=self.started, CODEX_HOME=str(self.profile),
                    FAKE_LOG=str(self.log), FAKE_END_AT=str(self.closes + turn_ends_after_closing))
         def close(request_file, receipt, environment=None):
-            delivered = 'finalization' in self.log.read_text().split()
+            # The confirmed-cost gate permits review after an incomplete model turn.
+            # Strict delivery still requires that turn's final usage receipt.
+            pending = budget_guard.actual_cost_summary(budget_guard.load_ledger(self.run))['missing_model_usage']
+            delivered = 'finalization' in self.log.read_text().split() and not pending
             return codex_tyche.write_worker_status(request_file, {
                 'status': 'delivered' if delivered else 'incomplete', 'delivery_allowed': delivered})
         with patch('codex_tyche.close_worker', side_effect=close), \
@@ -153,12 +156,15 @@ class DeadlineWindDownTests(unittest.TestCase):
         self.start(remaining=12, closing=6)
         code, status = self.supervise(turn_ends_after_closing=120)
         stopped_after_limit = time.time() - self.limit
-        self.assertEqual(self.log.read_text().split(), ['research'])  # No review session.
-        self.assertEqual((code, status['status'], status['reason']), (1, 'stopped', 'model_usage_pending'))
+        phases = self.log.read_text().split()
+        self.assertEqual(phases.count('research'), 1)
+        self.assertIn('finalization', phases)  # Review is allowed, but delivery cannot pass.
+        self.assertEqual(code, 1)
+        self.assertFalse(status['delivery_allowed'])
         # The hard deadline is unchanged: stopped at the limit, with no extra wait.
         self.assertGreaterEqual(stopped_after_limit, 0)
         self.assertLess(stopped_after_limit, 15)
-        (killed,) = self.receipts()
+        killed = min(self.receipts(), key=lambda receipt: receipt['started_at'])
         self.assertEqual((killed['status'], killed['failure_kind'], killed['usage'], killed['usage_reconciled']),
                          ('incomplete', 'deadline_reached', None, False))
         summary = budget_guard.actual_cost_summary(budget_guard.load_ledger(self.run))
@@ -170,8 +176,9 @@ class DeadlineWindDownTests(unittest.TestCase):
         self.start(remaining=8, closing=None)
         self.assertEqual(self.closes, self.limit)
         code, status = self.supervise(turn_ends_after_closing=2)
-        self.assertEqual(self.log.read_text().split(), ['research'])
-        self.assertEqual((code, status['reason']), (1, 'model_usage_pending'))
+        self.assertEqual(self.log.read_text().split().count('research'), 1)
+        self.assertEqual(code, 1)
+        self.assertFalse(status['delivery_allowed'])
 
     def test_pool_keeps_the_rest_of_the_window_then_stops_at_the_hard_deadline(self):
         self.start(remaining=100, closing=120)  # Research has closed; the deadline is 100 seconds away.
@@ -197,12 +204,12 @@ class DeadlineWindDownTests(unittest.TestCase):
         with patch('run_costs.execute_with_usage', side_effect=worker), \
                 patch('parallel_sourcing.time.time', side_effect=lambda: real_time() + offset[0]), \
                 contextlib.redirect_stdout(io.StringIO()):
-            # A worker stopped at the hard deadline leaves unknown usage, and the guard blocks the pool.
-            with self.assertRaisesRegex(RuntimeError, 'model_usage_pending'):
-                run_research(['codex', 'exec', 'Fixture ICP'], self.request,
-                             {'TYCHE_RUN_STARTED_AT': self.started}, self.root)
+            # The pool drains at the hard deadline. Unknown usage remains for strict delivery.
+            run_research(['codex', 'exec', 'Fixture ICP'], self.request,
+                         {'TYCHE_RUN_STARTED_AT': self.started}, self.root)
         self.assertEqual(set(waiting), {None})
         self.assertEqual(stops, ['pool_stopped'])
+        self.assertEqual(coordination.snapshot(self.run)['phase'], 'finalization')
 
     def test_operator_extension_must_leave_research_time(self):
         self.start(remaining=-5, closing=120)  # The deadline has passed.
