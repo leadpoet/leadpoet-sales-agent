@@ -422,6 +422,21 @@ def _is_linkedin_company_url(value: Any) -> bool:
     ) and parsed.path.lower().startswith("/company/")
 
 
+def _is_linkedin_person_url(value: Any) -> bool:
+    """Return whether a string is an http(s) LinkedIn person profile URL with a slug."""
+
+    if not isinstance(value, str) or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    # The whole authority must be the host: no user part, port, backslash or stray dot.
+    return (parsed.scheme in ("http", "https")
+            and bool(re.fullmatch(r"(?:[a-z0-9-]+\.)*linkedin\.com", parsed.netloc, re.IGNORECASE))
+            and bool(re.fullmatch(r"/in/[^/]+/?", parsed.path, re.IGNORECASE)))
+
+
 def _artifact_refs(row: Dict[str, Any]) -> Any:
     for key in (
         "raw_artifact_refs",
@@ -1771,12 +1786,24 @@ def _native_result_envelope(parsed, tool):
     """Unwrap observed native outputs; retain IDs/billing and the raw receipt."""
     lists = {"crustdata_v3_job_search": "job_listings", "datagma_find_people": "persons",
              "lusha_search_contacts": "contacts", "crustdata_v3_company_search": "companies",
-             "fullenrich_company_search": "companies"}
-    if (tool not in {"company_titles", "search_contact", "forager_person_role_search", "crustdata_people_search", "firecrawl_search", "fullenrich_people_search", *lists}
+             "fullenrich_company_search": "companies", "crustdata_v3_person_search": "profiles"}
+    if (tool not in {"company_titles", "search_contact", "forager_person_role_search", "crustdata_people_search", "firecrawl_search", "fullenrich_people_search", "limadata_find_person_profiles", *lists}
             or not isinstance(parsed, dict)
             or parsed.get("status") != "completed" or _structured_status(parsed) != "ok"):
         return parsed
     raw = parsed.get("toolResponse", {}).get("rawV2") if isinstance(parsed.get("toolResponse"), dict) else None
+    if tool == "limadata_find_person_profiles":
+        # Observed reply: one object holding only the found person's profile URL. A flat
+        # object is otherwise a row only when it names a person or a company, so this paid
+        # answer was discarded as malformed. Only that case is touched: a reply the generic
+        # reader already understands, as rows or as a miss, or one that signals a failure,
+        # is left exactly as it was.
+        url = raw.get("linkedin_url") if isinstance(raw, dict) and set(raw) == {"linkedin_url"} else None
+        if (not _is_linkedin_person_url(url) or _records(parsed) or _known_envelope(parsed)
+                or _empty_result_failure(parsed)[0] is not None
+                or _structured_status(parsed["toolResponse"]) not in (None, "ok")):
+            return parsed
+        return dict(parsed, results=[{"linkedin_url": url}])
     if tool in lists:
         for part in (parsed, parsed.get("toolResponse"), raw):
             if not isinstance(part, dict):
@@ -1788,6 +1815,12 @@ def _native_result_envelope(parsed, tool):
         rows = raw.get(lists[tool]) if isinstance(raw, dict) else None
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             return dict(parsed, status="schema_error", results=[], error=f"Expected {tool} {lists[tool]} array of objects")
+        if tool == "crustdata_v3_person_search":
+            # Observed rows keep the person under basic_profile and carry no profile URL.
+            # Expose the name and current title; the row itself is kept as returned.
+            rows = [dict(row, **{key: basic[field] for key, field in (("full_name", "name"), ("contact_title", "current_title"))
+                                 if key not in row and isinstance(basic.get(field), str) and basic[field].strip()})
+                    for row in rows for basic in [row["basic_profile"] if isinstance(row.get("basic_profile"), dict) else {}]]
         if tool == "datagma_find_people":
             # persons and employees repeat the same people; use the canonical
             # list once and preserve the provider's case-sensitive URL field.

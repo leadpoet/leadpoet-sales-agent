@@ -121,6 +121,88 @@ class ObservedProviderResultsTests(unittest.TestCase):
             self.assertNotEqual(self.normalize('unrelated_tool', raw)['status'], 'ok')
             self.assertNotEqual(self.normalize(tool, raw, status='pending')['status'], 'ok')
 
+    def test_limadata_profile_url_reply_is_a_paid_result_not_a_malformed_response(self):
+        # The two saved pilot replies: `linkedin_url` is the only key, a personal profile URL with
+        # no `www` and no trailing slash. The fixture slug stands in for the saved one. The `www`
+        # form with a trailing slash was not observed; it is the same profile address and is read too.
+        tool, url = 'limadata_find_person_profiles', 'https://linkedin.com/in/ada-example'
+        for address in (url, 'https://www.linkedin.com/in/ada-example/'):
+            result = self.normalize(tool, {'linkedin_url': address})  # normalize also checks the exact bill.
+            self.assertEqual((result['status'], len(result['results'])), ('ok', 1))
+            row = result['results'][0]
+            self.assertEqual((row['linkedin_url'], row['contact_url']), (address, address))
+            # The reply names nobody, so the row claims no person: identity still needs the profile getter.
+            self.assertFalse(row.get('contact_name') or row.get('full_name'))
+        # A value that is not an http(s) LinkedIn profile address with a slug is not unwrapped.
+        for value in ({'url': url}, 'ftp://linkedin.com/in/ada-example', 'linkedin.com/in/ada-example',
+                      'https://linkedin.com/in/', 'https://linkedin.com/in/ada-example/details/x', url + '\n',
+                      'https://linkedin.com.evil.test/in/ada-example', 'https://evil.test@linkedin.com/in/ada-example',
+                      'https://evil.test\\.linkedin.com/in/ada-example', 'https://linkedin.com:443/in/ada-example'):
+            with self.subTest(value=value):
+                self.assertNotEqual(self.normalize(tool, {'linkedin_url': value})['status'], 'ok')
+        self.assertEqual(self.normalize(tool, {'linkedin_url': 'https://fr.linkedin.com/in/ada-%C3%A9xample'})['status'], 'ok')
+        # A reply the generic reader already understood keeps that reading: rows stay those rows, a miss stays a miss.
+        for extra, expected in (({'results': []}, ('no_results', 0)), ({'items': []}, ('no_results', 0)),
+                                ({'results': [{'company': 'ExamplePay', 'domain': 'example.test'}]}, ('ok', 1))):
+            with self.subTest(extra=extra):
+                envelope = {'status': 'completed', 'job_id': 'fixture-request', 'billing': self.bill.copy(),
+                            'toolResponse': {'rawV2': {'linkedin_url': url}, 'view': 'data'}, **extra}
+                read, _ = deepline.normalize_response({'operation': 'execute', 'tool': tool, 'payload': {}, 'limit': 10},
+                                                      {'exit_code': 0, 'body': envelope})
+                self.assertEqual((read['status'], len(read['results'])), expected)
+                self.assertFalse(any(row.get('linkedin_url') == url for row in read['results']))
+        # An envelope that signals a failure beside the same URL keeps its failure.
+        for failure in ({'success': False}, {'ok': False}, {'status': 'rate_limited'}, {'status': 'failed'}, {'partial': True}):
+            with self.subTest(failure=failure):
+                envelope = {'status': 'completed', 'job_id': 'fixture-request', 'billing': self.bill.copy(),
+                            'toolResponse': {'rawV2': {'linkedin_url': url}, 'view': 'data', **failure}}
+                failed, _ = deepline.normalize_response({'operation': 'execute', 'tool': tool, 'payload': {}, 'limit': 10},
+                                                        {'exit_code': 0, 'body': envelope})
+                self.assertIn(failed['status'], deepline._FAILURE_STATUSES)
+                self.assertEqual((failed['results'], budget.settlement_billing(failed)), ([], self.bill))
+        # Only that exact reply is unwrapped. A missing, foreign or accompanied URL keeps its
+        # error and its charge; nothing is read as a free miss.
+        for raw in ({'linkedin_url': None}, {'linkedin_url': 'https://example.test/ada'}, {'linkedin_url': url, 'note': 'extra'}):
+            with self.subTest(raw=raw):
+                other = self.normalize(tool, raw)
+                self.assertIn(other['status'], deepline._FAILURE_STATUSES)
+                self.assertEqual(other['results'], [])
+        self.assertNotEqual(self.normalize('unrelated_tool', {'linkedin_url': url})['status'], 'ok')
+        self.assertNotEqual(self.normalize(tool, {'linkedin_url': url}, status='pending')['status'], 'ok')
+
+    def crustdata_people(self, profiles):
+        return {'profiles': profiles, 'next_cursor': 'cursor' if profiles else None, 'total_count': len(profiles),
+                'total_count_relation': 'eq' if profiles else None, 'remarks': []}
+
+    def test_crustdata_person_search_profiles_are_rows_and_an_empty_list_is_a_miss(self):
+        # Keys as the saved pilot rows declare them: the person sits under basic_profile and no row has a profile URL.
+        tool = 'crustdata_v3_person_search'
+        person = {'basic_profile': {'name': 'Ada Example', 'current_title': 'Head of Purchasing', 'headline': 'Buyer',
+                                    'professional_network_name': 'Ada Example', 'profile_picture_permalink': 'https://example.test/a.png',
+                                    'location': {'city': 'Lyon', 'country': 'France', 'full_location': 'Lyon, France'}},
+                  'experience': {'employment_details': {'current': [{'title': 'Head of Purchasing'}], 'past': []}}}
+        result = self.normalize(tool, self.crustdata_people([person, person]))
+        self.assertEqual((result['status'], len(result['results'])), ('ok', 2))
+        row = result['results'][0]
+        self.assertEqual((row['contact_name'], row['contact_title']), ('Ada Example', 'Head of Purchasing'))
+        self.assertEqual((row['basic_profile'], row['experience']), (person['basic_profile'], person['experience']))
+        self.assertFalse(row.get('contact_url'))  # Nothing in the row identifies a profile; none is invented.
+        named = self.normalize(tool, self.crustdata_people([dict(person, full_name='Provider Name')]))['results'][0]
+        self.assertEqual(named['full_name'], 'Provider Name')  # A key the provider set itself is not overwritten.
+        empty = self.normalize(tool, self.crustdata_people([]))
+        self.assertEqual((empty['status'], empty['results']), ('no_results', []))
+        for rows in (None, {}, ['invalid'], [None]):
+            with self.subTest(rows=rows):
+                broken = self.normalize(tool, dict(self.crustdata_people([person]), profiles=rows))
+                self.assertEqual((broken['status'], broken['results']), ('schema_error', []))
+        for failure in ({'success': False}, {'status': 'rate_limited'}):
+            with self.subTest(failure=failure):
+                failed = self.normalize(tool, dict(self.crustdata_people([person]), **failure))
+                self.assertIn(failed['status'], deepline._FAILURE_STATUSES)
+                self.assertEqual(failed['results'], [])
+        self.assertNotEqual(self.normalize('unrelated_search', self.crustdata_people([person]))['status'], 'ok')
+        self.assertNotEqual(self.normalize(tool, self.crustdata_people([person]), status='pending')['status'], 'ok')
+
     def test_body_request_ids_survive_both_completed_envelopes_without_headers(self):
         for tool, raw in [('builtwith_domain_lookup', self.builtwith()),
                           ('scrapecreators_instagram_profile', self.instagram())]:
