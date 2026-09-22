@@ -458,6 +458,46 @@ class ResearchToolTests(unittest.TestCase):
                 before,
             )
 
+    def test_company_review_rejects_unbound_domainless_getter_evidence_for_every_decision(self):
+        self.start()
+        self.provider.raw["element"].update(
+            name="ExamplePay", website=None, linkedinUrl="https://www.linkedin.com/company/example/")
+        unrelated = self.lookup()["lookups"][0]["results"][0]["ref"]
+        before = self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)
+        with self.assertRaisesRegex(ValueError, "has no company domain"):
+            self.tools.review(companies=[{"target": "example.test", "decision": "hold_account",
+                "reason": "Select ambiguous same-name facts", "company": {"ref": unrelated}}])
+        self.assertEqual(
+            (self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)),
+            before,
+        )
+        for decision, status in (("qualify_account", "pass"), ("reject", "fail")):
+            with self.subTest(decision=decision), self.assertRaisesRegex(ValueError, "has no company domain"):
+                self.tools.review(companies=[{"target": "example.test", "decision": decision,
+                    "reason": "Review ambiguous same-name evidence", "qualification_checks": [{
+                        "requirement_ref": "icp:industries", "status": status,
+                        "claim": "The domainless company record supports this decision.",
+                        "evidence": [{"ref": unrelated}]}]}])
+            self.assertEqual(
+                (self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)),
+                before,
+            )
+
+    def test_company_review_keeps_domainless_getter_after_verified_linkedin_binding(self):
+        self.start()
+        verified = self.lookup()["lookups"][0]["results"][0]["ref"]
+        self.tools.review(companies=[{"target": "example.test", "decision": "hold_account",
+            "reason": "Save domain-matched identity", "company": {"ref": verified}}])
+        self.provider.raw["element"]["website"] = None
+        bound = self.lookup(check(approach="refresh-bound-company",
+            inputs={"url": "https://www.linkedin.com/company/examplepay/?refresh=1"}))["lookups"][0]["results"][0]["ref"]
+        before = budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)
+        self.tools.review(companies=[{"target": "example.test", "decision": "hold_account",
+            "reason": "Review the already bound company", "company": {"ref": bound}}])
+        company = json.loads(self.path.read_text())["unresolved"][0]["candidate"]
+        self.assertEqual(company["linkedin_url"], "https://www.linkedin.com/company/examplepay/")
+        self.assertEqual((budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
+
     def test_company_review_keeps_matching_getter_and_press_negative_evidence(self):
         for source_kind in ("getter", "press"):
             with self.subTest(source_kind=source_kind):
@@ -1211,8 +1251,6 @@ class ResearchToolTests(unittest.TestCase):
 
     def test_company_and_profile_selected_together_resolve_current_employer(self):
         self.start()
-        # Without an exact domain, company identity still needs the researcher's selection.
-        self.provider.raw["element"].pop("website")
         company_ref = self.lookup()["lookups"][0]["results"][0]["ref"]
         self.tools.review(companies=[{"target": "example.test", "decision": "qualify_account", "reason": "Fit reviewed",
             "account_fit": {"ref": company_ref, "text": "Provides payments infrastructure"},
@@ -1226,7 +1264,7 @@ class ResearchToolTests(unittest.TestCase):
             "location": {"parsed": {"countryFull": "Singapore"}}}}
         profile_ref = self.lookup(check(phase="contact_verification", tool="harvestapi_get_profile",
             inputs={"url": "https://www.linkedin.com/in/ada-example/"}))["lookups"][0]["results"][0]["ref"]
-        self.assertEqual(self.tools._resolve(profile_ref)[0]["position_review"], "ambiguous")
+        self.assertEqual(self.tools._resolve(profile_ref)[0]["position_review"], "matched")
         before = budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)
         result = self.tools.review(companies=[{"target": "example.test", "decision": "hold_contact", "reason": "Select company and buyer",
             "company": {"ref": company_ref},
@@ -1377,11 +1415,13 @@ class ResearchToolTests(unittest.TestCase):
 
     def test_missing_company_selection_does_not_look_like_a_wrong_person(self):
         self.start()
-        self.provider.raw["element"].pop("website")  # No exact-domain automatic selection.
-        ref = self.lookup()["lookups"][0]["results"][0]["ref"]
+        ref = captured_page(self.tools, self.provider, text="ExamplePay provides payments infrastructure.")
+        checks = self.qualifying_signal(ref)
+        for item in checks:
+            for evidence in item["evidence"]:
+                evidence.pop("text", None)
         self.tools.review(companies=[{"target": "example.test", "decision": "qualify_account", "reason": "Fit reviewed",
-            "account_fit": {"ref": ref, "text": "Provides payments infrastructure"},
-            "qualification_checks": self.qualifying_signal(ref)}])
+            "account_fit": {"ref": ref}, "qualification_checks": checks}])
         self.provider.raw = {"status": "ok", "element": {"linkedinUrl": "https://www.linkedin.com/in/ada-example/",
             "firstName": "Ada", "lastName": "Example", "currentPosition": [{"companyName": "ExamplePay",
                 "companyLinkedinUrl": "https://www.linkedin.com/company/examplepay/", "title": "Head of Payments"}],
@@ -1398,6 +1438,11 @@ class ResearchToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "company.ref"):
             self.lookup(check(tool="zerobounce_validate", contact_ref=profile, inputs={"email": "ada@example.test"}))
         self.assertEqual((budget.ledger_path(self.path).read_bytes(), paid_calls()), before)
+        self.provider.raw = {"status": "ok", "element": {"name": "ExamplePay", "website": "https://example.test",
+            "linkedinUrl": "https://www.linkedin.com/company/examplepay/",
+            "employeeCountRange": {"start": 51, "end": 200}}}
+        ref = self.lookup()["lookups"][0]["results"][0]["ref"]
+        before = budget.ledger_path(self.path).read_bytes(), paid_calls()
         self.tools.review(companies=[{"target": "example.test", "decision": "hold_contact", "reason": "Selected saved company identity",
             "company": {"ref": ref}}])
         self.assertTrue(self.tools.inspect()["completion_candidates"][0]["profile_verified"])

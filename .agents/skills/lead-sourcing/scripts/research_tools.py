@@ -905,6 +905,26 @@ class ResearchTools:
                      for state in ("accepted", "unresolved") for r in document.get(state, [])
                      if runner._company_key(r) == target), None)
 
+    def _verified_company_linkedin(self, target):
+        """Return a saved LinkedIn identity only when its getter proved the target domain."""
+        document = self._document()
+        company = next((r.get("company", r.get("candidate", {}))
+                        for state in ("accepted", "unresolved") for r in document.get(state, [])
+                        if runner._company_key(r) == target), {})
+        linkedin = company.get("linkedin_url")
+        route_id = (company.get("employee_range_evidence") or {}).get("source", {}).get("route_id")
+        if not linkedin or not route_id:
+            return None
+        try:
+            row, source, _ = self._resolve(route_id + ":0")
+        except (KeyError, OSError, ValueError):
+            return None
+        if (source.get("tool") != "harvestapi_get_company"
+                or str(row.get("domain") or "").casefold().removeprefix("www.") != target.casefold().removeprefix("www.")
+                or deepline._linkedin_company_key(row.get("company_linkedin_url")) != deepline._linkedin_company_key(linkedin)):
+            return None
+        return linkedin
+
     def _attribution(self, value, *, email=None):
         """Bind a selected discovery/finder result to its saved receipt."""
         if not isinstance(value, dict):
@@ -967,6 +987,15 @@ class ResearchTools:
                                  f"LinkedIn {row.get('company_linkedin_url')!r}. "
                                  "Reconcile identity: use the saved domain only if this is the intended company; "
                                  "otherwise select its correct company receipt. No identity was changed.")
+            if (not row.get("domain") and
+                    (not deepline._linkedin_company_key(row.get("company_linkedin_url")) or
+                     deepline._linkedin_company_key(row.get("company_linkedin_url")) !=
+                     deepline._linkedin_company_key(self._verified_company_linkedin(target)))):
+                raise ValueError(f"Company target {target!r} is not bound to saved ref {reference!r}: "
+                                 f"{row.get('company')!r} has no company domain, LinkedIn "
+                                 f"{row.get('company_linkedin_url')!r}. Select a saved company getter whose domain "
+                                 "matches the target, or keep the company unresolved until its identity is verified. "
+                                 "No identity was changed.")
             facts = {"domain": target, "canonical_name": row.get("company"), "linkedin_url": row.get("company_linkedin_url"),
                      "website": company_website({"domain": target, "website": row.get("website")}), "employee_range": row.get("employee_range"), "employee_range_evidence": evidence}
             hq = next((r for r in row.get("locations", []) if r.get("headquarter") is True), {})
