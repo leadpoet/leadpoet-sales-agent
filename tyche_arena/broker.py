@@ -29,6 +29,7 @@ PROVIDER_TIMEOUT_LIMITS = {
 }
 PROVIDERS = ("deepline", "scrapingdog")
 SCRAPINGDOG_RUNTIME_HANDLE = "lab-arena-brokered-scrapingdog"
+CALL_IDENTITY_HEADER = "x-leadpoet-call-identity"
 
 # These are the intersections between the native adapter and the Arena's
 # existing closed operation table. Fields absent here are rejected before a
@@ -89,14 +90,6 @@ class BrokerRefusal(BrokerError):
     def __init__(self, code):
         self.code = code
         super().__init__("Arena refused operation: " + code)
-
-
-class _ResponseHeaders(dict):
-    """Provider headers with host-only call identity kept out of HTTP data."""
-
-    def __init__(self, values, call_identity=None):
-        super().__init__(values)
-        self.call_identity = call_identity
 
 
 class Broker:
@@ -316,15 +309,7 @@ class Broker:
                     "budget_exhausted", "invalid_frame", "frame_too_large", "invalid_request", "invalid_body"}:
                 raise BrokerRefusal(response["error"])
             raise BrokerError("Arena refused operation: " + str(response["error"]))
-        if (set(response) not in ({"status", "headers", "body_b64"},
-                                  {"status", "headers", "body_b64", "call_identity"})
-                or type(response["status"]) is not int):
-            raise BrokerError("Invalid Arena response envelope")
-        call_identity = response.get("call_identity")
-        if call_identity is not None and (
-            not isinstance(call_identity, str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", call_identity) is None
-        ):
+        if set(response) != {"status", "headers", "body_b64"} or type(response["status"]) is not int:
             raise BrokerError("Invalid Arena response envelope")
         try:
             raw_body = base64.b64decode(response["body_b64"], validate=True)
@@ -335,7 +320,7 @@ class Broker:
             raise BrokerError(f"Arena returned invalid provider {kind}; do not retry") from exc
         if not isinstance(response["headers"], dict):
             raise BrokerError("Invalid Arena response envelope")
-        return response["status"], _ResponseHeaders(response["headers"], call_identity), body
+        return response["status"], response["headers"], body
 
     @staticmethod
     def _valid_https_url(value):
@@ -529,7 +514,22 @@ class Broker:
                     status, headers, payload = self.request("deepline.execute", {
                         "tool": request["tool"], "payload": request["payload"]}, admitted=True,
                         timeout_seconds=request["timeout_seconds"])
-                    call_identity = getattr(headers, "call_identity", None)
+                    identity_headers = [
+                        value for name, value in headers.items()
+                        if isinstance(name, str)
+                        and name.casefold() == CALL_IDENTITY_HEADER
+                    ]
+                    call_identity = identity_headers[0] if len(identity_headers) == 1 else None
+                    headers = {
+                        name: value for name, value in headers.items()
+                        if not isinstance(name, str)
+                        or name.casefold() != CALL_IDENTITY_HEADER
+                    }
+                    if call_identity is not None and (
+                        not isinstance(call_identity, str)
+                        or re.fullmatch(r"sha256:[0-9a-f]{64}", call_identity) is None
+                    ):
+                        raise BrokerError("Arena returned an invalid call identity; do not retry")
                 else:
                     def transport(url, native_timeout_seconds):
                         if url != expected_url:

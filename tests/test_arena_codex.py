@@ -687,13 +687,10 @@ def lab(tmp_path, monkeypatch):
         assert timeout_seconds == 240.0
         fixture.frames.append(copy.deepcopy(parameters))
         fixture.deepline_used += 1
-        class Headers(dict):
-            pass
-        headers = Headers()
-        headers.call_identity = "sha256:" + hashlib.sha256(json.dumps(
+        call_identity = "sha256:" + hashlib.sha256(json.dumps(
             parameters, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
-        return 200, headers, fixture.provider(parameters)
+        return 200, {"x-leadpoet-call-identity": call_identity}, fixture.provider(parameters)
 
     monkeypatch.setattr(Broker, "request", request)
 
