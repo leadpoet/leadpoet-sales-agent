@@ -276,9 +276,9 @@ class LinkedInReceiptTests(unittest.TestCase):
                                      "position": contact["current_title"], "current": True}])
         self.path.write_text(json.dumps(self.doc))
         self.assertEqual(self.strict_check()[1]["errors"], [])
-        for label, link in (("website page", "https://example.test/team/ada-example"),
-                            ("opaque member id", "https://www.linkedin.com/in/ACoAAAExampleOpaqueMemberIdxxxxxxxx"),
-                            ("company page", company["linkedin_url"])):
+        for label, link, message in (("website page", "https://example.test/team/ada-example", "the saved LinkedIn link must be the same LinkedIn /in/ URL"),
+                                     ("opaque member id", "https://www.linkedin.com/in/ACoAAAExampleOpaqueMemberIdxxxxxxxx", "member id is lookup input, not a profile link"),
+                                     ("company page", company["linkedin_url"], "the saved LinkedIn link must be the same LinkedIn /in/ URL")):
             with self.subTest(link=label):
                 saved = copy.deepcopy(self.doc)
                 saved["accepted"][0]["primary_contact"]["linkedin_url"] = link
@@ -286,8 +286,36 @@ class LinkedInReceiptTests(unittest.TestCase):
                 self.path.write_text(json.dumps(saved))
                 code, result = self.strict_check()
                 self.assertEqual((code, result["delivery_allowed"]), (2, False))
-                self.assertIn("the saved LinkedIn link must be the same LinkedIn /in/ URL", " ".join(result["errors"]))
+                self.assertIn(message, " ".join(result["errors"]))
                 self.assertIn("exactly one matching LinkedIn entity", " ".join(linkedin_receipt_errors(saved, self.path)))
+        # A member id is lookup input, never output: refused in the saved link or in the evidence itself.
+        member = "https://www.linkedin.com/in/ACwAAB3g9uUBp7dK2C9mqJ4w7mN1q3xEyLXqZbo"
+        for label, apply in (("member id as saved link", lambda pc: pc.update(linkedin_url=member, contact_url=member)),
+                             ("member id as link and evidence", lambda pc: (pc.update(linkedin_url=member, contact_url=member), pc["location_evidence"].update(evidence_url=member)))):
+            with self.subTest(link=label):
+                saved = copy.deepcopy(self.doc)
+                apply(saved["accepted"][0]["primary_contact"])
+                self.path.write_text(json.dumps(saved))
+                code, result = self.strict_check()
+                self.assertEqual((code, result["delivery_allowed"]), (2, False))
+                self.assertIn("member id is lookup input, not a profile link", " ".join(result["errors"]))
+        # With no saved link, a contact_url on LinkedIn that is not this person's profile is refused too.
+        saved = copy.deepcopy(self.doc)
+        saved["accepted"][0]["primary_contact"].pop("linkedin_url")
+        saved["accepted"][0]["primary_contact"]["contact_url"] = company["linkedin_url"]
+        self.path.write_text(json.dumps(saved))
+        code, result = self.strict_check()
+        self.assertEqual((code, result["delivery_allowed"]), (2, False))
+        self.assertIn("the saved LinkedIn link must be the same LinkedIn /in/ URL", " ".join(result["errors"]))
+        # A public slug that merely contains digits or capitals is not a member id.
+        for slug in ("michael-merino-4b68047", "ACME-Buyer-2024", "emmanuel-bertail-734135146",
+                     "ACME-Corporation-Procurement-Director-2024", "ACcounting-and-Finance-Leader-Boston-MA"):
+            saved = copy.deepcopy(self.doc)
+            link = "https://www.linkedin.com/in/" + slug
+            saved["accepted"][0]["primary_contact"].update(linkedin_url=link, contact_url=link)
+            saved["accepted"][0]["primary_contact"]["location_evidence"]["evidence_url"] = link
+            self.path.write_text(json.dumps(saved))
+            self.assertNotIn("member id", " ".join(self.strict_check()[1]["errors"]), slug)
         # The same rule now covers the company's saved link, which the workbook also shows verbatim.
         saved = copy.deepcopy(self.doc)
         saved["accepted"][0]["company"]["linkedin_url"] = "https://example.test/about"

@@ -1594,6 +1594,13 @@ field sources.
   route_id}`. Keep the original range/location wording in the text. The URL must
   match the corresponding LinkedIn entity and the route must be a successful
   HarvestAPI company/profile getter. Missing facts or evidence stay unresolved.
+- A search result's `linkedin.com/in/ACoAA…` member id identifies the person
+  for the profile getter and nothing else. Save and deliver the public profile
+  URL that getter returns (`linkedinUrl` with a `publicIdentifier`), which the
+  delivery recheck matches to the saved contact by entity, name, current title
+  and employer. A member id, another page or a mismatched profile in the saved
+  link is refused at validation and delivery: nothing exports until the saved
+  record is corrected or the lead leaves the confirmed set.
 
 These fields are required independently of email/phone opt-outs.
 Review acceptance fills missing range/location values from the matching saved
@@ -1644,7 +1651,7 @@ item from `backup_contacts`:
 | `Email` | validated `contact.email`, otherwise blank |
 | `Role` | `contact.current_title` |
 | `Company` | `company.canonical_name` |
-| `LinkedIn` | `contact.linkedin_url`; use `contact_url` only when it is a LinkedIn URL |
+| `LinkedIn` | `contact.linkedin_url`, the public profile URL the saved profile getter returned for this person. For an older record without it, `contact_url` stands in when it is itself a LinkedIn profile page, otherwise the profile URL of the contact's receipt-validated `location_evidence`. A member id (`linkedin.com/in/ACoAA…`) is lookup input and is never delivered. A contact whose profile was not fetched, whose link is not that profile, or whose identity does not match its receipt is refused at validation and delivery: the run does not export until the record is corrected or the lead leaves the confirmed set, and the partial export reports the shortfall |
 | `Website` | Direct company URL normalized against `company.domain`; recognized LinkedIn wrappers are unwrapped, and mismatched destinations require correction. |
 | `Company LinkedIn` | `company.linkedin_url`, otherwise blank |
 | `Industry` | `company.industry`, required canonical label for version `1.2` |

@@ -104,11 +104,20 @@ function isLinkedInUrl(value) {
   }
 }
 
+function isLinkedInProfileUrl(value) {
+  if (!isLinkedInUrl(value)) return false;
+  return /^\/in\/[^/]+\/?$/i.test(new URL(value).pathname);
+}
+
 function contactLinkedIn(contact) {
   const explicit = text(contact.linkedin_url);
   if (explicit) return explicit;
+  // Older records: a person's profile page in contact_url stands in, otherwise the profile URL of the
+  // contact's own receipt-validated evidence. A company page or a post never does, and nothing is invented.
   const contactUrl = text(contact.contact_url);
-  return isLinkedInUrl(contactUrl) ? contactUrl : "";
+  if (isLinkedInProfileUrl(contactUrl)) return contactUrl;
+  const evidenceUrl = text(object(contact.location_evidence).evidence_url);
+  return isLinkedInProfileUrl(evidenceUrl) ? evidenceUrl : "";
 }
 
 function employeeRange(value, field) {

@@ -1533,13 +1533,25 @@ def _validate_client_output(accepted: list, errors: list[str]) -> None:
             errors.append(f"{path}.company requires an exact canonical industry/sub_industry pair; "
                           f"received {industry!r} / {subindustry!r}. {choices} Select from evidence; no classification was changed.")
 
+def _member_id_slug(value: Any) -> bool:
+    """A LinkedIn member id in place of the public slug: the encodings seen from search tools and the getter."""
+    match = isinstance(value, str) and re.search(r"linkedin\.com/in/([^/?#]+)", value, re.IGNORECASE)
+    return bool(match) and re.fullmatch(r"AC[a-zA-Z]AA[A-Za-z0-9_-]{30,}", match[1]) is not None
+
+
 def _validate_harvest_evidence(evidence: Any, linkedin: Any, kind: str, path: str,
                               routes: dict, errors: list[str]) -> None:
     evidence = evidence if isinstance(evidence, dict) else {}
     url = evidence.get("evidence_url")
+    if kind == "in" and any(_member_id_slug(value) for value in (url, linkedin)):
+        # A member id (linkedin.com/in/ACoAA…) is what a search result carries and what the profile getter
+        # accepts as input. It is never client output: the delivered link is the getter's public profile URL.
+        # Checked first, so a saved member id is named even when the evidence itself is missing or wrong.
+        errors.append(f"{path}: a LinkedIn member id is lookup input, not a profile link; save and deliver the "
+                      "public profile URL the profile getter returned")
     if not _linkedin_url(url, kind):
         errors.append(f"{path}.evidence_url requires the LinkedIn /{kind}/ source")
-    elif _nonempty_text(linkedin):
+    elif _nonempty_text(linkedin) and not _member_id_slug(linkedin) and not _member_id_slug(url):
         # The saved link is what gets exported: it must be this evidence's LinkedIn /{kind}/ URL, not
         # another page. A missing link is an older record and is read from the evidence instead.
         slug = lambda value: re.search(rf"/{kind}/([^/?#]+)", value, re.IGNORECASE)[1].casefold()
@@ -1599,8 +1611,9 @@ def linkedin_field_errors(document: dict) -> list[str]:
                 if field in contact and contact[field] is not None and not _nonempty_text(contact[field]):
                     errors.append(f"{contact_path}.{field} must be text when supplied")
             link = contact.get("linkedin_url")
-            if not _nonempty_text(link):  # Older saved contacts: only a LinkedIn contact_url is exported as the link.
-                link = contact.get("contact_url") if _linkedin_url(contact.get("contact_url"), "in") else None
+            if not _nonempty_text(link):  # Older saved contacts: a contact_url on LinkedIn stands in for the link.
+                other = contact.get("contact_url")
+                link = other if isinstance(other, str) and re.match(r"https?://(?:[a-z0-9-]+\.)*linkedin\.com/", other, re.I) else None
             _validate_harvest_evidence(contact.get("location_evidence"), link, "in", f"{contact_path}.location_evidence", routes, errors)
     return errors
 

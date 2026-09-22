@@ -323,8 +323,10 @@ and one missing field into a single unknown `complete_account_fit` check.
 
 The contact gate requires `full_name`, current title, requested-role match,
 company/domain match, a person-identifying URL, and evidence URL/date/text that
-show the role is current at that company. Run this gate before email/phone
-lookup. Only `ok` or `partial` provider responses can supply candidates; all
+show the role is current at that company. The person-identifying URL is the
+public profile URL the saved profile getter returned; a search result's
+`linkedin.com/in/ACoAA…` member id is the getter's input and is never saved as
+the link or delivered. Run this gate before email/phone lookup. Only `ok` or `partial` provider responses can supply candidates; all
 provider statuses and stable reasons belong in the receipts, while output
 `accepted`, `rejected`, and `unresolved` remain separate states.
 

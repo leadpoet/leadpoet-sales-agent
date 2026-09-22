@@ -346,8 +346,21 @@ class ExportXlsxTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         row = json.loads(result.stdout)["rows"][0]
         self.assertEqual(row["Website"], "https://example.com")
-        self.assertEqual(row["LinkedIn"], "")
+        # No saved link and a website page in contact_url: the profile URL of the contact's own
+        # receipt-validated evidence is delivered, never a blank for a verified person.
+        self.assertEqual(row["LinkedIn"], contact["location_evidence"]["evidence_url"])
         self.assertEqual(row["Company LinkedIn"], "")
+        # A company page or a post in contact_url never stands in for the person's profile link: the
+        # validator refuses the row before the exporter writes anything.
+        for other in ("https://www.linkedin.com/company/example-products", "https://www.linkedin.com/posts/example-update"):
+            contact["contact_url"] = other
+            result = self.run_rows_json(document)
+            self.assertEqual(result.returncode, 2, other)
+            self.assertIn("the saved LinkedIn link must be the same LinkedIn /in/ URL", result.stderr)
+        contact["contact_url"] = "https://www.linkedin.com/in/ada-example"
+        result = self.run_rows_json(document)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["rows"][0]["LinkedIn"], "https://www.linkedin.com/in/ada-example")
         self.assertEqual(row["Company Employee Range"], "201-500")
 
     def test_malformed_accepted_row_fails_closed(self):
@@ -551,6 +564,21 @@ class ExportXlsxTests(unittest.TestCase):
                     self.assertIn("Contact Location: Buyer 1", fields)
                     self.assertNotIn("Role: Buyer 5", fields)
                 self.assertEqual(source.read_bytes(), before)
+                # An older record: no saved link and a website page in contact_url. The written cell is the
+                # profile URL of the contact's own receipt-validated evidence, not a blank.
+                legacy = row["backup_contacts"][0]
+                verified = legacy["location_evidence"]["evidence_url"]
+                legacy.pop("linkedin_url"); legacy["contact_url"] = "https://example.com/team/legacy"
+                source.write_text(json.dumps(document))
+                write_linkedin_receipts(source, document)
+                source.write_text(json.dumps(document))
+                again = destination.with_name("leads-legacy.xlsx")
+                result = export_workbook(self.node, source, again, node_modules)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                leads = read_first_sheet_rows(again)
+                column = leads[0].index("LinkedIn")
+                self.assertEqual(leads[2][column], verified)
+                self.assertTrue(all("linkedin.com/in/" in lead[column] for lead in leads[1:]))
 
 
 if __name__ == "__main__":
