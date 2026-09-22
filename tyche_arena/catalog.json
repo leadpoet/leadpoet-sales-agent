@@ -3440,6 +3440,106 @@
       },
       "callable": true
     },
+    "hunter_email_finder": {
+      "toolId": "hunter_email_finder",
+      "provider": "hunter",
+      "description": "Find one work email from a person's name and company domain or LinkedIn handle.",
+      "inputSchema": {
+        "fields": [
+          {"name": "domain", "required": false, "type": "string"},
+          {"name": "first_name", "required": false, "type": "string"},
+          {"name": "last_name", "required": false, "type": "string"},
+          {"name": "full_name", "required": false, "type": "string"},
+          {"name": "company", "required": false, "type": "string"},
+          {"name": "linkedin_handle", "required": false, "type": "string"},
+          {"name": "max_duration", "required": false, "type": "integer"}
+        ],
+        "jsonSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {"type": "string"}, "domain": {"type": "string"},
+            "first_name": {"type": "string"}, "full_name": {"type": "string"},
+            "last_name": {"type": "string"}, "linkedin_handle": {"type": "string"},
+            "max_duration": {"type": "integer"}
+          },
+          "type": "object"
+        }
+      },
+      "pricing": {"displayText": "0.3 Deepline credits / $0.03 per result", "unit": "result", "creditsPerUnit": 0.3, "usdPerUnit": 0.03, "currency": "USD", "summary": null, "details": []},
+      "callable": true
+    },
+    "limadata_find_work_email": {
+      "toolId": "limadata_find_work_email",
+      "provider": "limadata",
+      "description": "Find one likely work email from full name and company domain.",
+      "inputSchema": {
+        "fields": [
+          {"name": "full_name", "required": true, "type": "string"},
+          {"name": "company_domain", "required": true, "type": "string"}
+        ],
+        "jsonSchema": {
+          "additionalProperties": false,
+          "properties": {"company_domain": {"minLength": 1, "type": "string"}, "full_name": {"minLength": 1, "type": "string"}},
+          "required": ["full_name", "company_domain"],
+          "type": "object"
+        }
+      },
+      "pricing": {"displayText": "0.28 Deepline credits / $0.028 per call", "unit": "call", "creditsPerUnit": 0.28, "usdPerUnit": 0.028, "currency": "USD", "summary": null, "details": []},
+      "callable": true
+    },
+    "datagma_find_email": {
+      "toolId": "datagma_find_email",
+      "provider": "datagma",
+      "description": "Find one verified work email from person and company context.",
+      "inputSchema": {
+        "fields": [
+          {"name": "firstName", "required": false, "type": "string"}, {"name": "lastName", "required": false, "type": "string"},
+          {"name": "fullName", "required": false, "type": "string"}, {"name": "companyDomain", "required": false, "type": "string"},
+          {"name": "companyName", "required": false, "type": "string"}, {"name": "linkedInSlug", "required": false, "type": "string"},
+          {"name": "first_name", "required": false, "type": "string"}, {"name": "last_name", "required": false, "type": "string"},
+          {"name": "full_name", "required": false, "type": "string"}, {"name": "company_name", "required": false, "type": "string"},
+          {"name": "company_domain", "required": false, "type": "string"}, {"name": "domain", "required": false, "type": "string"}
+        ],
+        "jsonSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "companyDomain": {"minLength": 1, "type": "string"}, "companyName": {"minLength": 1, "type": "string"},
+            "company_domain": {"minLength": 1, "type": "string"}, "company_name": {"minLength": 1, "type": "string"},
+            "domain": {"minLength": 1, "type": "string"}, "firstName": {"minLength": 1, "type": "string"},
+            "first_name": {"minLength": 1, "type": "string"}, "fullName": {"minLength": 1, "type": "string"},
+            "full_name": {"minLength": 1, "type": "string"}, "lastName": {"minLength": 1, "type": "string"},
+            "last_name": {"minLength": 1, "type": "string"}, "linkedInSlug": {"minLength": 1, "type": "string"}
+          },
+          "required": [],
+          "type": "object"
+        }
+      },
+      "pricing": {"displayText": "0.14 Deepline credits / $0.014 per result", "unit": "result", "creditsPerUnit": 0.14, "usdPerUnit": 0.014, "currency": "USD", "summary": null, "details": []},
+      "callable": true
+    },
+    "leadmagic_email_finder": {
+      "toolId": "leadmagic_email_finder",
+      "provider": "leadmagic",
+      "description": "Find one verified work email from a person's name and company.",
+      "inputSchema": {
+        "fields": [
+          {"name": "first_name", "required": true, "type": "string"}, {"name": "last_name", "required": true, "type": "string"},
+          {"name": "domain", "required": false, "type": "string"}, {"name": "company_name", "required": false, "type": "string"},
+          {"name": "company_domain", "required": false, "type": "string"}
+        ],
+        "jsonSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "company_domain": {"type": "string"}, "company_name": {"type": "string"}, "domain": {"type": "string"},
+            "first_name": {"type": "string"}, "last_name": {"type": "string"}
+          },
+          "required": ["first_name", "last_name"],
+          "type": "object"
+        }
+      },
+      "pricing": {"displayText": "0.34 Deepline credits / $0.034 per result", "unit": "result", "creditsPerUnit": 0.34, "usdPerUnit": 0.034, "currency": "USD", "summary": null, "details": []},
+      "callable": true
+    },
     "zerobounce_validate": {
       "toolId": "zerobounce_validate",
       "provider": "zerobounce",

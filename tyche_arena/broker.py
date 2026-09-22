@@ -91,6 +91,14 @@ class BrokerRefusal(BrokerError):
         super().__init__("Arena refused operation: " + code)
 
 
+class _ResponseHeaders(dict):
+    """Provider headers with host-only call identity kept out of HTTP data."""
+
+    def __init__(self, values, call_identity=None):
+        super().__init__(values)
+        self.call_identity = call_identity
+
+
 class Broker:
     def __init__(self, socket_path, deadline, *, response_deadline=None, catalog=None,
                  initial_calls=0, provider_blocked=False):
@@ -308,7 +316,15 @@ class Broker:
                     "budget_exhausted", "invalid_frame", "frame_too_large", "invalid_request", "invalid_body"}:
                 raise BrokerRefusal(response["error"])
             raise BrokerError("Arena refused operation: " + str(response["error"]))
-        if set(response) != {"status", "headers", "body_b64"} or type(response["status"]) is not int:
+        if (set(response) not in ({"status", "headers", "body_b64"},
+                                  {"status", "headers", "body_b64", "call_identity"})
+                or type(response["status"]) is not int):
+            raise BrokerError("Invalid Arena response envelope")
+        call_identity = response.get("call_identity")
+        if call_identity is not None and (
+            not isinstance(call_identity, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", call_identity) is None
+        ):
             raise BrokerError("Invalid Arena response envelope")
         try:
             raw_body = base64.b64decode(response["body_b64"], validate=True)
@@ -319,7 +335,7 @@ class Broker:
             raise BrokerError(f"Arena returned invalid provider {kind}; do not retry") from exc
         if not isinstance(response["headers"], dict):
             raise BrokerError("Invalid Arena response envelope")
-        return response["status"], response["headers"], body
+        return response["status"], _ResponseHeaders(response["headers"], call_identity), body
 
     @staticmethod
     def _valid_https_url(value):
@@ -513,6 +529,7 @@ class Broker:
                     status, headers, payload = self.request("deepline.execute", {
                         "tool": request["tool"], "payload": request["payload"]}, admitted=True,
                         timeout_seconds=request["timeout_seconds"])
+                    call_identity = getattr(headers, "call_identity", None)
                 else:
                     def transport(url, native_timeout_seconds):
                         if url != expected_url:
@@ -539,7 +556,9 @@ class Broker:
                          "operation": request["operation"], "request_sent": True}, 0)
             raw = {"body": payload, "exit_code": 0 if 200 <= status < 300 else 2,
                    "stderr": "" if 200 <= status < 300 else f"Arena HTTP {status}",
-                   "arena": {"status": status, "headers": headers}}
+                   "arena": {"status": status, "headers": headers,
+                             **({"call_identity": call_identity}
+                                if is_deepline and call_identity else {})}}
             capture(raw)
             return deepline.normalize_response(request, raw)
 

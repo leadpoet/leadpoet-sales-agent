@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import budget_guard
 import confirmed_leads
+import email_receipts
 import linkedin_receipts
 import run_attempt
 import run_coordination as coordination
@@ -24,6 +25,13 @@ from .input import company_stage_matches, required_company_stage
 CHECKPOINT_TRANSITION_REASONS = {
     "unchanged", "rejected", "unresolved", "changed_accepted",
     "missing_accepted", "mixed",
+}
+
+ARENA_EMAIL_FINDERS = {
+    "datagma_find_email": "datagma",
+    "hunter_email_finder": "hunter",
+    "leadmagic_email_finder": "leadmagic",
+    "limadata_find_work_email": "limadata",
 }
 
 
@@ -145,7 +153,7 @@ def projected_payload(rows, targets=()):
               "intent_signals", "company_stage_evidence", "quote", "required_attribute", "contact", "matched_icp_signal",
               "description", "date", "url", "text", "passed", "evidence_url", "evidence_quote",
               "explanation", "full_name", "role", "linkedin_url", "email", "location", "region",
-              "city", "email_source", "provider", "tool", "record_id"}
+              "city", "email_source", "provider", "tool", "broker_call_id", "record_id"}
 
     def fail(path, reason):
         match = re.search(r"^\$\.companies\[(\d+)\]", path)
@@ -415,26 +423,48 @@ def _project_companies(run_file, document, icp, *, require_review):
             source = email_attribution["source"]
         else:
             source = (person.get("location_evidence") or person)["source"]
-        profile = linkedin_receipts._saved_profile(run_file, source, person["linkedin_url"], "in",
-            document["routes"], company.get("linkedin_url"))
         receipt = run_attempt.read_receipt(run_file, source["route_id"])["result"]
-        if receipt["attempt"]["request"].get("payload", {}).get("findEmail") != "true":
-            raise ValueError("Arena email must come from HarvestAPI get_profile with findEmail=true")
-        # Use only the selected raw profile, never an LLM-authored email_source.
-        emails = profile.get("emails", [])
-        observed = {str(e.get("email") if isinstance(e, dict) else e).strip().casefold() for e in emails}
-        if profile.get("email"):
-            observed.add(str(profile["email"]).strip().casefold())
-        if person["email"].strip().casefold() not in observed:
-            raise ValueError("Arena email is absent from the selected provider profile")
-        record_id = text(profile.get("recordId") or profile.get("record_id") or profile.get("id"), "HarvestAPI record ID")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/~-]{0,199}", record_id):
-            raise ValueError("HarvestAPI record ID violates Arena's source contract")
+        tool = receipt.get("tool")
+        if tool == "harvestapi_get_profile":
+            profile = linkedin_receipts._saved_profile(run_file, source, person["linkedin_url"], "in",
+                document["routes"], company.get("linkedin_url"))
+            if receipt["attempt"]["request"].get("payload", {}).get("findEmail") != "true":
+                raise ValueError("Arena email must come from HarvestAPI get_profile with findEmail=true")
+            # Use only the selected raw profile, never an LLM-authored email_source.
+            emails = profile.get("emails", [])
+            observed = {str(e.get("email") if isinstance(e, dict) else e).strip().casefold() for e in emails}
+            if profile.get("email"):
+                observed.add(str(profile["email"]).strip().casefold())
+            if person["email"].strip().casefold() not in observed:
+                raise ValueError("Arena email is absent from the selected provider profile")
+            record_id = text(profile.get("recordId") or profile.get("record_id") or profile.get("id"), "HarvestAPI record ID")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/~-]{0,199}", record_id):
+                raise ValueError("HarvestAPI record ID violates Arena's source contract")
+            arena_source = {"provider": "harvestapi", "tool": tool, "record_id": record_id}
+        elif tool in ARENA_EMAIL_FINDERS:
+            discovered = email_receipts.discovery_source(
+                run_file, document["routes"], person["email"],
+                preferred=source["route_id"],
+            )
+            if not discovered or discovered["source"].get("route_id") != source["route_id"]:
+                raise ValueError("Arena email is absent from the selected provider finder")
+            provider_response = receipt.get("provider_response")
+            arena_metadata = provider_response.get("arena") if isinstance(provider_response, Mapping) else None
+            broker_call_id = arena_metadata.get("call_identity") if isinstance(arena_metadata, Mapping) else None
+            if not isinstance(broker_call_id, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", broker_call_id) is None:
+                raise ValueError("Arena email finder lacks its trusted broker call identity")
+            arena_source = {
+                "provider": ARENA_EMAIL_FINDERS[tool],
+                "tool": tool,
+                "broker_call_id": broker_call_id,
+            }
+        else:
+            raise ValueError("Arena email has an unsupported saved discovery source")
         contact = {"full_name": person["full_name"], "role": person["current_title"],
             "linkedin_url": person["linkedin_url"], "email": person["email"],
             "location": {"country": person["country"], **({"region": person["state"]} if person.get("state") else {}),
                          **({"city": person["city"]} if person.get("city") else {})},
-            "email_source": {"provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": record_id}}
+            "email_source": arena_source}
         output.append({"company_name": company["canonical_name"],
             "company_website": public_url(company.get("website") or "https://" + company["domain"]),
             "company_linkedin": company["linkedin_url"], "industry": company["industry"],

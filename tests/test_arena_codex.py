@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -298,7 +299,7 @@ def review_findings(packet, tools=None):
     } for company in packet["companies"]]
 
 
-def scenario(finish_tool="tyche_finish", *, separate_email_source=False):
+def scenario(finish_tool="tyche_finish", *, separate_email_source=False, finder_tool=None):
     company = yield "tyche_lookup", lookup(
         "harvestapi_get_company", {"url": COMPANY_URL}, "account_discovery")
     company_ref = company["lookups"][0]["results"][0]["ref"]
@@ -320,9 +321,22 @@ def scenario(finish_tool="tyche_finish", *, separate_email_source=False):
     profile_ref = profile["lookups"][0]["results"][0]["ref"]
     yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Verify selected email",
         "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
-    enriched = yield "tyche_lookup", lookup("harvestapi_get_profile", {"findEmail": "true"}, "contact_discovery", contact_ref=profile_ref)
+    finder_inputs = {
+        "hunter_email_finder": {"first_name": "Ada", "last_name": "Example", "domain": "example.com"},
+        "limadata_find_work_email": {"full_name": "Ada Example", "company_domain": "example.com"},
+        "datagma_find_email": {"fullName": "Ada Example", "companyDomain": "example.com"},
+        "leadmagic_email_finder": {"first_name": "Ada", "last_name": "Example", "domain": "example.com"},
+    }
+    if finder_tool:
+        yield "tyche_inspect", {"tool": finder_tool}
+        enriched = yield "tyche_lookup", lookup(
+            finder_tool, finder_inputs[finder_tool], "contact_discovery",
+            contact_ref=profile_ref,
+        )
+    else:
+        enriched = yield "tyche_lookup", lookup("harvestapi_get_profile", {"findEmail": "true"}, "contact_discovery", contact_ref=profile_ref)
     email_profile_ref = enriched["lookups"][0]["results"][0]["ref"]
-    if not separate_email_source:
+    if not separate_email_source and not finder_tool:
         profile_ref = email_profile_ref
         yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Select enriched profile",
             "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
@@ -330,7 +344,7 @@ def scenario(finish_tool="tyche_finish", *, separate_email_source=False):
     email_ref = email["lookups"][0]["results"][0]["ref"]
     accept_request = {"companies": [{"target": "example.com", "decision": "accept", "reason": "Verified company and current buyer",
         "primary_contact": {"email_ref": email_ref, "email_source": {"ref": email_profile_ref}}}]}
-    if separate_email_source:
+    if separate_email_source or finder_tool:
         accept_request["sources"] = [{"ref": enriched["lookups"][0]["route"], "state": "exhausted",
             "reason": "Selected email profile reviewed"}]
     accepted = yield "tyche_review", accept_request
@@ -567,6 +581,8 @@ class ProviderFixture:
                       if second else PERSON_URL)
         website = "https://second.example" if second else "https://example.com"
         email = "bob@second.example" if second else "ada@example.com"
+        first_name = "Bob" if second else "Ada"
+        last_name = "Second" if second else "Example"
         data = {
             "harvestapi_get_company": {"status": "ok", "element": {"name": company_name,
                 "website": website, "linkedinUrl": company_url,
@@ -577,6 +593,20 @@ class ProviderFixture:
                 "currentPosition": [{"companyName": company_name, "title": "Director of Supply Chain", "companyLinkedinUrl": company_url}],
                 "location": {"parsed": {"countryFull": "United States", "state": "Ohio", "city": "Columbus"}}}},
             "zerobounce_validate": {"status": "ok", "data": {"address": email, "status": "valid", "sub_status": ""}},
+            "hunter_email_finder": {"status": "completed", "toolResponse": {"rawV2": {"data": {
+                "email": email, "first_name": first_name, "last_name": last_name,
+                "domain": website.removeprefix("https://"),
+            }}}},
+            "limadata_find_work_email": {"status": "completed", "toolResponse": {"rawV2": {
+                "email": email,
+            }}},
+            "datagma_find_email": {"status": "completed", "toolResponse": {"rawV2": {
+                "email": email, "status": "Valid",
+            }}},
+            "leadmagic_email_finder": {"status": "completed", "toolResponse": {"rawV2": {
+                "email": email, "status": "valid", "first_name": first_name,
+                "last_name": last_name, "domain": website.removeprefix("https://"),
+            }}},
             "exa_answer": {"answer": "Generated summary; review its citations.", "citations": [
                 {"id": "citation-1", "url": "https://example.com/news/wms-project", "title": "Warehouse project",
                  "text": "On August 12, 2026, Example Products connected its acquired warehouse to one WMS.",
@@ -597,6 +627,8 @@ class ProviderFixture:
                  "metadata": {"statusCode": 200, "sourceUrl": "https://second.example/news/wms-project", "publishedTime": "2026-08-21"}},
             ]}
         rate = {"harvestapi_get_company": .03, "harvestapi_get_profile": .14, "zerobounce_validate": .28,
+                "hunter_email_finder": .3, "limadata_find_work_email": .28,
+                "datagma_find_email": .14, "leadmagic_email_finder": .34,
                 "exa_answer": .07, "generic_http_request": 0, "firecrawl_scrape": .02}[tool]
         if tool == "harvestapi_get_profile" and parameters["payload"].get("main") == "true":
             rate = .03
@@ -655,7 +687,13 @@ def lab(tmp_path, monkeypatch):
         assert timeout_seconds == 240.0
         fixture.frames.append(copy.deepcopy(parameters))
         fixture.deepline_used += 1
-        return 200, {}, fixture.provider(parameters)
+        class Headers(dict):
+            pass
+        headers = Headers()
+        headers.call_identity = "sha256:" + hashlib.sha256(json.dumps(
+            parameters, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        return 200, headers, fixture.provider(parameters)
 
     monkeypatch.setattr(Broker, "request", request)
 
@@ -822,6 +860,48 @@ def test_projection_uses_explicit_email_source_separate_from_location_profile(la
     assert person["location_evidence"]["source"]["route_id"] != person["email_source"]["source"]["route_id"]
     assert rows[0]["contact"]["email_source"] == {
         "provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": "profile-123"}
+
+
+@pytest.mark.parametrize(("tool", "provider"), [
+    ("hunter_email_finder", "hunter"),
+    ("limadata_find_work_email", "limadata"),
+    ("datagma_find_email", "datagma"),
+    ("leadmagic_email_finder", "leadmagic"),
+])
+def test_projection_accepts_trusted_native_email_finder(lab, tool, provider):
+    lab.program = lambda: scenario(finder_tool=tool)
+
+    rows = runtime.run(ICP)
+
+    source = rows[0]["contact"]["email_source"]
+    assert source["provider"] == provider
+    assert source["tool"] == tool
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", source["broker_call_id"])
+    assert "record_id" not in source
+    assert [frame["tool"] for frame in lab.frames][-3:] == [
+        "harvestapi_get_profile", tool, "zerobounce_validate",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["missing", "fabricated"])
+def test_projection_rejects_untrusted_native_email_finder_call_identity(lab, monkeypatch, failure):
+    tool = "hunter_email_finder"
+    lab.program = lambda: scenario(finder_tool=tool)
+    runtime.run(ICP)
+    run_file = lab.research[0].research.path
+    document = json.loads(run_file.read_text())
+    source = document["accepted"][0]["primary_contact"]["email_source"]["source"]
+    receipt_path = run_file.parent / "receipts" / (source["route_id"] + ".json")
+    receipt = json.loads(receipt_path.read_text())
+    if failure == "missing":
+        receipt["provider_response"]["arena"].pop("call_identity")
+    else:
+        receipt["provider_response"]["arena"]["call_identity"] = "model-authored-call-id"
+    receipt_path.write_text(json.dumps(receipt))
+    monkeypatch.setattr(arena_output, "accepted_preflight", lambda *_args, **_kwargs: [])
+
+    with pytest.raises(ValueError, match="trusted broker call identity"):
+        arena_output._project_companies(run_file, document, ICP, require_review=False)
 
 
 @pytest.mark.parametrize(("failure", "message"), [
