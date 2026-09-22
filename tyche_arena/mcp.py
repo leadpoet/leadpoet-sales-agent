@@ -72,9 +72,10 @@ def lab_tools():
         contact["properties"]["email"] = {
             "description": "The exact chosen address from saved discovery evidence; selecting it does not verify it. email_source attributes this same address.",
         }
-        contact["properties"]["email_ref"]["description"] = (
-            "A saved same-address ZeroBounce or eligible BounceBan validation verdict, separate from finder provenance in email_source."
-        )
+        contact["properties"]["email_ref"] = {
+            **contact["properties"]["email_ref"],
+            "description": "A saved same-address ZeroBounce or eligible BounceBan validation verdict, separate from finder provenance in email_source.",
+        }
     tools["tyche_review"] = review_description, review_schema
     tools["tyche_open"] = (
         "Read one exact public HTTP(S) page through the Arena host proxy. Native TYCHE first "

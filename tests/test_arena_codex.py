@@ -3555,6 +3555,43 @@ def test_arena_stage_schema_is_explicit_without_native_mutation():
     assert "reject the company and continue research" in json.dumps(LAB_TOOLS["tyche_review"][1])
 
 
+def test_arena_email_ref_description_does_not_mutate_shared_reference_schemas():
+    native_review = TOOLS["tyche_review"][1]
+    native_contact = native_review["properties"]["companies"]["items"]["properties"]["primary_contact"]
+    arena_review = LAB_TOOLS["tyche_review"][1]
+
+    def resolve(schema, value):
+        return schema["$defs"][value["$ref"].removeprefix("#/$defs/")]
+
+    arena_companies = resolve(arena_review, arena_review["properties"]["companies"])
+    arena_company_review = resolve(arena_review, arena_companies["items"])
+    arena_contacts = (
+        resolve(arena_review, arena_company_review["properties"]["primary_contact"]),
+        resolve(arena_review, resolve(
+            arena_review, arena_company_review["properties"]["backup_contacts"])["items"]),
+    )
+    for arena_contact in arena_contacts:
+        assert arena_contact["properties"]["email_ref"]["description"].startswith(
+            "A saved same-address ZeroBounce")
+        for field in ("ref", "profile_ref"):
+            assert (arena_contact["properties"][field]["description"]
+                    == native_contact["properties"][field]["description"])
+
+    arena_inspect = LAB_TOOLS["tyche_inspect"][1]
+    native_inspect = TOOLS["tyche_inspect"][1]
+    for field in ("ref", "recover"):
+        assert (arena_inspect["properties"][field]["description"]
+                == native_inspect["properties"][field]["description"])
+
+    arena_finish = LAB_TOOLS["tyche_finish"][1]
+    arena_findings = resolve(arena_finish, arena_finish["properties"]["review_findings"])
+    arena_finding = resolve(arena_finish, arena_findings["items"])
+    arena_source_refs = resolve(arena_finish, arena_finding["properties"]["source_refs"])
+    native_source_ref = (TOOLS["tyche_finish"][1]["properties"]["review_findings"]
+                         ["items"]["properties"]["source_refs"]["items"])
+    assert arena_source_refs["items"]["description"] == native_source_ref["description"]
+
+
 def test_arena_approved_attribute_uses_native_verified_quote(lab, arena_operations):
     lab.program = lambda: projection_field_scenario(
         competing_quote="A competing passage absent from the captured source.")
