@@ -93,8 +93,9 @@ def contact_verification_errors(document, run_file, company, contact, *, roles=T
     evidence = evidence if isinstance(evidence, dict) else {}  # Malformed evidence fails as an unverified profile.
     source = evidence.get("source")
     url = contact.get("linkedin_url", contact.get("contact_url"))
-    if not roles and not _linkedin_url(url, "in"):
+    if not roles and not _text(contact.get("linkedin_url")) and not _linkedin_url(url, "in"):
         url = evidence.get("evidence_url")  # Older saved contacts carry their profile URL only in its evidence.
+    # A saved linkedin_url is what the workbook shows, so it is never replaced by the fallback: it must be this profile.
     try:
         profile = _saved_profile(run_file, source if isinstance(source, dict) else {}, url, "in",
             document.get("routes", []), company.get("linkedin_url"))

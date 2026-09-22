@@ -268,6 +268,34 @@ class LinkedInReceiptTests(unittest.TestCase):
         broken["accepted"][0]["primary_contact"]["location_evidence"] = "not an object"
         self.assertIn("Verify the selected person's LinkedIn profile", " ".join(linkedin_receipt_errors(broken, self.path)))
 
+    def test_exported_link_must_be_the_saved_profile_url_not_another_page_or_an_opaque_id(self):
+        """The saved link is what the workbook shows. Saved outputs once carried a member id or a website page there."""
+        row = self.doc["accepted"][0]
+        company, contact = row["company"], row["primary_contact"]
+        self.save_profile(contact, [{"companyName": company["canonical_name"], "companyLinkedinUrl": company["linkedin_url"],
+                                     "position": contact["current_title"], "current": True}])
+        self.path.write_text(json.dumps(self.doc))
+        self.assertEqual(self.strict_check()[1]["errors"], [])
+        for label, link in (("website page", "https://example.test/team/ada-example"),
+                            ("opaque member id", "https://www.linkedin.com/in/ACoAAAExampleOpaqueMemberIdxxxxxxxx"),
+                            ("company page", company["linkedin_url"])):
+            with self.subTest(link=label):
+                saved = copy.deepcopy(self.doc)
+                saved["accepted"][0]["primary_contact"]["linkedin_url"] = link
+                saved["accepted"][0]["primary_contact"]["contact_url"] = link
+                self.path.write_text(json.dumps(saved))
+                code, result = self.strict_check()
+                self.assertEqual((code, result["delivery_allowed"]), (2, False))
+                self.assertIn("the saved LinkedIn link must be the same LinkedIn /in/ URL", " ".join(result["errors"]))
+                self.assertIn("exactly one matching LinkedIn entity", " ".join(linkedin_receipt_errors(saved, self.path)))
+        # The same rule now covers the company's saved link, which the workbook also shows verbatim.
+        saved = copy.deepcopy(self.doc)
+        saved["accepted"][0]["company"]["linkedin_url"] = "https://example.test/about"
+        self.path.write_text(json.dumps(saved))
+        code, result = self.strict_check()
+        self.assertEqual((code, result["delivery_allowed"]), (2, False))
+        self.assertIn("the saved LinkedIn link must be the same LinkedIn /company/ URL", " ".join(result["errors"]))
+
     def test_exported_contact_without_requested_email_still_needs_a_current_role_at_the_company(self):
         # The request opts out of contact data, so no email gate ever ran for this exported contact.
         self.doc["request"]["contact_fields"] = []

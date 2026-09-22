@@ -1539,10 +1539,12 @@ def _validate_harvest_evidence(evidence: Any, linkedin: Any, kind: str, path: st
     url = evidence.get("evidence_url")
     if not _linkedin_url(url, kind):
         errors.append(f"{path}.evidence_url requires the LinkedIn /{kind}/ source")
-    elif _linkedin_url(linkedin, kind):
+    elif _nonempty_text(linkedin):
+        # The saved link is what gets exported: it must be this evidence's LinkedIn /{kind}/ URL, not
+        # another page. A missing link is an older record and is read from the evidence instead.
         slug = lambda value: re.search(rf"/{kind}/([^/?#]+)", value, re.IGNORECASE)[1].casefold()
-        if slug(url) != slug(linkedin):
-            errors.append(f"{path}.evidence_url must match the same LinkedIn entity")
+        if not _linkedin_url(linkedin, kind) or slug(url) != slug(linkedin):
+            errors.append(f"{path}.evidence_url and the saved LinkedIn link must be the same LinkedIn /{kind}/ URL")
     try:
         date = evidence.get("evidence_date")
         if not isinstance(date, str) or datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d") != date:
@@ -1596,8 +1598,10 @@ def linkedin_field_errors(document: dict) -> list[str]:
             for field in ("city", "state"):
                 if field in contact and contact[field] is not None and not _nonempty_text(contact[field]):
                     errors.append(f"{contact_path}.{field} must be text when supplied")
-            _validate_harvest_evidence(contact.get("location_evidence"), contact.get("linkedin_url", contact.get("contact_url")),
-                                      "in", f"{contact_path}.location_evidence", routes, errors)
+            link = contact.get("linkedin_url")
+            if not _nonempty_text(link):  # Older saved contacts: only a LinkedIn contact_url is exported as the link.
+                link = contact.get("contact_url") if _linkedin_url(contact.get("contact_url"), "in") else None
+            _validate_harvest_evidence(contact.get("location_evidence"), link, "in", f"{contact_path}.location_evidence", routes, errors)
     return errors
 
 
