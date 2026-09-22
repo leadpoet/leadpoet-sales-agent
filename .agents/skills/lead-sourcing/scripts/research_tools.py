@@ -912,18 +912,22 @@ class ResearchTools:
                         for state in ("accepted", "unresolved") for r in document.get(state, [])
                         if runner._company_key(r) == target), {})
         linkedin = company.get("linkedin_url")
-        route_id = (company.get("employee_range_evidence") or {}).get("source", {}).get("route_id")
-        if not linkedin or not route_id:
+        linkedin_key = deepline._linkedin_company_key(linkedin)
+        if not linkedin_key:
             return None
-        try:
-            row, source, _ = self._resolve(route_id + ":0")
-        except (KeyError, OSError, ValueError):
-            return None
-        if (source.get("tool") != "harvestapi_get_company"
-                or str(row.get("domain") or "").casefold().removeprefix("www.") != target.casefold().removeprefix("www.")
-                or deepline._linkedin_company_key(row.get("company_linkedin_url")) != deepline._linkedin_company_key(linkedin)):
-            return None
-        return linkedin
+        for route in document.get("routes", []):
+            if (route.get("scope") != target or route.get("tool") != "harvestapi_get_company"
+                    or route.get("operation") != "execute" or route.get("provider_status") != "ok"):
+                continue
+            try:
+                row, source, saved = self._resolve(route["route_id"] + ":0")
+            except (KeyError, OSError, ValueError):
+                continue
+            if (source.get("tool") == "harvestapi_get_company" and len(saved.get("results", [])) == 1
+                    and str(row.get("domain") or "").casefold().removeprefix("www.") == target.casefold().removeprefix("www.")
+                    and deepline._linkedin_company_key(row.get("company_linkedin_url")) == linkedin_key):
+                return linkedin
+        return None
 
     def _attribution(self, value, *, email=None):
         """Bind a selected discovery/finder result to its saved receipt."""
