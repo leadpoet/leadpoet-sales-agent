@@ -1176,6 +1176,10 @@ class ResearchTools:
                                          f"Its attached source choices are {choices}; no replacement was selected or saved. "
                                          "For deliberate cross-company reuse, save the shared observation first and review its returned lookup ref.")
                     self._evidence_date(row, value)
+                elif value.get("ref"):
+                    _, source, _ = self._resolve(value["ref"])
+                    if source.get("tool") == "harvestapi_get_company":
+                        self._harvest({"ref": value["ref"]}, target)
                 for child in value.values():
                     check_attached_web(child, target)
             elif isinstance(value, list):

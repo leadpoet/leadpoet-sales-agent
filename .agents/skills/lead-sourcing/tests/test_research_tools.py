@@ -441,6 +441,47 @@ class ResearchToolTests(unittest.TestCase):
         self.assertEqual(company["employee_range_evidence"]["source"]["route_id"], correct.split(":")[0])
         self.assertNotEqual(company["employee_range_evidence"]["source"]["route_id"], wrong.split(":")[0])
 
+    def test_company_review_rejects_wrong_domain_getter_evidence_for_every_decision(self):
+        self.start()
+        self.provider.raw["element"]["website"] = "https://wrong.test"
+        wrong = self.lookup()["lookups"][0]["results"][0]["ref"]
+        before = self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)
+        for decision, status in (("qualify_account", "pass"), ("reject", "fail")):
+            with self.subTest(decision=decision), self.assertRaisesRegex(ValueError, "differs from saved ref"):
+                self.tools.review(companies=[{"target": "example.test", "decision": decision,
+                    "reason": "Review selected getter evidence", "qualification_checks": [{
+                        "requirement_ref": "icp:industries", "status": status,
+                        "claim": "The selected company record supports this decision.",
+                        "evidence": [{"ref": wrong}]}]}])
+            self.assertEqual(
+                (self.path.read_bytes(), budget.ledger_path(self.path).read_bytes(), len(self.provider.requests)),
+                before,
+            )
+
+    def test_company_review_keeps_matching_getter_and_press_negative_evidence(self):
+        for source_kind in ("getter", "press"):
+            with self.subTest(source_kind=source_kind):
+                directory = tempfile.TemporaryDirectory()
+                self.addCleanup(directory.cleanup)
+                path = Path(directory.name) / "run/results.json"
+                provider = FixtureProvider()
+                tools = ResearchTools(path, execute=provider)
+                tools.call("tyche_start", {"request": copy.deepcopy(self.request)})
+                if source_kind == "getter":
+                    reference = tools.call("tyche_lookup", {"checks": [check()]})["lookups"][0]["results"][0]["ref"]
+                else:
+                    reference = captured_page(tools, provider, text="Example does not provide the requested product.")
+                calls = len(provider.requests)
+                tools.review(companies=[{"target": "example.test", "decision": "reject",
+                    "reason": "Saved negative evidence establishes the mismatch.", "qualification_checks": [{
+                        "requirement_ref": "icp:industries", "status": "fail",
+                        "claim": "The saved source shows a different business category.",
+                        "evidence": [{"ref": reference}]}]}])
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved["rejected"][0]["candidate"]["domain"], "example.test")
+                self.assertEqual(saved["rejected"][0]["qualification_checks"][0]["status"], "fail")
+                self.assertEqual(len(provider.requests), calls)
+
     def test_conflicting_company_getters_require_selection_and_preserve_it(self):
         self.start()
         first = self.lookup()["lookups"][0]["results"][0]["ref"]
