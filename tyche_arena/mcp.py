@@ -21,31 +21,6 @@ import run_attempt
 import run_coordination as coordination
 from tyche_tools import serve
 
-
-
-
-def arena_schema(schema):
-    """Hoist nested shapes to fit PR #198's 12-level operation JSON ceiling."""
-    definitions = {}
-
-    def visit(value, root=False):
-        if isinstance(value, list):
-            return [visit(item) for item in value]
-        if not isinstance(value, dict):
-            return value
-        result = {key: visit(child) for key, child in value.items()}
-        if not root and value.get("type") in {"object", "array"}:
-            key = "Shape" + str(len(definitions))
-            definitions[key] = result
-            return {"$ref": "#/$defs/" + key}
-        return result
-
-    result = visit(schema, root=True)
-    if definitions:
-        result["$defs"] = definitions
-    return result
-
-
 def lab_tools():
     tools = copy.deepcopy(TOOLS)
     del tools["tyche_start"]
@@ -100,7 +75,7 @@ def lab_tools():
             for key in ("review_ref", "review_findings")
         },
          "additionalProperties": False})
-    return {name: (description, arena_schema(schema)) for name, (description, schema) in tools.items()}
+    return tools
 
 
 LAB_TOOLS = lab_tools()

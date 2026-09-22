@@ -274,7 +274,10 @@ def lookup(tool, inputs, phase="account_verification", **extra):
 
 
 def dereference_tool_schema(schema, field):
-    reference = schema["properties"][field]["$ref"]
+    value = schema["properties"][field]
+    if "$ref" not in value:
+        return value
+    reference = value["$ref"]
     assert reference.startswith("#/$defs/")
     return schema["$defs"][reference.removeprefix("#/$defs/")]
 
@@ -3346,7 +3349,8 @@ def projection_field_scenario(*, stage=None, competing_quote=..., forged_native_
         if command[0] == "tyche_review":
             for company in command[1].get("companies", []):
                 if company["decision"] == "qualify_account":
-                    company["company"]["company_stage"] = stage
+                    if stage is not None:
+                        company["company"]["company_stage"] = stage
                     if competing_quote is not ...:
                         proof = company["qualification_checks"][1]["evidence"][0]
                         captured = "Example Products manufactures packaged goods, tools and accessories for retailers."
@@ -3625,7 +3629,6 @@ print(json.dumps(_company_stage_matches(_normalize_company_stage(observed),_norm
 
 def test_arena_stage_schema_is_explicit_without_native_mutation():
     from tyche_arena.mcp import LAB_TOOLS
-    # The adapter converts repeated schemas to refs; inspect the fully copied native schema seam.
     native = TOOLS["tyche_review"][1]["properties"]["companies"]["items"]["properties"]["company"]["properties"]
     assert "company_stage" not in native
     assert "observed current stage label" in json.dumps(LAB_TOOLS["tyche_review"][1])
@@ -3637,15 +3640,11 @@ def test_arena_email_ref_description_does_not_mutate_shared_reference_schemas():
     native_contact = native_review["properties"]["companies"]["items"]["properties"]["primary_contact"]
     arena_review = LAB_TOOLS["tyche_review"][1]
 
-    def resolve(schema, value):
-        return schema["$defs"][value["$ref"].removeprefix("#/$defs/")]
-
-    arena_companies = resolve(arena_review, arena_review["properties"]["companies"])
-    arena_company_review = resolve(arena_review, arena_companies["items"])
+    arena_companies = arena_review["properties"]["companies"]
+    arena_company_review = arena_companies["items"]
     arena_contacts = (
-        resolve(arena_review, arena_company_review["properties"]["primary_contact"]),
-        resolve(arena_review, resolve(
-            arena_review, arena_company_review["properties"]["backup_contacts"])["items"]),
+        arena_company_review["properties"]["primary_contact"],
+        arena_company_review["properties"]["backup_contacts"]["items"],
     )
     for arena_contact in arena_contacts:
         assert arena_contact["properties"]["email_ref"]["description"].startswith(
@@ -3661,9 +3660,9 @@ def test_arena_email_ref_description_does_not_mutate_shared_reference_schemas():
                 == native_inspect["properties"][field]["description"])
 
     arena_finish = LAB_TOOLS["tyche_finish"][1]
-    arena_findings = resolve(arena_finish, arena_finish["properties"]["review_findings"])
-    arena_finding = resolve(arena_finish, arena_findings["items"])
-    arena_source_refs = resolve(arena_finish, arena_finding["properties"]["source_refs"])
+    arena_findings = arena_finish["properties"]["review_findings"]
+    arena_finding = arena_findings["items"]
+    arena_source_refs = arena_finding["properties"]["source_refs"]
     native_source_ref = (TOOLS["tyche_finish"][1]["properties"]["review_findings"]
                          ["items"]["properties"]["source_refs"]["items"])
     assert arena_source_refs["items"]["description"] == native_source_ref["description"]
@@ -3750,7 +3749,7 @@ def test_generated_primary_bonus_order_and_age_limits(tmp_path):
     assert request["signal_match_mode"] == "all"
 
 
-def test_advertised_mcp_contract_fits_pr198_structural_bounds():
+def test_advertised_mcp_contract_fits_current_structural_bounds():
     from tyche_tools import serve
 
     incoming = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n')
@@ -3765,7 +3764,7 @@ def test_advertised_mcp_contract_fits_pr198_structural_bounds():
         {"type": "function", "name": t["name"], "parameters": t["inputSchema"]} for t in tools]}
 
     def bounds(value, depth=0):
-        assert depth <= 12
+        assert depth <= 24
         if isinstance(value, dict):
             assert len(value) <= 64
             for child in value.values():

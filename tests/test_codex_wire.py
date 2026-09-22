@@ -21,6 +21,26 @@ from tyche_arena import host as runtime
 from tyche_arena.mcp import LAB_TOOLS
 
 
+@pytest.fixture
+def arena_operations():
+    """Load the exact host operation validator supplied for this audit."""
+    configured = os.environ.get("LAB_ARENA_REFERENCE_SOURCE")
+    if not configured:
+        pytest.skip("set LAB_ARENA_REFERENCE_SOURCE for the exact broker boundary")
+    original_modules = {name for name in sys.modules
+                        if name == "lab_arena" or name.startswith("lab_arena.")}
+    sys.path.insert(0, configured)
+    try:
+        from lab_arena import operations
+        yield operations
+    finally:
+        sys.path.pop(0)
+        for name in list(sys.modules):
+            if ((name == "lab_arena" or name.startswith("lab_arena."))
+                    and name not in original_modules):
+                sys.modules.pop(name, None)
+
+
 def unsupported_fields(body):
     """Inspect the relevant closed PR #198 fields; not a full gateway validator."""
     errors = []
@@ -58,7 +78,7 @@ def nesting_depth(value):
 )
 def test_native_codex_lab_boundary(
         tmp_path, monkeypatch, admit_native, tool_timeout_sec, tool_delay_sec,
-        expect_tool_timeout):
+        expect_tool_timeout, arena_operations):
     binary = os.environ["TYCHE_TEST_CODEX_BINARY"]
     version = subprocess.check_output([binary, "--version"], text=True).strip()
     assert version == "codex-cli 0.154.0"
@@ -89,7 +109,7 @@ def test_native_codex_lab_boundary(
                 # Replies are scripted; no model inference occurs.
                 if len(calls) < 2:
                     calls.append(len(calls) + 1)
-                    code = "const required = ['tyche_inspect','tyche_lookup','tyche_review','tyche_finish']; const missing = required.filter(name => !ALL_TOOLS.some(t => t.name.endsWith(name))); if (missing.length) throw new Error('TYCHE MCP tools missing: ' + missing.join(',')); const t = ALL_TOOLS.find(t => t.name.endsWith('tyche_inspect')); text(await tools[t.name]({}));"
+                    code = "const required = ['tyche_inspect','tyche_lookup','tyche_review','tyche_finish']; const missing = required.filter(name => !ALL_TOOLS.some(t => t.name.endsWith(name))); if (missing.length) throw new Error('TYCHE MCP tools missing: ' + missing.join(',')); const review = ALL_TOOLS.find(t => t.name.endsWith('tyche_review')); text(JSON.stringify(review)); const t = ALL_TOOLS.find(t => t.name.endsWith('tyche_inspect')); text(await tools[t.name]({}));"
                     output = [{"type": "custom_tool_call", "id": "ct-" + str(len(calls)),
                                "call_id": "call-" + str(len(calls)), "name": "exec", "namespace": "functions",
                                "input": code, "status": "completed"}]
@@ -207,6 +227,14 @@ def test_native_codex_lab_boundary(
     assert observed, log
     assert "Code Mode is unavailable" not in log, log
     assert all(row["path"] == "/v1/responses" for row in observed)
+    for row in observed:
+        broker_body = dict(row["body"])
+        broker_body.pop("stream", None)
+        broker_body.pop("store", None)
+        broker_body.pop("client_metadata", None)
+        broker_body.pop("previous_response_id", None)
+        broker_body.setdefault("max_output_tokens", 16384)
+        arena_operations.validate_operation_request("openrouter.responses", broker_body)
     body = observed[0]["body"]
     additional = [item for item in body["input"] if item.get("type") == "additional_tools"]
     tools = [tool for item in additional for tool in item.get("tools", [])] + (body.get("tools") or [])
@@ -229,6 +257,10 @@ def test_native_codex_lab_boundary(
         assert len(calls) == 2
         tool_outputs = [item for row in observed[1:] for item in row["body"]["input"]
                         if item.get("type") == "custom_tool_call_output"]
+        declarations = [json.dumps(item) for item in tool_outputs
+                        if "mcp__tyche__tyche_review" in json.dumps(item)]
+        assert declarations and all(fragment in declarations[0] for fragment in (
+            "companies?: Array<{", "decision:", "reason: string", "target: string")), declarations
         if expect_tool_timeout:
             assert sum("timed out awaiting tools/call after 1000ms" in json.dumps(item)
                        for item in tool_outputs) >= 2, (
