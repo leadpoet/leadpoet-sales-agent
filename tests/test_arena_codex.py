@@ -2647,6 +2647,73 @@ def test_contextdev_catalog_is_free_and_matches_the_host_route(arena_operations)
     ) == {"tool": name, "payload": payload}
 
 
+def test_contextdev_news_filter_pairs_fail_before_dispatch_and_can_be_corrected(
+        tmp_path, arena_operations):
+    from itertools import combinations
+    import research_input
+
+    name = "contextdev_post_news_search"
+    filters = {
+        "sourceDomain": ["example.com"], "sourceCountry": ["us"],
+        "articleLanguage": ["en"], "articleType": ["press_release"],
+    }
+    date = {"date": {"from": 1758499200000, "to": 1790035200000}}
+    payload = {
+        "searchBy": {"type": "entity", "entity": {
+            "type": "domain", "domain": "example.com"}},
+        "filterBy": date, "limit": 3,
+    }
+    response = json.dumps({
+        "status": "completed", "job_id": "fixture-contextdev-news",
+        "result": {"data": []},
+    }).encode()
+    socket_path = Path("/tmp") / (
+        "tyche-news-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16] + ".sock"
+    )
+    valid_filters = [None, {}, date] + [
+        {**date, field: values} for field, values in filters.items()
+    ]
+    contract = json.loads((ROOT / "tyche_arena/catalog.json").read_text())["tools"][name]
+    for selected in valid_filters:
+        valid = copy.deepcopy(payload)
+        if selected is None:
+            del valid["filterBy"]
+        else:
+            valid["filterBy"] = copy.deepcopy(selected)
+        research_input.check_tool_contract({"results": [contract]}, {
+            "operation": "execute", "tool": name, "payload": valid,
+        })
+        assert arena_operations.validate_operation_request(
+            "deepline.execute", {"tool": name, "payload": valid}
+        ) == {"tool": name, "payload": valid}
+
+    with FramedArenaWorker(socket_path, arena_operations, [
+        (200, {"content-type": "application/json"}, response)
+    ]) as worker:
+        broker = Broker(socket_path, time.monotonic() + 60)
+        tools = ResearchTools(tmp_path / "research/results.json", execute=broker.execute)
+        tools.start(request=request_for(ICP, 1, 60), max_usd=.5)
+        tools.inspect(tool=name)
+        calls_before = copy.deepcopy(budget_guard.load_ledger(tools.path)["calls"])
+        for left, right in combinations(filters, 2):
+            invalid = copy.deepcopy(payload)
+            invalid["filterBy"] = {**date, left: filters[left], right: filters[right]}
+            with pytest.raises(ValueError, match="No paid call was made"):
+                tools.lookup(lookup(name, invalid)["checks"])
+        assert worker.frames == []
+        assert budget_guard.load_ledger(tools.path)["calls"] == calls_before
+
+        # Correcting the payload resumes the same run; no operator reset or
+        # changed research strategy is needed. Filters reach the host intact.
+        valid = {**payload, "filterBy": {**date, "articleLanguage": ["en"]}}
+        result = tools.lookup(lookup(name, valid)["checks"])
+        assert result["lookups"][0]["status"] == "no_results"
+        assert len(worker.frames) == 1
+        assert worker.frames[0]["parameters"]["payload"] == valid
+        assert tools._operational_block() is None
+        assert budget_guard.audit_ledger(tools.path, json.loads(tools.path.read_text())) == []
+
+
 def test_contextdev_native_bridge_dispatches_and_normalizes_free_page(tmp_path, monkeypatch):
     name = "contextdev_get_web_scrape_markdown"
     contract = json.loads((ROOT / "tyche_arena/catalog.json").read_text())["tools"][name]

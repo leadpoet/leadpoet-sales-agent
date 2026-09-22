@@ -5235,7 +5235,7 @@
           },
           {
             "default": {},
-            "description": "Optional result filters.",
+            "description": "Optional result filters. Use at most one of sourceDomain, sourceCountry, articleLanguage, or articleType. The date filter can be combined with that one category or used alone.",
             "name": "filterBy",
             "required": false,
             "type": "object"
@@ -5283,8 +5283,58 @@
             },
             "filterBy": {
               "additionalProperties": false,
+              "allOf": [
+                {
+                  "not": {
+                    "required": [
+                      "sourceDomain",
+                      "sourceCountry"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "sourceDomain",
+                      "articleLanguage"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "sourceDomain",
+                      "articleType"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "sourceCountry",
+                      "articleLanguage"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "sourceCountry",
+                      "articleType"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "articleLanguage",
+                      "articleType"
+                    ]
+                  }
+                }
+              ],
               "default": {},
-              "description": "Optional result filters.",
+              "description": "Optional result filters. Use at most one of sourceDomain, sourceCountry, articleLanguage, or articleType. The date filter can be combined with that one category or used alone.",
               "properties": {
                 "articleLanguage": {
                   "description": "Article languages to include. Up to 3.",
