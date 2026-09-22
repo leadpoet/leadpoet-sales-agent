@@ -12,7 +12,7 @@ from unittest.mock import patch
 from test_client_output import client_document, VALIDATOR
 from test_export_xlsx import EXPORTER_PATH, read_first_sheet_rows
 from linkedin_fixtures import write_linkedin_receipts
-from linkedin_receipts import linkedin_receipt_errors
+from linkedin_receipts import email_identity_fields, linkedin_receipt_errors
 import run_attempt
 
 
@@ -42,6 +42,23 @@ class LinkedInReceiptTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertNotIn("Traceback", result.stderr)
         return result.returncode, json.loads(result.stdout)
+
+    def test_email_identity_strips_ca_credential_from_structured_surname_only(self):
+        contact = self.doc["accepted"][0]["primary_contact"]
+        company = self.doc["accepted"][0]["company"]
+        cases = (
+            ({"firstName": "Bella", "lastName": "Smolnicki, CA", "headline": "Finance Manager"}, "Smolnicki"),
+            ({"firstName": "Jordan", "lastName": "Slade ACCA", "headline": "Finance Manager, CA"}, "Slade ACCA"),
+            ({"firstName": "Ana", "lastName": "Garcia, Marquez", "headline": "Chartered Accountant"}, "Garcia, Marquez"),
+            ({"firstName": "Aaron", "lastName": "Blocher-Rubin, PhD", "headline": "Research lead"}, "Blocher-Rubin"),
+        )
+        for profile, expected_last_name in cases:
+            with self.subTest(last_name=profile["lastName"]), patch(
+                "linkedin_receipts._saved_profile", return_value=profile
+            ):
+                identity = email_identity_fields(self.doc, self.path, company, contact)
+                self.assertEqual(identity["last_name"], expected_last_name)
+                self.assertEqual(identity["full_name"], f"{profile['firstName']} {expected_last_name}")
 
     def test_review_fills_missing_values_and_strict_delivery_reads_saved_result(self):
         row = copy.deepcopy(self.doc["accepted"][0])
