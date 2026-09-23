@@ -66,6 +66,30 @@ class RunCostsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 estimate(bad, 'gpt-5.6-luna')
 
+    def test_gpt_6_luna_uses_its_official_rates_and_receipts_keep_their_rates(self):
+        self.assertEqual(estimate(self.usage, 'gpt-6-luna', per_request=True), 0.000078)
+        usage = dict(input_tokens=300000, cached_input_tokens=200000, cache_write_input_tokens=10000,
+                     output_tokens=10000, total_tokens=310000)
+        self.assertEqual(estimate(usage, 'gpt-6-luna', per_request=True), 0.032)
+        usage.pop('cache_write_input_tokens')
+        self.assertEqual(estimate(usage, 'gpt-6-luna'), 0.017)
+        with self.assertRaisesRegex(ValueError, 'No verified pricing'):
+            estimate(self.usage, 'gpt-6-sol')
+        with self.assertRaisesRegex(ValueError, 'No verified pricing'):
+            UsageReceipt(self.request, 'gpt-6-sol', 'high', 'fast')
+        candidate = UsageReceipt(self.request, 'gpt-6-luna', 'high', 'fast')
+        self.assertEqual(candidate.data['pricing_source'],
+                         'https://developers.openai.com/api/docs/models/gpt-6-luna')
+        self.assertEqual(candidate.data['pricing_rates_usd_per_million']['output'], '0.50')
+        self.assertIn('Fast mode at 2x', candidate.data['limitations'][0])
+        incumbent = self.receipt()
+        self.assertEqual(incumbent.data['pricing_source'],
+                         'https://developers.openai.com/api/docs/models/gpt-5.6-luna')
+        self.assertNotIn('Fast mode at', incumbent.data['limitations'][0])
+        self.record_response(incumbent)
+        self.assertEqual(incumbent.data['responses'][0]['model'], 'gpt-5.6-luna')
+        self.assertEqual(incumbent.data['estimated_base_usd'], 0.000176)
+
     def test_worker_failure_category_does_not_copy_error_payload(self):
         receipt = self.receipt()
         receipt.observe({'type': 'turn.failed', 'error': {'message': 'Usage limit reached; private account detail'}})

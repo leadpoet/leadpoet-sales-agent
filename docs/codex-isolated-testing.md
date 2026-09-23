@@ -65,8 +65,14 @@ AGENTS.md, user configuration, plugins, apps, or memories. It discovers skills
 through Codex itself, disables every skill outside this repository's
 `.agents/skills`, and checks the actual loaded instruction sources before
 starting. Repository instructions and `.codex/config.toml` still apply. The
-launcher pins `gpt-5.6-luna` with `high` reasoning and the `fast`
-service tier (the accelerated 1.5× mode when the account exposes it).
+launcher pins `gpt-5.6-luna` with `high` reasoning and the `fast` service tier
+when the account exposes it; its price premium is not published for this model.
+Before any model turn, it reads the pinned Codex
+model list and refuses a model that does not support that reasoning effort and
+speed tier, or a thread that reports a different model. `TYCHE_MODEL` can select
+another model with an official rate row in `scripts/run_costs.py` for an isolated
+local comparison. A resumed run must keep the model recorded in its receipts.
+Arena remains pinned to the default model.
 
 The child disables Deepline CLI self-updates and global skill synchronization
 using `DEEPLINE_NO_AUTO_UPDATE=1` and `DEEPLINE_SKIP_SKILLS_SYNC=1`. This keeps
@@ -260,6 +266,10 @@ cache writes, output and reasoning output, and dated pricing are retained in
 the receipt. Prompts and tool output are not copied into it. Pricing is applied
 per response so cumulative input does not accidentally trigger long-context
 rates. Reasoning tokens are already included in output and are not billed twice.
+Rates are recorded per model from the official model pages. Each new receipt
+stores the rates used for its estimates, so later rate-table changes do not
+alter its saved per-response amounts. The base estimate excludes Fast premiums;
+the GPT-6 Luna page prices Fast at 2x the applicable rates.
 
 Each continuation gets its own receipt. Failed or interrupted invocations retain
 observed usage but remain incomplete when final totals cannot be reconciled.

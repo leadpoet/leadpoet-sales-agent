@@ -15,18 +15,80 @@ import threading
 import time
 
 try:
-    from .run_costs import UsageReceipt, execute_with_usage, save_report
+    from .run_costs import MODEL_PRICING, UsageReceipt, execute_with_usage, save_report
 except ImportError:  # Direct CLI invocation.
-    from run_costs import UsageReceipt, execute_with_usage, save_report
+    from run_costs import MODEL_PRICING, UsageReceipt, execute_with_usage, save_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = ROOT / '.agents' / 'skills'
 sys.path.insert(0, str(SKILL_ROOT / 'lead-sourcing' / 'scripts'))
 CODEX_VERSION = '0.154.0'
-MODEL = 'gpt-5.6-luna'
+# gpt-6-luna is priced and selectable through TYCHE_MODEL. The default stays
+# gpt-5.6-luna until the pinned runtime advertises the candidate for this login.
+DEFAULT_MODEL = 'gpt-5.6-luna'
+
+
+def selected_model(environ=os.environ):
+    """Select an explicitly priced local-launcher model."""
+    return environ.get('TYCHE_MODEL') or DEFAULT_MODEL
+
+
+def require_priced_model(model):
+    if model not in MODEL_PRICING:
+        raise RuntimeError(f'No verified pricing for model {model!r}; TYCHE_MODEL must be one of '
+                           f'{sorted(MODEL_PRICING)} or the model needs an official rate row in run_costs.py.')
+
+
+def saved_run_model_conflict(request_file, model):
+    """A resumed run keeps the model its receipts were written under."""
+    models = set()
+    for path in (Path(request_file).resolve().parent / 'model-usage').glob('*.json'):
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(receipt, dict):
+            return f'{path} is not a usage receipt; preserve it and inspect the run before restarting.'
+        models.add(receipt.get('model'))
+    models.discard(None)
+    if models and models != {model}:
+        return (f'This run was researched with {sorted(models)}; resuming with {model!r} would mix models. '
+                'Set TYCHE_MODEL to the saved model or start a new run directory.')
+    return None
+
+
+MODEL = selected_model()
 REASONING_EFFORT = 'high'
 SERVICE_TIER = 'fast'
+
+
+def model_support_error(listed, model, effort, service_tier):
+    """Explain why the runtime model list cannot run the selected configuration."""
+    entry = next((item for item in listed if item.get('id') == model), None)
+    if entry is None:
+        return (f'Codex {CODEX_VERSION} does not receive model {model!r} in this login\'s model list '
+                f'({sorted(str(item.get("id")) for item in listed)}); no fallback model was launched.')
+    efforts = [item.get('reasoningEffort') for item in entry.get('supportedReasoningEfforts', [])]
+    if effort not in efforts:
+        return f'Model {model!r} does not support reasoning effort {effort!r} (supported: {efforts}); nothing was launched.'
+    tiers = entry.get('additionalSpeedTiers') or []
+    if service_tier and service_tier not in tiers:
+        return f'Model {model!r} does not advertise the {service_tier!r} speed tier (advertised: {tiers}); nothing was launched.'
+    return None
+
+
+def listed_models(request):
+    """Read every page of the app-server model list and reject malformed replies."""
+    models, cursor, ident = [], None, 5
+    while True:
+        reply = request(ident, 'model/list', {'cursor': cursor} if cursor else {})
+        if not isinstance(reply, dict) or not isinstance(reply.get('data'), list):
+            raise RuntimeError('Codex returned a malformed model list; nothing was launched.')
+        models.extend(reply['data'])
+        cursor, ident = reply.get('nextCursor'), ident + 1
+        if not cursor or ident > 25:
+            return models
 FINALIZATION_SECONDS = 600
 STARTUP_SECONDS = 600
 WIND_DOWN_SECONDS = 120  # Research closes this long before an explicit time limit.
@@ -52,6 +114,8 @@ def original_start(request_file, fallback):
     starts = [fallback]
     for path in (Path(request_file).resolve().parent / 'model-usage').glob('*.json'):
         receipt = json.loads(path.read_text())
+        if not isinstance(receipt, dict):
+            raise ValueError(f'{path} is not a usage receipt; preserve it and inspect the run before restarting')
         if Path(receipt['request_file']).resolve() == Path(request_file).resolve():
             starts.append(receipt.get('run_started_at', receipt['started_at']))
     return min(starts, key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')))
@@ -164,6 +228,8 @@ def recover_stopped_workers(run_file, *, receipts_directory='model-usage'):
     # ownership until that group is gone, even if the saved receipt says stopped.
     for path in (run_file.parent / receipts_directory).glob('*.json'):
         receipt = json.loads(path.read_text())
+        if not isinstance(receipt, dict):
+            raise ValueError(f'{path} is not a usage receipt; preserve it and inspect the run before restarting')
         pid = receipt.get('process_group_id')
         if pid is not None:
             if type(pid) is not int or pid <= 1:
@@ -657,6 +723,9 @@ def inspect_runtime(env, overrides, start_thread=False, native_tools=False):
                     raise RuntimeError('This Codex version cannot report loaded instruction sources.')
                 result['instruction_sources'] = started['instructionSources']
                 result['model'] = started.get('model')
+                # A thread can echo configured fallback metadata. The runtime's
+                # own list decides whether this exact configuration is supported.
+                result['models'] = listed_models(request)
                 result['native_tools'] = []
                 if native_tools:
                     servers = request(4, 'mcpServerStatus/list', {'limit': 100})
@@ -723,6 +792,7 @@ def main():
     parser.add_argument('--budget-policy', choices=('actual_cost', 'reserved'), default=None,
                         help='Accounting for new runs; reserved preserves a hard provider-only cap for comparisons. Resumes retain their saved policy.')
     args = parser.parse_args()
+    require_priced_model(MODEL)
     if (args.resume_until is not None or args.resume_reason is not None) and not (
             args.exec_file is not None and args.resume_until and args.resume_reason):
         parser.error('--resume-until and --resume-reason require each other and --exec-file')
@@ -738,6 +808,10 @@ def main():
             parser.error('the request file is empty')
     if os.environ.get('TYCHE_ISOLATED_RUN') == '1':
         raise RuntimeError('Already inside isolated TYCHE. Use the local lead-sourcing skill directly; nested launch refused.')
+    if args.exec_file is not None:
+        conflict = saved_run_model_conflict(args.exec_file, MODEL)
+        if conflict:
+            raise RuntimeError(conflict)
 
     source_home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).resolve()
     # Give CODEX_HOME its documented meaning only in the child process. The
@@ -788,6 +862,13 @@ def main():
             '{path=' + json.dumps(path) + ',enabled=false}' for path in excluded
         ) + ']'])
         verified = inspect_runtime(env, overrides, start_thread=True, native_tools=native_tools)
+        if verified.get('model') != MODEL:
+            raise RuntimeError(f'Codex started with model {verified.get("model")!r} instead of the pinned {MODEL!r}; '
+                               'no fallback was launched. Check the pinned Codex version and the account model list.')
+        unsupported = model_support_error(verified['models'], MODEL, REASONING_EFFORT, SERVICE_TIER)
+        if unsupported:
+            raise RuntimeError(unsupported)
+        listing = next(item for item in verified['models'] if item.get('id') == MODEL)
         active = [skill for skill in verified['skills'] if skill['enabled']]
         if not active or any(not inside(skill['path'], SKILL_ROOT) for skill in active):
             raise RuntimeError('Skill isolation failed; no test was launched.')
@@ -800,6 +881,12 @@ def main():
             'plugins_enabled': False, 'apps_enabled': False, 'memories_enabled': False,
             'codex_version': CODEX_VERSION, 'model': verified['model'], 'reasoning_effort': REASONING_EFFORT,
             'service_tier': SERVICE_TIER,
+            'model_listing': {
+                'supported_reasoning_efforts': [item.get('reasoningEffort')
+                                                for item in listing.get('supportedReasoningEfforts', [])],
+                'speed_tiers': listing.get('additionalSpeedTiers') or [],
+                'listed_models': sorted(str(item.get('id')) for item in verified['models']),
+            },
             'native_tools': verified['native_tools'],
         }
         print(json.dumps(summary, indent=2), flush=True)

@@ -677,6 +677,102 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(original_start(self.request, self.started), '2026-09-01T00:00:00Z')
 
 
+class ModelSelectionTests(unittest.TestCase):
+
+    def test_default_model_and_priced_override_only(self):
+        from codex_tyche import DEFAULT_MODEL, require_priced_model, selected_model
+        self.assertEqual(DEFAULT_MODEL, 'gpt-5.6-luna')
+        self.assertEqual(selected_model({}), 'gpt-5.6-luna')
+        self.assertEqual(selected_model({'TYCHE_MODEL': ''}), 'gpt-5.6-luna')
+        self.assertEqual(selected_model({'TYCHE_MODEL': 'gpt-6-luna'}), 'gpt-6-luna')
+        for model in ('gpt-5.6-luna', 'gpt-6-luna'):
+            require_priced_model(model)
+        with self.assertRaisesRegex(RuntimeError, 'No verified pricing for model'):
+            require_priced_model(selected_model({'TYCHE_MODEL': 'gpt-6-astra'}))
+
+    def test_resume_refuses_a_model_change_and_arena_keeps_the_default(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import tyche_arena.host as host
+        from codex_tyche import saved_run_model_conflict
+        self.assertEqual(host.MODEL, 'openai/gpt-5.6-luna')
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / 'request.txt'
+            request.write_text('Synthetic.')
+            self.assertIsNone(saved_run_model_conflict(request, 'gpt-6-luna'))
+            (Path(directory) / 'model-usage').mkdir()
+            (Path(directory) / 'model-usage' / 'a.json').write_text(
+                json.dumps({'model': 'gpt-5.6-luna'}))
+            self.assertIsNone(saved_run_model_conflict(request, 'gpt-5.6-luna'))
+            self.assertIn("researched with ['gpt-5.6-luna']",
+                          saved_run_model_conflict(request, 'gpt-6-luna'))
+
+    def test_local_override_does_not_change_the_arena_model(self):
+        import subprocess
+        import sys
+        root = Path(__file__).resolve().parents[1]
+        code = ('import json; from scripts import codex_tyche; import tyche_arena.host as host; '
+                'print(json.dumps([codex_tyche.MODEL, host.MODEL]))')
+        result = subprocess.run(
+            [sys.executable, '-c', code], cwd=root,
+            env={**os.environ, 'TYCHE_MODEL': 'gpt-6-luna'},
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout),
+                         ['gpt-6-luna', 'openai/gpt-5.6-luna'])
+
+    def test_malformed_receipt_is_refused_on_resume_and_recovery(self):
+        from codex_tyche import recover_stopped_workers, saved_run_model_conflict
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / 'request.txt'
+            request.write_text('Synthetic.')
+            usage = Path(directory) / 'model-usage'
+            usage.mkdir()
+            (usage / 'odd.json').write_text('["not", "a", "receipt"]')
+            self.assertIn('is not a usage receipt',
+                          saved_run_model_conflict(request, 'gpt-5.6-luna'))
+            with self.assertRaisesRegex(ValueError, 'is not a usage receipt'):
+                original_start(request, '2026-09-22T00:00:00+00:00')
+            with self.assertRaisesRegex(ValueError, 'is not a usage receipt'):
+                recover_stopped_workers(Path(directory) / 'results.json')
+
+    def test_runtime_model_list_decides_support_before_any_turn(self):
+        from codex_tyche import listed_models, model_support_error
+        luna = {
+            'id': 'gpt-5.6-luna',
+            'additionalSpeedTiers': ['fast'],
+            'supportedReasoningEfforts': [
+                {'reasoningEffort': effort}
+                for effort in ('low', 'medium', 'high', 'xhigh', 'max')
+            ],
+        }
+        listed = [
+            {'id': 'gpt-6-astra', 'additionalSpeedTiers': ['fast'],
+             'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]},
+            luna,
+        ]
+        self.assertIsNone(model_support_error(listed, 'gpt-5.6-luna', 'high', 'fast'))
+        self.assertIn("does not receive model 'gpt-6-luna'",
+                      model_support_error(listed, 'gpt-6-luna', 'high', 'fast'))
+        self.assertIn('reasoning effort',
+                      model_support_error(listed, 'gpt-5.6-luna', 'ultra', 'fast'))
+        self.assertIn('speed tier', model_support_error(
+            [dict(luna, additionalSpeedTiers=[])], 'gpt-5.6-luna', 'high', 'fast'))
+        replies = iter(({'data': [luna], 'nextCursor': 'next'},
+                        {'data': [listed[0]], 'nextCursor': None}))
+        calls = []
+
+        def request(ident, method, params):
+            calls.append((ident, method, params))
+            return next(replies)
+
+        self.assertEqual(listed_models(request), [luna, listed[0]])
+        self.assertEqual(calls, [(5, 'model/list', {}),
+                                 (6, 'model/list', {'cursor': 'next'})])
+        with self.assertRaisesRegex(RuntimeError, 'malformed model list'):
+            listed_models(lambda *_: {'data': {}})
+
+
 class WorkspaceConfigurationTests(unittest.TestCase):
 
     def test_installed_bundle_paths_are_supplied_without_changing_parent(self):

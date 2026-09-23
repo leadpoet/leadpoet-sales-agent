@@ -106,9 +106,14 @@ calls. It does not verify model-service connectivity or provider credentials.
 Use `--smoke` for an optional read-only model response with no provider calls.
 See [launcher setup and troubleshooting](docs/codex-isolated-testing.md).
 
-The [launcher](scripts/codex_tyche.py) pins **`gpt-5.6-luna`**, **`high` reasoning**,
+The [launcher](scripts/codex_tyche.py) pins **`gpt-5.6-luna`**, **`high` reasoning**
 and the **`fast` service tier**. It loads project-local sourcing instructions in
 an isolated session while retaining the worker's sandbox and network policy.
+Before any model turn, it checks the pinned Codex model list and refuses an
+unsupported model, reasoning effort, speed tier, or silent fallback.
+`TYCHE_MODEL=gpt-6-luna` selects the priced candidate for an isolated local
+comparison. Arena stays pinned to the default model, and a resumed run must use
+the model recorded in its receipts.
 
 ### 3. Ask for leads
 

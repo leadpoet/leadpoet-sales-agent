@@ -28,7 +28,7 @@ import budget_guard
 import run_attempt
 from scripts import codex_tyche as runner
 
-MODEL = "openai/" + runner.MODEL
+MODEL = "openai/" + runner.DEFAULT_MODEL  # TYCHE_MODEL is only a local-launcher comparison override.
 REASONING_EFFORT = runner.REASONING_EFFORT
 CODEX_VERSION = runner.CODEX_VERSION
 FINALIZATION_SECONDS = runner.FINALIZATION_SECONDS

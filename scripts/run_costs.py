@@ -14,10 +14,18 @@ import threading
 import time
 import uuid
 
-# Standard API-equivalent USD per million tokens, checked 2026-09-13.
-# This is a comparison estimate, never a ChatGPT subscription/credit invoice.
-PRICING_SOURCE = 'https://developers.openai.com/api/docs/models/gpt-5.6-luna'
-LUNA_RATES = {'input': '0.20', 'cached_input': '0.02', 'cache_write': '0.25', 'output': '1.20'}
+# Standard API-equivalent USD per million tokens, per model, from the official model pages.
+# This is a comparison estimate, never a ChatGPT subscription/credit invoice. A receipt keeps the
+# rates it was written with; a model without a verified row is refused, never priced by analogy.
+MODEL_PRICING = {
+    'gpt-5.6-luna': {'input': '0.20', 'cached_input': '0.02', 'cache_write': '0.25', 'output': '1.20',
+                     'source': 'https://developers.openai.com/api/docs/models/gpt-5.6-luna',
+                     'checked_on': '2026-09-22', 'fast_multiplier': None},
+    'gpt-6-luna': {'input': '0.10', 'cached_input': '0.01', 'cache_write': '0.125', 'output': '0.50',
+                   'source': 'https://developers.openai.com/api/docs/models/gpt-6-luna',
+                   'checked_on': '2026-09-22', 'fast_multiplier': '2'},
+}
+RATE_FIELDS = ('input', 'cached_input', 'cache_write', 'output')
 USAGE_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
                 'output_tokens', 'reasoning_output_tokens', 'total_tokens')
 
@@ -26,9 +34,15 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def estimate(usage, model, *, per_request=False):
-    if model != 'gpt-5.6-luna':
+def pricing_for(model):
+    pricing = MODEL_PRICING.get(model)
+    if pricing is None:
         raise ValueError('No verified pricing for ' + str(model))
+    return pricing
+
+
+def estimate(usage, model, *, per_request=False):
+    pricing = pricing_for(model)
     required = ('input_tokens', 'cached_input_tokens', 'output_tokens')
     if any(type(usage.get(k)) is not int or usage[k] < 0 for k in required):
         raise ValueError('Missing or invalid input/cache/output token breakdown')
@@ -40,7 +54,7 @@ def estimate(usage, model, *, per_request=False):
     writes = usage.get('cache_write_input_tokens')
     if writes is not None and (type(writes) is not int or not 0 <= writes <= inputs - cached):
         raise ValueError('Invalid cache-write tokens')
-    r = {k: Decimal(v) for k, v in LUNA_RATES.items()}
+    r = {k: Decimal(pricing[k]) for k in RATE_FIELDS}
     def price(write_count, long_context):
         prompt = (inputs - cached - write_count) * r['input'] + cached * r['cached_input'] + write_count * r['cache_write']
         return (prompt * (2 if long_context else 1) + output * r['output'] * (Decimal('1.5') if long_context else 1)) / 1_000_000
@@ -51,6 +65,7 @@ def estimate(usage, model, *, per_request=False):
 
 class UsageReceipt:
     def __init__(self, request_file, model, effort, service_tier):
+        pricing = pricing_for(model)
         request_file = Path(request_file).resolve(strict=True)
         directory = request_file.parent / 'model-usage'
         directory.mkdir(exist_ok=True)
@@ -60,9 +75,12 @@ class UsageReceipt:
             'requested_service_tier': service_tier, 'thread_id': None, 'status': 'running',
             'usage': None, 'estimated_base_usd': None, 'actual_model_billed_usd': None,
             'responses': [], 'compaction_response_ids': [], 'usage_reconciled': False,
-            'pricing_source': PRICING_SOURCE, 'pricing_checked_on': '2026-09-13',
+            'pricing_source': pricing['source'], 'pricing_checked_on': pricing['checked_on'],
+            'pricing_rates_usd_per_million': {k: pricing[k] for k in RATE_FIELDS},
             'pricing_basis': 'standard_api_equivalent_not_actual_billing',
-            'limitations': ['Standard rates exclude Fast/priority premiums and hosted-tool charges.',
+            'limitations': ['Standard rates exclude Fast/priority premiums and hosted-tool charges.'
+                            + (f" The official page prices Fast mode at {pricing['fast_multiplier']}x the applicable rates."
+                               if pricing['fast_multiplier'] else ''),
                             'Actual subscription charges require billing data; token prices are API-equivalent.']}
         with self.path.open('x', encoding='utf-8') as stream:
             json.dump(self.data, stream)
