@@ -88,7 +88,7 @@ Command paths below are relative to the skill directory, not this reference.
   For new runs, stop new calls once observed spending at the current accepted-company
   count reaches that threshold. The last call or concurrent batch may exceed it.
   When absent, 5 credits is only a strategy-review warning. Record
-  `accepted_companies_before_call`; rejected candidates, failed calls and demotions
+  `accepted_leads_before_call` (the retained ledger field); rejected candidates, failed calls and demotions
   never reset spending. Historical version 1 ledgers retain their original rules.
 
 ## Inputs and workflow

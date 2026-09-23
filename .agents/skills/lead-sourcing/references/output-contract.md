@@ -1110,7 +1110,7 @@ cost cannot prove the allowance and is invalid while the guard is active. The
 sum at each dispatch must include all earlier costs at that count or higher
 and must not exceed the configured allowance. Route changes,
 rejections, and failed lookups do not change the count; only a fully accepted
-lead advances it. Before a paid Deepline execution, the agent must add its conservative cost upper bound to
+company advances it. Before a paid Deepline execution, the agent must add its conservative cost upper bound to
 the amount already charged at the current count or higher and must not run the call if
 the sum would exceed the allowance. The shared
 [paid-call ledger](adapter-io.md#paid-call-budget) enforces this cap before
@@ -1122,8 +1122,9 @@ that were affordable when made. The output
 limit, when present, must match the request limit. Artifacts without this
 optional field remain valid for backward compatibility.
 
-Record `accepted_leads_before_call` on every paid Deepline route even without
-that cap. At 5 observed credits since the last complete lead, review the strategy;
+Record the retained `accepted_leads_before_call` ledger field on every paid
+Deepline route even without that cap; it counts accepted companies in active
+company-only runs. At 5 observed credits since the last complete lead, review the strategy;
 this is a nonblocking warning. New runs stop on known provider charges plus
 locally captured base LLM estimates. Old ledgers retain hard reservation limits. `--show-progress` on
 `validate_run.py` derives this warning without modifying the run or its verdict.
