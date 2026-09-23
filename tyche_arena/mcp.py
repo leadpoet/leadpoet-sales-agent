@@ -83,6 +83,40 @@ MODEL_RESULT_MAX_CHARACTERS = 24000
 EVIDENCE_REVIEW_PAGE_CHARACTERS = 8000
 
 
+def tools_for_request(run_file):
+    """Hide contact-stage inputs when the bound Arena request is company-only."""
+    tools = copy.deepcopy(LAB_TOOLS)
+    document = budget_guard.read_object(run_file)
+    if document["request"].get("contacts_required", True):
+        return tools
+    description, schema = tools["tyche_review"]
+    company = schema["properties"]["companies"]["items"]
+    company["properties"].pop("primary_contact")
+    company["properties"].pop("backup_contacts")
+    company["properties"]["decision"]["enum"] = ["hold_account", "reject", "accept"]
+    description = description.replace(
+        "Preserve its valid description and verified contacts.",
+        "Preserve its valid description and company evidence. This request is company-only: "
+        "accept after company fit, intent and writing review; do not research people or contacts.",
+    ).replace(
+        "Contact example: {ref, requested_role, role_match}; code derives the role group. ",
+        "",
+    ).replace(
+        "Select an email validation result with email_ref to supply its exact address and verdict. ",
+        "",
+    )
+    tools["tyche_review"] = description, schema
+    checkpoint_description, checkpoint_schema = tools["tyche_checkpoint"]
+    tools["tyche_checkpoint"] = (
+        checkpoint_description.replace(
+            "fully qualified companies and contacts",
+            "fully qualified companies",
+        ),
+        checkpoint_schema,
+    )
+    return tools
+
+
 def broker_resume_state(run_file):
     """Restore local dispatch safety from this run's durable routes and receipts."""
     run_file = Path(run_file).resolve(strict=True)
@@ -357,6 +391,7 @@ class LabTools:
             # A peer can own this gate longer than Codex's MCP startup timeout.
             # Every lookup refreshes durable state under the gate before dispatch.
             provider_calls, provider_blocked = 0, False
+        self.tools = tools_for_request(run_file)
         self.broker = Broker(os.environ["LAB_ARENA_WORKER_SOCKET"], deadline,
                              response_deadline=response_deadline,
                              initial_calls=provider_calls,
@@ -470,6 +505,8 @@ class LabTools:
     def _ready_contact_candidates(self):
         """Return fully ready unresolved contacts bound to their current evidence."""
         document = self.research._document()
+        if not document["request"].get("contacts_required", True):
+            return []
         if len(document.get("accepted", [])) >= document["request"]["target_count"]:
             return []
         progress = self.research._overview()
@@ -542,11 +579,11 @@ class LabTools:
 
     def _inspect_lab_tool(self, arguments):
         """Use native field/paging semantics with the exact served Arena contract."""
-        validate(arguments, LAB_TOOLS["tyche_inspect"][1])
+        validate(arguments, self.tools["tyche_inspect"][1])
         if any(arguments.get(key) is not None for key in ("target", "ref", "query", "recover")):
             raise ValueError("Inspect one company, result, capability query, tool or recovery reference at a time")
         name = arguments["tool"]
-        description, schema = LAB_TOOLS[name]
+        description, schema = self.tools[name]
         contract = {"toolId": name, "description": description, "inputSchema": schema}
         if not arguments.get("field"):
             return {"tool": self.research._description_view(contract)}
@@ -561,7 +598,7 @@ class LabTools:
         return {"tool": copy.deepcopy(value)}
 
     def call(self, name, arguments):
-        if name not in LAB_TOOLS:
+        if name not in self.tools:
             raise ValueError("The lab initialized this run; use its bound research tools")
         if name == "tyche_review" and "web" in arguments:
             raise ValueError("Lab evidence must come through the bound provider adapter")
@@ -599,13 +636,13 @@ class LabTools:
     def _call(self, name, arguments):
         if self.delivered and (name != "tyche_inspect" or any(key in arguments for key in ("recover", "refresh", "query", "tool"))):
             raise ValueError("Reviewed JSON is delivered; end the Codex turn now")
-        if name == "tyche_inspect" and arguments.get("tool") in LAB_TOOLS:
+        if name == "tyche_inspect" and arguments.get("tool") in self.tools:
             result = self._inspect_lab_tool(arguments)
         elif name == "tyche_checkpoint":
-            validate(arguments, LAB_TOOLS[name][1])
+            validate(arguments, self.tools[name][1])
             result = self.checkpoint(**arguments)
         elif name == "tyche_review":
-            validate(arguments, LAB_TOOLS[name][1])
+            validate(arguments, self.tools[name][1])
             document = self.research._document()
             if arguments.get("review_ref") is not None and (repair := self._projection_repair(document)):
                 result = repair
@@ -638,7 +675,7 @@ class LabTools:
                         if candidate["target"] in reviewed_holds
                     )
         elif name == "tyche_open":
-            validate(arguments, LAB_TOOLS[name][1])
+            validate(arguments, self.tools[name][1])
             document = self.research._document()
             state = confirmed_leads.status(self.research.path, document)
             if ((state["pending_review"] or state["sync_required"])
@@ -667,7 +704,7 @@ class LabTools:
         elif name == "tyche_finish":
             # Let native finish retain its blocker, stop and budget order;
             # only insert the Arena projection at its review boundary.
-            validate(arguments, LAB_TOOLS[name][1])
+            validate(arguments, self.tools[name][1])
             self.research.review_delivery = self._review_delivery
             try:
                 result = self.research.call(name, arguments)
@@ -717,7 +754,7 @@ def main():
     session = LabTools(args.run_file, args.deadline, args.response_deadline)
     try:
         # Already isolated by the lab. Do not use the local Codex sandbox relay.
-        serve(session, tools=LAB_TOOLS)
+        serve(session, tools=session.tools)
     finally:
         session.broker.stopped.set()
         stopped.set()

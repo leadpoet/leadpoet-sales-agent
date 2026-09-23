@@ -89,13 +89,23 @@ def signals_for(icp):
 def request_for(icp, limit, duration):
     if not isinstance(icp, dict):
         raise ValueError("ICP must be an object")
-    if icp.get("intent_details_policy") != "intent_details_v1" or icp.get("contact_policy") != "contacts_v1":
-        raise ValueError("This bundle supports intent_details_v1 + contacts_v1 rounds")
+    if icp.get("intent_details_policy") != "intent_details_v1":
+        raise ValueError("This bundle supports intent_details_v1 rounds")
+    contact_policy = icp.get("contact_policy")
+    if contact_policy not in {None, "contacts_v1"}:
+        raise ValueError("contact_policy must be omitted for company-only output or contacts_v1")
+    company_only = contact_policy is None
     validate_constraints(icp)
     if icp.get("required_attribute") is not None and not isinstance(icp["required_attribute"], str):
         raise ValueError("required_attribute must be text; structured attributes are unsupported")
     roles = icp.get("target_roles")
-    if not isinstance(roles, list) or not roles or any(not isinstance(v, str) or not v.strip() for v in roles):
+    if company_only:
+        contact_fields = {key for key in ("target_roles", "target_seniority", "contact_geography")
+                          if icp.get(key) is not None}
+        if contact_fields:
+            raise ValueError("company-only rounds must omit contact targeting fields: "
+                             + ", ".join(sorted(contact_fields)))
+    elif not isinstance(roles, list) or not roles or any(not isinstance(v, str) or not v.strip() for v in roles):
         raise ValueError("target_roles must be a nonempty list of text")
     signals = signals_for(icp)
     criteria = {}
@@ -116,12 +126,16 @@ def request_for(icp, limit, duration):
         attributes.append("Employee range is one of: " + json.dumps(icp["employee_count"]))
     if attributes:
         criteria["required_attributes"] = attributes
-    request = {"target_count": limit, "icp": criteria, "requested_roles": roles,
+    request = {"target_count": limit, "icp": criteria,
         "buying_signals": signals,
         "signal_match_mode": "all", "time_window": {"max_age_days": icp.get("intent_max_age_days", 365)},
-        "contact_fields": ["email"], "max_duration_seconds": duration,
+        "max_duration_seconds": duration,
         "original_text": json.dumps(icp, ensure_ascii=True, allow_nan=False),
         "as_of_date": os.environ.get("LAB_ARENA_EVALUATION_DATE") or datetime.now(timezone.utc).date().isoformat()}
+    if company_only:
+        request["contacts_required"] = False
+    else:
+        request.update(requested_roles=roles, contact_fields=["email"])
     if icp.get("product_service"):
         request["product_service"] = {"description": icp["product_service"], "perspective": "target"}
     return request

@@ -51,6 +51,44 @@ class ContactPolicyTests(unittest.TestCase):
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 self.normalize(**fields)
 
+    def test_company_only_mode_has_zero_contact_target_and_rejects_mixed_policy(self):
+        request = setup_request()["request"]
+        for key in ("requested_roles", "contact_role_groups", "contact_fields",
+                    "contacts_per_company", "min_contacts_per_company",
+                    "target_contacts_per_company"):
+            request.pop(key, None)
+        request["contacts_required"] = False
+        normalized = research_input.normalize_request(
+            request, Path("/tmp/contact-policy/company-only/results.json")
+        )
+        self.assertEqual(validator.contact_limits(normalized), (0, 0))
+        self.assertTrue(validator.sourcing_target_met({
+            "request": dict(normalized, target_count=1),
+            "accepted": [{"company": {"domain": "example.com"}}],
+        }))
+        for key in ("requested_roles", "contact_fields", "min_contacts_per_company"):
+            with self.subTest(key=key):
+                mixed = copy.deepcopy(request)
+                mixed[key] = ["Operations leader"] if key == "requested_roles" else (["email"] if key == "contact_fields" else 1)
+                with self.assertRaisesRegex(ValueError, "contacts_required=false"):
+                    research_input.normalize_request(
+                        mixed, Path("/tmp/contact-policy/company-only/results.json")
+                    )
+
+    def test_company_only_accepted_row_needs_no_person_or_email(self):
+        document = contacts_document(1, minimum=1, target=1)
+        request = document["request"]
+        for key in ("requested_roles", "contact_role_groups", "contact_fields",
+                    "contacts_per_company", "min_contacts_per_company",
+                    "target_contacts_per_company"):
+            request.pop(key, None)
+        request["contacts_required"] = False
+        row = document["accepted"][0]
+        row.pop("primary_contact")
+        row.pop("backup_contacts")
+        self.assertEqual(validator.accepted_errors(document), [])
+        self.assertEqual(validator.contact_coverage(document)["target_shortfall"], 0)
+
     def test_legacy_resume_preserves_request_and_completion(self):
         request = self.normalize()
         request.pop("min_contacts_per_company")

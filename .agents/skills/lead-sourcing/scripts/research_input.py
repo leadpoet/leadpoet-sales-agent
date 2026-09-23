@@ -41,7 +41,7 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
     """Apply mechanical defaults to new inputs; never infer roles or intent."""
     allowed = {"target_count", "icp", "buying_signals", "requested_roles", "time_window",
                "budget", "contact_fields", "contacts_per_company", "min_contacts_per_company", "target_contacts_per_company", "contact_role_groups",
-               "signal_match_mode", "run_id", "as_of_date", "max_duration_seconds", "product_service", "original_text"}
+               "contacts_required", "signal_match_mode", "run_id", "as_of_date", "max_duration_seconds", "product_service", "original_text"}
     object_fields(value, allowed, "request")
     request = copy.deepcopy(value)
     prior = saved or {}
@@ -75,13 +75,23 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
                 raise ValueError("company_size bounds are reversed")
         else:
             strings(values, "icp." + key, empty=key == "exclusions")
+    contacts_required = request.get("contacts_required", True)
+    if type(contacts_required) is not bool:
+        raise ValueError("contacts_required must be true or false")
+    contact_policy_fields = {
+        "requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
+        "min_contacts_per_company", "target_contacts_per_company",
+    }
+    if not contacts_required and contact_policy_fields & request.keys():
+        raise ValueError("contacts_required=false cannot include contact roles, fields or counts")
     if "contact_role_groups" in request:
         groups = request["contact_role_groups"]
         object_fields(groups, {"primary", "secondary"}, "contact_role_groups")
         strings(groups.get("primary"), "primary roles")
         strings(groups.get("secondary"), "secondary roles", empty=True)
         request.setdefault("requested_roles", list(dict.fromkeys(groups["primary"] + groups["secondary"])))
-    strings(request.get("requested_roles"), "requested_roles")
+    if contacts_required:
+        strings(request.get("requested_roles"), "requested_roles")
     if not isinstance(request.get("buying_signals"), list) or not request["buying_signals"]:
         raise ValueError("buying_signals must contain the agent's interpreted signals")
     window = request.setdefault("time_window", {})
@@ -117,7 +127,11 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", fallback_id):
         fallback_id = "run-" + hashlib.sha256(str(Path(run_file).resolve()).encode()).hexdigest()[:16]
     from validate_run import contact_limits, explicit_contact_policy
-    if prior and not explicit_contact_policy(prior) and not explicit_contact_policy(request):
+    if prior and prior.get("contacts_required", True) != contacts_required:
+        raise ValueError("resume must preserve contacts_required")
+    if not contacts_required:
+        contact_limits(request)
+    elif prior and not explicit_contact_policy(prior) and not explicit_contact_policy(request):
         # Preserve old request fingerprints and their best-effort backup policy.
         request.setdefault("contacts_per_company", prior.get("contacts_per_company", 1))
         contact_limits(request)
@@ -128,9 +142,10 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
         minimum, contact_target = contact_limits(request)
         request.pop("contacts_per_company", None)
         request.update(min_contacts_per_company=minimum, target_contacts_per_company=contact_target)
-    defaults = {"contact_fields": ["email"],
-                "signal_match_mode": "any", "run_id": fallback_id,
+    defaults = {"signal_match_mode": "any", "run_id": fallback_id,
                 "as_of_date": window.get("as_of_date", date)}
+    if contacts_required:
+        defaults["contact_fields"] = ["email"]
     if not prior:
         defaults["max_duration_seconds"] = None
     elif "max_duration_seconds" in prior:
@@ -492,8 +507,12 @@ def company_update(document, item):
     if state == "accepted":
         for key in ("stage", "reason_code", "reason_text"):
             row.pop(key, None)
-        row.setdefault("backup_contacts", [])
-        row["contact_candidate_count"] = int(bool(row.get("primary_contact"))) + len(row["backup_contacts"])
+        if document["request"].get("contacts_required", True):
+            row.setdefault("backup_contacts", [])
+        else:
+            row.pop("primary_contact", None)
+            row.pop("backup_contacts", None)
+        row["contact_candidate_count"] = int(bool(row.get("primary_contact"))) + len(row.get("backup_contacts", []))
         from validate_run import contact_count, contact_limits
         row["backup_shortfall"] = max(0, contact_limits(document["request"])[1] - contact_count(row, document["request"]))
     else:

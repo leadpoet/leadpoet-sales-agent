@@ -50,6 +50,17 @@ NEXT_LEAD_REVIEW_CREDITS = Decimal("5")
 
 def contact_limits(request: dict) -> tuple[int, int]:
     """One contact by default; the legacy field remains a target alias."""
+    contacts_required = request.get("contacts_required", True)
+    if type(contacts_required) is not bool:
+        raise ValueError("contacts_required must be true or false")
+    if not contacts_required:
+        conflicting = {
+            "requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
+            "min_contacts_per_company", "target_contacts_per_company",
+        } & request.keys()
+        if conflicting:
+            raise ValueError("contacts_required=false cannot include contact roles, fields or counts")
+        return 0, 0
     minimum = request.get("min_contacts_per_company", 1)
     target = request.get("target_contacts_per_company", request.get("contacts_per_company", minimum))
     if "contacts_per_company" in request and (type(request["contacts_per_company"]) is not int or request["contacts_per_company"] < 1):
@@ -84,7 +95,8 @@ def contact_count(row: dict, request=None) -> int:
 
 
 def explicit_contact_policy(request: dict) -> bool:
-    return any(key in request for key in ("min_contacts_per_company", "target_contacts_per_company"))
+    return ("contacts_required" in request
+            or any(key in request for key in ("min_contacts_per_company", "target_contacts_per_company")))
 
 
 def contact_coverage(document: dict) -> dict:
@@ -1729,9 +1741,12 @@ def source_evidence_errors(document, *, run_file=None):
         evidence = [("account_fit", row.get("account_fit"))]
         if signal or not signals_optional(document.get("request", {})):
             evidence.append(("signal_evidence", signal))
-        evidence += [("primary_contact", contact), ("primary_contact.location_evidence", contact.get("location_evidence")),
-                     ("company.employee_range_evidence", company.get("employee_range_evidence"))]
-        if explicit_contact_policy(document.get("request", {})):
+        evidence += [("company.employee_range_evidence", company.get("employee_range_evidence"))]
+        if document.get("request", {}).get("contacts_required", True):
+            evidence += [("primary_contact", contact),
+                         ("primary_contact.location_evidence", contact.get("location_evidence"))]
+        if (document.get("request", {}).get("contacts_required", True)
+                and explicit_contact_policy(document.get("request", {}))):
             for offset, backup in enumerate(row.get("backup_contacts", [])):
                 if isinstance(backup, dict):
                     evidence += [(f"backup_contacts[{offset}]", backup),
@@ -1775,6 +1790,7 @@ def accepted_errors(document: dict, *, run_file=None, fill_missing=False) -> lis
             errors.append(f"accepted[{index}].company.website: {exc}")
     if document.get("schema_version") == "1.2":
         _validate_client_output(accepted, errors)
+    contacts_required = request.get("contacts_required", True)
     grouped_roles = request.get("contact_role_groups")
     normalized_groups: dict[str, set[str]] = {}
     if grouped_roles is not None:
@@ -1852,6 +1868,11 @@ def accepted_errors(document: dict, *, run_file=None, fill_missing=False) -> lis
             accepted_domains.append(
                 canonical[4:] if canonical.startswith("www.") else canonical
             )
+
+        if not contacts_required:
+            if isinstance(row.get("primary_contact"), dict) or row.get("backup_contacts"):
+                errors.append(f"accepted[{index}] cannot include contacts when contacts_required=false")
+            continue
 
         primary = row.get("primary_contact")
         if not isinstance(primary, dict):

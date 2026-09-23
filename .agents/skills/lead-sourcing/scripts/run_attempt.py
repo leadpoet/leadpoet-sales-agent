@@ -119,6 +119,8 @@ def _contact_gate(document, action, run_file=None):
         return
     if action["phase"] not in {"contact_discovery", "contact_verification", "email_validation"}:
         return
+    if not document["request"].get("contacts_required", True):
+        raise ValueError("This request is company-only; contact research is not allowed")
     # Draft problems belong to their company. Keep the full-document gate at
     # delivery; an unrelated candidate must not block discovery or recovery.
     scoped = dict(document, rejected=[])

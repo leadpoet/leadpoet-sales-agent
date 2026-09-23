@@ -261,6 +261,8 @@ ICP = {"intent_details_policy": "intent_details_v1", "contact_policy": "contacts
        "target_roles": ["Director of Supply Chain"], "target_seniority": "Director+",
        "contact_geography": {"countries": ["US"], "regions": ["OH"], "cities": ["Columbus"]},
        "excluded_companies": ["excluded.example.com"]}
+COMPANY_ONLY_ICP = {key: copy.deepcopy(value) for key, value in ICP.items()
+                    if key not in {"contact_policy", "target_roles", "target_seniority", "contact_geography"}}
 COMPANY_URL = "https://www.linkedin.com/company/example-products"
 PERSON_URL = "https://www.linkedin.com/in/ada-example"
 PARAGRAPH = ("Example Products connected its acquired warehouse to a shared WMS on August 12, 2026. "
@@ -365,6 +367,53 @@ def scenario(finish_tool="tyche_finish", *, separate_email_source=False, finder_
     }
     assert final["checkpoint_saved"], final
     assert final["delivery_allowed"] == (finish_tool == "tyche_finish"), final
+
+
+def company_only_scenario(finish_tool="tyche_finish"):
+    """Accept and checkpoint one company without person discovery or contact tools."""
+    company = yield "tyche_lookup", lookup(
+        "harvestapi_get_company", {"url": COMPANY_URL}, "account_discovery")
+    company_ref = company["lookups"][0]["results"][0]["ref"]
+    pages = yield "tyche_lookup", lookup(
+        "generic_http_request", {"url": "https://example.com/news", "method": "GET"})
+    refs = [row["ref"] for row in pages["lookups"][0]["results"]]
+    accepted = yield "tyche_review", {"companies": [{
+        "target": "example.com", "decision": "accept",
+        "reason": "Company fit and current intent are verified",
+        "company": {"ref": company_ref, "discovery_source": {"ref": company_ref},
+            "industry": "Manufacturing", "sub_industry": "Textiles",
+            "description": "Example Products manufactures packaged goods, tools, and accessories. It supplies retailers with consumer products.",
+            "classification_note": "Canonical taxonomy classification"},
+        "account_fit": {"ref": refs[0], "fit_claim": "Manufacturing account"},
+        "qualification_checks": [
+            {"requirement_ref": "icp:industries", "status": "pass",
+             "claim": "Manufactures consumer products", "evidence": [{"ref": refs[0]}]},
+            {"requirement_ref": "attribute:0", "status": "pass",
+             "claim": "Manufactures consumer products for retailers", "evidence": [{"ref": refs[0]}]},
+            {"requirement_ref": "signal:0", "status": "pass",
+             "claim": "Connected an acquired warehouse to a shared WMS",
+             "evidence": [{"ref": refs[1], "event_date": "2026-08-12"}]},
+        ],
+        "intent_details": PARAGRAPH,
+    }], "sources": [{"ref": pages["lookups"][0]["route"], "state": "exhausted",
+                       "reason": "Both fixture sources reviewed"}]}
+    assert accepted["status"] == "review_required", accepted
+    confirmed = yield "tyche_review", {
+        "review_ref": accepted["review_ref"],
+        "review_findings": review_findings(accepted),
+    }
+    assert confirmed["checkpoint_saved"], confirmed
+    if finish_tool is None:
+        return
+    packet = yield finish_tool, {}
+    assert packet["status"] == "review_required", packet
+    assert "primary_contact" not in packet["companies"][0]
+    assert "company-only request" in packet["instructions"]
+    final = yield finish_tool, {
+        "review_ref": packet["review_ref"],
+        "review_findings": review_findings(packet),
+    }
+    assert final["checkpoint_saved"] and final["delivery_allowed"], final
 
 
 def capture_accepted_review(captured):
@@ -848,6 +897,52 @@ def test_trigger_returns_reviewed_checkpoint_with_codex_configuration(lab, monke
         lab.research[0].call("tyche_review", {})
     with pytest.raises(ValueError, match="initialized"):
         lab.research[0].call("tyche_start", {})
+
+
+def test_company_only_harness_run_reviews_and_checkpoints_without_contact_research(lab):
+    from harness import run_icp
+
+    lab.program = company_only_scenario
+    rows = run_icp(COMPANY_ONLY_ICP)
+
+    assert len(rows) == 1
+    assert "contact" not in rows[0]
+    assert rows[0]["intent_details"] == PARAGRAPH
+    assert rows[0]["intent_signals"][0]["matched_icp_signal"] == 0
+    assert [frame["tool"] for frame in lab.frames] == [
+        "harvestapi_get_company", "generic_http_request",
+    ]
+    document = json.loads(lab.research[0].research.path.read_text())
+    request = document["request"]
+    assert request["contacts_required"] is False
+    assert "requested_roles" not in request and "contact_fields" not in request
+    assert "primary_contact" not in document["accepted"][0]
+    review_tool = lab.research[0].tools["tyche_review"]
+    review_company = review_tool[1]["properties"]["companies"]["items"]
+    assert review_company["properties"]["decision"]["enum"] == [
+        "hold_account", "reject", "accept",
+    ]
+    assert "primary_contact" not in review_company["properties"]
+    assert "backup_contacts" not in review_company["properties"]
+    assert "do not research people or contacts" in review_tool[0]
+    checkpoint = json.loads(lab.output.read_text())
+    assert checkpoint == {"companies": rows}
+    assert lab.checkpoints and all("contact" not in row for row in lab.checkpoints[-1])
+
+
+def test_company_only_input_is_explicit_and_contact_v5_request_stays_frozen():
+    company_request = request_for(COMPANY_ONLY_ICP, 2, 2640)
+    assert company_request["contacts_required"] is False
+    assert "requested_roles" not in company_request
+    assert "contact_fields" not in company_request
+
+    contact_request = request_for(ICP, 2, 2640)
+    assert "contacts_required" not in contact_request
+    assert contact_request["requested_roles"] == ICP["target_roles"]
+    assert contact_request["contact_fields"] == ["email"]
+
+    with pytest.raises(ValueError, match="must omit contact targeting fields: target_roles"):
+        request_for({**COMPANY_ONLY_ICP, "target_roles": ["Operations leader"]}, 1, 30)
 
 
 def test_projection_uses_explicit_email_source_separate_from_location_profile(lab):

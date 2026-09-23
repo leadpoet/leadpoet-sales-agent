@@ -356,6 +356,72 @@ def accepted_preflight(run_file, document):
             + accepted_errors(completed, run_file=run_file))
 
 
+def _project_contact(run_file, document, company, person):
+    """Project the frozen V5 contact only for contact-required requests."""
+    check_contact(person, json.loads(document["request"]["original_text"]))
+    if "email_source" in person:
+        email_attribution = person["email_source"]
+        if (not isinstance(email_attribution, Mapping)
+                or not isinstance(email_attribution.get("source"), Mapping)):
+            raise ValueError("Arena email has an invalid explicit saved discovery source")
+        source = email_attribution["source"]
+    else:
+        source = (person.get("location_evidence") or person)["source"]
+    receipt = run_attempt.read_receipt(run_file, source["route_id"])["result"]
+    tool = receipt.get("tool")
+    if tool == "harvestapi_get_profile":
+        profile = linkedin_receipts._saved_profile(
+            run_file, source, person["linkedin_url"], "in",
+            document["routes"], company.get("linkedin_url"),
+        )
+        if receipt["attempt"]["request"].get("payload", {}).get("findEmail") != "true":
+            raise ValueError("Arena email must come from HarvestAPI get_profile with findEmail=true")
+        emails = profile.get("emails", [])
+        observed = {str(e.get("email") if isinstance(e, dict) else e).strip().casefold()
+                    for e in emails}
+        if profile.get("email"):
+            observed.add(str(profile["email"]).strip().casefold())
+        if person["email"].strip().casefold() not in observed:
+            raise ValueError("Arena email is absent from the selected provider profile")
+        record_id = text(
+            profile.get("recordId") or profile.get("record_id") or profile.get("id"),
+            "HarvestAPI record ID",
+        )
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/~-]{0,199}", record_id):
+            raise ValueError("HarvestAPI record ID violates Arena's source contract")
+        arena_source = {"provider": "harvestapi", "tool": tool, "record_id": record_id}
+    elif tool in ARENA_EMAIL_FINDERS:
+        discovered = email_receipts.discovery_source(
+            run_file, document["routes"], person["email"], preferred=source["route_id"],
+        )
+        if not discovered or discovered["source"].get("route_id") != source["route_id"]:
+            raise ValueError("Arena email is absent from the selected provider finder")
+        provider_response = receipt.get("provider_response")
+        arena_metadata = (provider_response.get("arena")
+                          if isinstance(provider_response, Mapping) else None)
+        broker_call_id = (arena_metadata.get("call_identity")
+                          if isinstance(arena_metadata, Mapping) else None)
+        if (not isinstance(broker_call_id, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", broker_call_id) is None):
+            raise ValueError("Arena email finder lacks its trusted broker call identity")
+        arena_source = {
+            "provider": ARENA_EMAIL_FINDERS[tool], "tool": tool,
+            "broker_call_id": broker_call_id,
+        }
+    else:
+        raise ValueError("Arena email has an unsupported saved discovery source")
+    return {
+        "full_name": person["full_name"], "role": person["current_title"],
+        "linkedin_url": person["linkedin_url"], "email": person["email"],
+        "location": {
+            "country": person["country"],
+            **({"region": person["state"]} if person.get("state") else {}),
+            **({"city": person["city"]} if person.get("city") else {}),
+        },
+        "email_source": arena_source,
+    }
+
+
 def _project_companies(run_file, document, icp, *, require_review):
     if json.loads(document["request"]["original_text"]) != icp:
         raise ValueError("Arena delivery ICP differs from the saved request")
@@ -368,9 +434,10 @@ def _project_companies(run_file, document, icp, *, require_review):
     if errors := accepted_preflight(run_file, document):
         raise ValueError("; ".join(errors))
     output = []
+    contacts_required = document["request"].get("contacts_required", True)
     kinds = {_identity(signal["kind"]): index for index, signal in enumerate(document["request"]["buying_signals"])}
     for row in document["accepted"]:
-        company, person = row["company"], row["primary_contact"]
+        company = row["company"]
         stage = company.get("company_stage")
         if stage is None:
             stage = ""
@@ -389,7 +456,6 @@ def _project_companies(run_file, document, icp, *, require_review):
         # saved for another ICP dimension, so do not couple this optional
         # packet to the stage criterion or require a dedicated stage check.
         stage_evidence = company_stage_evidence(row)
-        check_contact(person, icp)
         signals = []
         attribute = None
         for check in row["qualification_checks"]:
@@ -415,64 +481,19 @@ def _project_companies(run_file, document, icp, *, require_review):
         if (len(paragraph) > 2000 or re.search(r"\n\s*\n|(?:^|\n)\s*(?:#{1,6}\s|[-*•]\s|\d+[.)]\s|>)", paragraph)
                 or "```" in paragraph or any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} and c not in "\r\n\t" for c in paragraph)):
             raise ValueError("Arena intent_details requires one plain paragraph of at most 2000 characters")
-        if "email_source" in person:
-            email_attribution = person["email_source"]
-            if (not isinstance(email_attribution, Mapping)
-                    or not isinstance(email_attribution.get("source"), Mapping)):
-                raise ValueError("Arena email has an invalid explicit saved discovery source")
-            source = email_attribution["source"]
-        else:
-            source = (person.get("location_evidence") or person)["source"]
-        receipt = run_attempt.read_receipt(run_file, source["route_id"])["result"]
-        tool = receipt.get("tool")
-        if tool == "harvestapi_get_profile":
-            profile = linkedin_receipts._saved_profile(run_file, source, person["linkedin_url"], "in",
-                document["routes"], company.get("linkedin_url"))
-            if receipt["attempt"]["request"].get("payload", {}).get("findEmail") != "true":
-                raise ValueError("Arena email must come from HarvestAPI get_profile with findEmail=true")
-            # Use only the selected raw profile, never an LLM-authored email_source.
-            emails = profile.get("emails", [])
-            observed = {str(e.get("email") if isinstance(e, dict) else e).strip().casefold() for e in emails}
-            if profile.get("email"):
-                observed.add(str(profile["email"]).strip().casefold())
-            if person["email"].strip().casefold() not in observed:
-                raise ValueError("Arena email is absent from the selected provider profile")
-            record_id = text(profile.get("recordId") or profile.get("record_id") or profile.get("id"), "HarvestAPI record ID")
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/~-]{0,199}", record_id):
-                raise ValueError("HarvestAPI record ID violates Arena's source contract")
-            arena_source = {"provider": "harvestapi", "tool": tool, "record_id": record_id}
-        elif tool in ARENA_EMAIL_FINDERS:
-            discovered = email_receipts.discovery_source(
-                run_file, document["routes"], person["email"],
-                preferred=source["route_id"],
-            )
-            if not discovered or discovered["source"].get("route_id") != source["route_id"]:
-                raise ValueError("Arena email is absent from the selected provider finder")
-            provider_response = receipt.get("provider_response")
-            arena_metadata = provider_response.get("arena") if isinstance(provider_response, Mapping) else None
-            broker_call_id = arena_metadata.get("call_identity") if isinstance(arena_metadata, Mapping) else None
-            if not isinstance(broker_call_id, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", broker_call_id) is None:
-                raise ValueError("Arena email finder lacks its trusted broker call identity")
-            arena_source = {
-                "provider": ARENA_EMAIL_FINDERS[tool],
-                "tool": tool,
-                "broker_call_id": broker_call_id,
-            }
-        else:
-            raise ValueError("Arena email has an unsupported saved discovery source")
-        contact = {"full_name": person["full_name"], "role": person["current_title"],
-            "linkedin_url": person["linkedin_url"], "email": person["email"],
-            "location": {"country": person["country"], **({"region": person["state"]} if person.get("state") else {}),
-                         **({"city": person["city"]} if person.get("city") else {})},
-            "email_source": arena_source}
-        output.append({"company_name": company["canonical_name"],
+        projected = {"company_name": company["canonical_name"],
             "company_website": public_url(company.get("website") or "https://" + company["domain"]),
             "company_linkedin": company["linkedin_url"], "industry": company["industry"],
             "employee_count": company["employee_range"], "company_stage": stage,
             "country": text(company.get("hq_country"), "company country"), "state": company.get("hq_state", ""),
             "intent_details": " ".join(paragraph.split()), "intent_signals": signals,
             **({"company_stage_evidence": stage_evidence} if stage_evidence else {}),
-            "required_attribute": attribute, "contact": contact})
+            "required_attribute": attribute}
+        if contacts_required:
+            projected["contact"] = _project_contact(
+                run_file, document, company, row["primary_contact"],
+            )
+        output.append(projected)
     if len(output) > min(5, document["request"]["target_count"]):
         raise ValueError("Arena company limit exceeded")
     projected_payload(output, [row["company"]["domain"] for row in document["accepted"]])
