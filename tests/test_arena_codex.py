@@ -398,6 +398,14 @@ def company_only_scenario(finish_tool="tyche_finish"):
     }], "sources": [{"ref": pages["lookups"][0]["route"], "state": "exhausted",
                        "reason": "Both fixture sources reviewed"}]}
     assert accepted["status"] == "review_required", accepted
+    if finish_tool == "tyche_checkpoint":
+        checkpointed = yield "tyche_checkpoint", {
+            "review_ref": accepted["review_ref"],
+            "review_findings": review_findings(accepted),
+        }
+        assert checkpointed["checkpoint_saved"], checkpointed
+        assert checkpointed["delivery_allowed"] is False
+        return
     confirmed = yield "tyche_review", {
         "review_ref": accepted["review_ref"],
         "review_findings": review_findings(accepted),
@@ -6198,13 +6206,20 @@ def test_final_review_has_time_for_two_brokered_model_responses():
     assert runtime.RUN_SECONDS - runtime.RESEARCH_SECONDS >= 2 * 185 + 30
 
 
+@pytest.mark.parametrize("company_only", [False, True], ids=["contact-v5", "company-v6"])
 @pytest.mark.parametrize("mode", ["partial_timeout", "partial_error", "deliver"])
-def test_partial_checkpoint_survives_unfinished_research(lab, monkeypatch, mode):
+def test_partial_checkpoint_survives_unfinished_research(
+        lab, monkeypatch, mode, company_only):
     from harness import run_icp
 
     monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
-    lab.program = lambda: scenario("tyche_checkpoint")
+    lab.program = (lambda: company_only_scenario("tyche_checkpoint")) if company_only else (
+        lambda: scenario("tyche_checkpoint")
+    )
     lab.mode = mode
+    reference = os.environ.get("LAB_ARENA_REFERENCE_SOURCE")
+    if reference:
+        install_actual_checkpoint_writer(lab, monkeypatch)
 
     def continue_research(tools):
         assert not tools.delivered
@@ -6222,9 +6237,22 @@ def test_partial_checkpoint_survives_unfinished_research(lab, monkeypatch, mode)
             ledger["blocked"] = "Later call billing is uncertain; do not retry"
 
     lab.after_program = continue_research
-    rows = run_icp(ICP)
+    rows = run_icp(COMPANY_ONLY_ICP if company_only else ICP)
     assert len(rows) == 1
+    assert ("contact" not in rows[0]) is company_only
     assert json.loads(lab.output.read_text()) == {"companies": rows}
+    if reference:
+        monkeypatch.syspath_prepend(reference)
+        output = importlib.import_module("lab_arena.output")
+        expected = ("leadpoet.lab_arena.output.v6" if company_only
+                    else "leadpoet.lab_arena.output.v5")
+        validated = output.output_document_from_bytes(
+            lab.output.read_bytes(), expected_schema_version=expected,
+        )
+        assert validated["schema_version"] == expected
+        assert len(validated["companies"]) == 1
+        assert validated["companies"][0]["company_name"] == rows[0]["company_name"]
+        assert ("contact" not in validated["companies"][0]) is company_only
     assert json.loads(lab.research[0].research.path.read_text())["request"]["target_count"] == 5
     # A partial checkpoint is not full delivery, so the supervisor continues;
     # this fixture's later workers fail and the outer run records that failure.
