@@ -933,6 +933,9 @@ def test_company_only_harness_run_reviews_and_checkpoints_without_contact_resear
     assert "primary_contact" not in review_company["properties"]
     assert "backup_contacts" not in review_company["properties"]
     assert "do not research people or contacts" in review_tool[0]
+    inspect = lab.research[0].call("tyche_inspect", {})
+    assert "company-only" in inspect["request_review"]
+    assert "do not start contact work or infer buyer roles" in inspect["request_review"]
     checkpoint = json.loads(lab.output.read_text())
     assert checkpoint == {"companies": rows}
     assert lab.checkpoints and all("contact" not in row for row in lab.checkpoints[-1])
