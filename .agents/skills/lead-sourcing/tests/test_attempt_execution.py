@@ -29,7 +29,78 @@ def reviewed(document):
     return document
 
 
+def company_stop_document(*, target_count, accepted):
+    document = stop_document([], target_count=target_count, accepted=accepted)
+    document["schema_version"] = VALIDATOR.COMPANY_RESULT_SCHEMA_VERSION
+    document["cost_summary"] = VALIDATOR.calculate_cost_summary(document)
+    return document
+
+
+def verification_gate_document(*, company_only):
+    document = stop_document([], target_count=2, routes=[{
+        "route_id": "attempted", "scope": "discovery", "provider": "deepline",
+        "operation": "company_search", "provider_status": "ok", "paid_calls": 0,
+        "cost_basis": "actual", "cost_credits": 0, "cost_upper_bound_credits": 0,
+    }])
+    document["stop_reason"] = "no_productive_route"
+    document["stop_audit"] = {
+        "target_shortfall": 2,
+        "candidate_companies_reviewed": 0,
+        "substantive_account_reviews": 0,
+        "exclusion_only_rejections": 0,
+        "duplicate_candidates": 0,
+        "frontier_complete": True,
+        "provider_call_capacity": {},
+        "route_frontier": [{
+            "route_id": "attempted", "scope": "discovery", "state": "continuable",
+            "reason": "The attempted company search can continue.",
+        }],
+    }
+    if company_only:
+        document["schema_version"] = VALIDATOR.COMPANY_RESULT_SCHEMA_VERSION
+        document["cost_summary"] = VALIDATOR.calculate_cost_summary(document)
+    return document
+
+
 class PersistencePolicyTests(unittest.TestCase):
+    def test_company_only_shortfall_does_not_reopen_accepted_company(self):
+        document = company_stop_document(target_count=2,
+            accepted=[{"company": {"domain": "accepted.example"}}])
+        result = VALIDATOR.evaluate_stop(document, now=NOW)
+        self.assertEqual(result["decision"], "continue")
+        self.assertEqual(result["missing_scopes"], ["discovery"])
+        self.assertNotIn("contact_coverage", result)
+
+    def test_company_only_target_met_has_no_contact_coverage(self):
+        document = company_stop_document(target_count=1,
+            accepted=[{"company": {"domain": "accepted.example"}}])
+        result = VALIDATOR.evaluate_stop(document, now=NOW)
+        self.assertEqual(result["decision"], "target_met")
+        self.assertNotIn("contact_coverage", result)
+
+    def test_legacy_stop_policy_keeps_contact_scope_and_coverage(self):
+        document = stop_document([], target_count=2,
+            accepted=[{"company": {"domain": "accepted.example"}}])
+        result = VALIDATOR.evaluate_stop(document, now=NOW)
+        self.assertEqual(result["missing_scopes"], ["accepted.example", "discovery"])
+        self.assertIn("contact_coverage", result)
+
+    def test_company_only_validation_skips_email_recovery_gates(self):
+        document = verification_gate_document(company_only=True)
+        with (patch("email_receipts.pending_verification_errors") as pending,
+              patch("email_receipts.unused_pending_verifications") as unused):
+            VALIDATOR.validate_run(document, run_file=Path("unused"))
+        pending.assert_not_called()
+        unused.assert_not_called()
+
+    def test_legacy_validation_keeps_email_recovery_gates(self):
+        document = verification_gate_document(company_only=False)
+        with (patch("email_receipts.pending_verification_errors", return_value=[]) as pending,
+              patch("email_receipts.unused_pending_verifications", return_value=set()) as unused):
+            VALIDATOR.validate_run(document, run_file=Path("unused"))
+        pending.assert_called_once()
+        unused.assert_called_once()
+
     def test_saved_failed_run_cannot_pass_stop_check(self):
         path = Path(__file__).parent / "fixtures" / "tablecloth_premature_stop.json"
         doc = json.loads(path.read_text())

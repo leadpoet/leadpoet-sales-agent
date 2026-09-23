@@ -2062,6 +2062,7 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
     if type(target) is not int or target < 1 or not isinstance(accepted, list):
         errors.append("positive target_count and accepted array are required")
         return result
+    company_only = company_stage(document)
     try:
         started = datetime.fromisoformat(check["started_at"].replace("Z", "+00:00"))
         current = now or datetime.now(timezone.utc)
@@ -2085,11 +2086,12 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
     _validate_next_lead_budget(document, errors)
     if errors:
         return result
-    try:
-        result["contact_coverage"] = contact_coverage(document)
-    except ValueError as exc:
-        errors.append(str(exc))
-        return result
+    if not company_only:
+        try:
+            result["contact_coverage"] = contact_coverage(document)
+        except ValueError as exc:
+            errors.append(str(exc))
+            return result
     actual_cost = document.get("budget", {}).get("policy") == "actual_cost"
     if actual_cost:
         if execution_budget is None:
@@ -2121,10 +2123,12 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
     if errors:
         return result
     scopes = {"discovery"} if len(accepted) < target else set()
-    _, contact_target = contact_limits(request)
-    scopes.update(_company_key(row) for row in accepted if contact_count(row, request) < contact_target)
+    if not company_only:
+        _, contact_target = contact_limits(request)
+        scopes.update(_company_key(row) for row in accepted if contact_count(row, request) < contact_target)
+    unresolved_stages = {"account"} if company_only else {"account", "contact"}
     for row in document.get("unresolved", []):
-        if isinstance(row, dict) and row.get("stage") in {"account", "contact"}:
+        if isinstance(row, dict) and row.get("stage") in unresolved_stages:
             key = _company_key(row)
             if key:
                 scopes.add(key)
@@ -2320,7 +2324,8 @@ def validate_run(document: Any, *, require_stop_check: bool = False, now: Option
         errors.append("summary.accepted_companies must equal len(accepted)")
 
     errors.extend(accepted_errors(document, run_file=run_file))
-    if run_file is not None and (require_stop_check or "stop_check" in document):
+    if (run_file is not None and not company_stage(document)
+            and (require_stop_check or "stop_check" in document)):
         from email_receipts import pending_verification_errors
         errors.extend(pending_verification_errors(document, run_file, allow_unused=True))
 
@@ -2359,9 +2364,9 @@ def validate_run(document: Any, *, require_stop_check: bool = False, now: Option
         return errors
     if complete:
         if stop_reason != "target_met":
-            errors.append("a run that reaches its company and contact targets must stop with target_met")
+            errors.append("a run that reaches its requested targets must stop with target_met")
     elif stop_reason == "target_met":
-        errors.append("target_met is invalid while the company or contact target is incomplete")
+        errors.append("target_met is invalid while a requested target is incomplete")
 
     audit = document.get("stop_audit")
     if shortfall and not isinstance(audit, dict):
@@ -2418,8 +2423,11 @@ def validate_run(document: Any, *, require_stop_check: bool = False, now: Option
         # Unused future research is not unfinished dispatched work. Keep it in
         # the frontier after target completion instead of inventing exhaustion.
         if stop_reason not in {"time_limit_reached", "budget_exhausted"}:
-            from email_receipts import unused_pending_verifications
-            unused = unused_pending_verifications(document, run_file) if run_file is not None else set()
+            if run_file is not None and not company_stage(document):
+                from email_receipts import unused_pending_verifications
+                unused = unused_pending_verifications(document, run_file)
+            else:
+                unused = set()
             open_reviews = sorted(rid for rid in attempted_ids if
                                   rid not in unused and frontier_by_id.get(rid, {}).get("state") in ACTIONABLE_FRONTIER_STATES)
             if open_reviews:

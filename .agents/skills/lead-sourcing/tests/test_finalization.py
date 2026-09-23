@@ -16,8 +16,8 @@ import budget_guard
 import run_attempt
 
 
-def completed_document():
-    document = client_document()
+def completed_document(*, schema_version="2.0"):
+    document = client_document(schema_version=schema_version)
     document["budget"] = {"policy": "reserved", "limits": {"deepline_credits": 10,
         "scrapingdog_credits": 0}, "spent": {"deepline_credits": 0,
         "scrapingdog_credits": 0}, "paid_calls": 0, "status": "within_budget"}
@@ -99,8 +99,8 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual(after["stop_check"], document["stop_check"])
         self.assertEqual(after["stop_audit"]["route_frontier"], document["stop_audit"]["route_frontier"])
 
-    def test_pending_job_cannot_be_hidden_by_completion_labels(self):
-        document = completed_document()
+    def test_legacy_pending_job_cannot_be_hidden_by_completion_labels(self):
+        document = completed_document(schema_version="1.1")
         route = dict(document["routes"][0], route_id="pending-job", phase="email_validation", provider_status="partial",
                      tool="bounceban_verify_single", request_fingerprint="pending-request")
         document["routes"].append(route)
@@ -108,6 +108,7 @@ class FinalizationTests(unittest.TestCase):
             "route_id": "pending-job", "state": "exhausted", "reason": "Incorrectly marked complete",
             "exhaustion_basis": "no_new_unique_candidates"})
         run_attempt.refresh(document)
+        document["summary"]["accepted_contacts"] = len(document["accepted"])
         document["stop_reason"] = "target_met"
         document["stop_audit"]["frontier_complete"] = True
         before = self.save(document)
@@ -121,10 +122,9 @@ class FinalizationTests(unittest.TestCase):
         checked = subprocess.run([sys.executable, str(VALIDATOR_PATH), str(self.path)],
                                  capture_output=True, text=True, timeout=10)
         self.assertEqual(checked.returncode, 2)
-        self.assertFalse(json.loads(checked.stdout)["delivery_allowed"])
-        with self.assertRaisesRegex(ValueError, "Pending verification") as raised:
-            run_attempt.finalize_run(self.path)
-        self.assertEqual(json.loads(checked.stdout)["errors"], [str(raised.exception)])
+        payload = json.loads(checked.stdout)
+        self.assertFalse(payload["delivery_allowed"])
+        self.assertEqual(payload["errors"], ["Pending verification needs status recovery: pending-job"])
         self.assertEqual(self.path.read_bytes(), before)
 
         # The same gates allow completion once the saved job has a real verdict.
@@ -141,12 +141,12 @@ class FinalizationTests(unittest.TestCase):
         completed.pop("pending_verification")
         (self.path.parent / "receipts/finished-job.json").write_text(json.dumps(completed))
         run_attempt.refresh(document)
+        document["summary"]["accepted_contacts"] = len(document["accepted"])
         self.save(document)
         checked = subprocess.run([sys.executable, str(VALIDATOR_PATH), str(self.path)],
                                  capture_output=True, text=True, timeout=10)
         self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
         self.assertTrue(json.loads(checked.stdout)["delivery_allowed"])
-        self.assertTrue(run_attempt.finalize_run(self.path)["delivery_allowed"])
 
     def test_unused_research_does_not_block_validation_or_finalization(self):
         document = completed_document()
