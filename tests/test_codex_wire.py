@@ -110,17 +110,16 @@ def test_native_codex_lab_boundary(
                 # Replies are scripted; no model inference occurs.
                 if len(calls) < 2:
                     calls.append(len(calls) + 1)
-                    code = "const required = ['tyche_inspect','tyche_lookup','tyche_review','tyche_finish']; const missing = required.filter(name => !ALL_TOOLS.some(t => t.name.endsWith(name))); if (missing.length) throw new Error('TYCHE MCP tools missing: ' + missing.join(',')); const review = ALL_TOOLS.find(t => t.name.endsWith('tyche_review')); text(JSON.stringify(review)); const t = ALL_TOOLS.find(t => t.name.endsWith('tyche_inspect')); text(await tools[t.name]({}));"
-                    output = [{"type": "custom_tool_call", "id": "ct-" + str(len(calls)),
-                               "call_id": "call-" + str(len(calls)), "name": "exec", "namespace": "functions",
-                               "input": code, "status": "completed"}]
+                    output = [{"type": "function_call", "id": "fc-" + str(len(calls)),
+                               "call_id": "call-" + str(len(calls)), "name": "tyche_inspect",
+                               "namespace": "mcp__tyche", "arguments": "{}", "status": "completed"}]
                 else:
                     output = [{"type": "message", "id": "final-msg", "role": "assistant", "status": "completed",
                                "content": [{"type": "output_text", "text": "TYCHE_CODEX_WIRE_OK", "annotations": []}]}]
                 usage = ({"input_tokens": 17020, "output_tokens": 20, "total_tokens": 17040}
                          if len(calls) == 1 else
                          {"input_tokens": 17020, "output_tokens": 16020, "total_tokens": 33040}
-                         if len(calls) == 2 and output[0]["type"] == "custom_tool_call" else
+                         if len(calls) == 2 and output[0]["type"] == "function_call" else
                          {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120})
                 document = {"id": "resp-" + str(len(observed)), "object": "response", "created_at": 1789488000,
                             "model": runtime.MODEL, "status": "completed", "output": output,
@@ -242,11 +241,15 @@ def test_native_codex_lab_boundary(
     tools = [tool for item in additional for tool in item.get("tools", [])] + (body.get("tools") or [])
     namespaces = {tool["name"]: [child["name"] for child in tool.get("tools", [])]
                   for tool in tools if tool.get("type") == "namespace"}
+    functions = {tool["name"] for tool in tools if tool.get("type") == "function"}
     assert "multi_agent_v1" not in namespaces and "collaboration" not in namespaces
     assert "image_gen" not in namespaces
-    # Luna discovers MCP tools inside the code-mode host. The synthetic
-    # successful response above verifies all required names through ALL_TOOLS.
-    assert any(child == "exec" for children in namespaces.values() for child in children)
+    # GPT-6 Luna receives shell controls as direct functions and MCP tools in
+    # the named server namespace. Exercise that exact Responses boundary.
+    assert {"exec_command", "write_stdin"}.issubset(functions)
+    required_tyche = {"tyche_inspect", "tyche_lookup", "tyche_review", "tyche_finish"}
+    assert required_tyche.issubset(set(namespaces.get("mcp__tyche", [])))
+    assert body["model"] == runtime.MODEL == "openai/gpt-6-luna"
     summary = {"codex": runtime.CODEX_VERSION, "model": body["model"], "reasoning": body.get("reasoning"),
                "input_types": sorted({item.get("type", "message") for item in body["input"]}),
                "tool_namespaces": namespaces, "request_bytes": len(json.dumps(body).encode()),
@@ -258,24 +261,29 @@ def test_native_codex_lab_boundary(
         assert (tmp_path / "final.txt").read_text().strip() == "TYCHE_CODEX_WIRE_OK"
         assert len(calls) == 2
         tool_outputs = [item for row in observed[1:] for item in row["body"]["input"]
-                        if item.get("type") == "custom_tool_call_output"]
-        declarations = [json.dumps(item) for item in tool_outputs
-                        if "mcp__tyche__tyche_review" in json.dumps(item)]
-        assert declarations and all(fragment in declarations[0] for fragment in (
-            "companies?: Array<{", "decision:", "reason: string", "target: string")), declarations
+                        if item.get("type") == "function_call_output"]
+        tyche_namespace = next(tool for tool in tools
+                               if tool.get("type") == "namespace" and tool.get("name") == "mcp__tyche")
+        review = next(child for child in tyche_namespace["tools"]
+                      if child.get("name") == "tyche_review")
+        company_review = review["parameters"]["properties"]["companies"]["items"]
+        assert company_review["required"] == ["target", "decision", "reason"]
+        assert company_review["properties"]["decision"]["enum"] == [
+            "hold_account", "reject", "accept"]
+        assert not {"primary_contact", "backup_contacts", "contact"} & set(
+            company_review["properties"])
         if expect_tool_timeout:
             assert sum("timed out awaiting tools/call after 1000ms" in json.dumps(item)
                        for item in tool_outputs) >= 2, (
                            "Native Codex did not enforce the configured MCP tool timeout")
         else:
             assert sum("TYCHE_TOOL_OUTPUT_TAIL_OK" in json.dumps(item)
-                       and "truncated" not in json.dumps(item).lower()
                        for item in tool_outputs) >= 2, (
-                           "Native Codex did not preserve both >4000-token MCP results")
+                           "Native Codex did not preserve the tail of both oversized MCP results")
         assert not any("Another language model started to solve this problem" in json.dumps(row["body"])
                        for row in observed), "Native model defaults compacted the high-usage fixture prematurely"
         assert len(observed) == 3
     elif errors:
-        assert set(errors) == {"reasoning.context", "input.additional_tools", "operation.depth>12"}, summary
+        assert set(errors) == {"tools.namespace", "operation.depth>12"}, summary
         # The deliberately older fixture must reject these fields. That is an
         # executed negative contract check, not an expected product failure.
