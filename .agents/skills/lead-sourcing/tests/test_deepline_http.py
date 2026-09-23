@@ -22,7 +22,7 @@ class DeeplineHttpTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "results.json"
-        self.path.write_text(json.dumps({"request": {"target_count": 5, "contact_fields": []},
+        self.path.write_text(json.dumps({"request": {"target_count": 5},
             "accepted": [], "routes": [], "budget": {"policy": "actual_cost", "paid_calls": 0,
                 "limits": {"deepline_credits": 25, "scrapingdog_credits": 0}}}))
         budget.initialize(self.path, max_usd=2.5)

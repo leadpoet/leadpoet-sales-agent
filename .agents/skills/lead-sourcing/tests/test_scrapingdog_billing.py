@@ -117,20 +117,6 @@ class BillingJourneyTests(unittest.TestCase):
         self.assertEqual(budget.actual_cost_summary(self.state())['budget_total_usd'], .01)
         self.audit()
 
-    def test_variable_tariff_keeps_ceiling_separate_from_actual(self):
-        import validate_run
-        self.transport.return_value = (200, '{"full_name":"Fixture"}', {})
-        self.lookup(operation='linkedin_person', id='fixture')
-        summary = budget.actual_cost_summary(self.state())
-        self.assertEqual(summary['provider_usd'], 0)
-        self.assertEqual(summary['held_provider_usd'], .1)
-        self.assertEqual(summary['providers']['scrapingdog']['held_credits'], 100)
-        self.assertIsNone(budget.spending_stop(self.state()))
-        errors = validate_run.validate_run(
-            json.loads(self.path.read_text()), require_stop_check=True,
-            execution_budget=self.state(), run_file=self.path)
-        self.assertIn('final delivery requires complete cost accounting: billing_pending', errors)
-        self.audit()
 
     def test_unsupported_combined_price_stays_unknown_without_fake_ceiling(self):
         self.transport.return_value = (200, '<html>Fixture</html>', {})

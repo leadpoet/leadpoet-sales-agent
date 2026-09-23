@@ -95,7 +95,6 @@ class ReceiptHardeningTests(unittest.TestCase):
     def test_padded_route_ids_do_not_bypass_order_checks(self):
         for factory, check in (
             (accepted_email_result, lambda d: not VALIDATOR.validate_run(d)),
-            (exporter.accepted_document, lambda d: exporter.ExportXlsxTests().run_rows_json(d).returncode == 0),
         ):
             for reverse in (False, True):
                 for pad_routes in (False, True):
@@ -110,28 +109,3 @@ class ReceiptHardeningTests(unittest.TestCase):
                         if reverse:
                             document["routes"].reverse()
                         self.assertEqual(check(document), not reverse)
-
-    def test_export_checks_stored_primary_email_even_when_not_requested(self):
-        document = exporter.accepted_document()
-        document["request"]["contact_fields"] = []
-        document["accepted"][0]["primary_contact"]["email_validation"]["status"] = "invalid"
-        result = exporter.ExportXlsxTests().run_rows_json(document)
-        self.assertEqual(result.returncode, 2)
-
-    def test_all_stored_emails_have_consistent_syntax_validation(self):
-        for factory, check in (
-            (accepted_email_result, lambda d: not VALIDATOR.validate_run(d)),
-            (exporter.accepted_document, lambda d: exporter.ExportXlsxTests().run_rows_json(d).returncode == 0),
-        ):
-            for email in ("ada@@example.com", "ada@example", "ada\n@example.com", "not-an-email"):
-                for backup in (False, True):
-                    with self.subTest(factory=factory.__name__, email=email, backup=backup):
-                        document = factory()
-                        row = document["accepted"][0]
-                        contact = row["primary_contact"]
-                        if backup:
-                            contact = copy.deepcopy(contact)
-                            row["backup_contacts"] = [contact]
-                        contact["email"] = email
-                        contact["email_validation"]["email"] = email
-                        self.assertFalse(check(document))

@@ -8,7 +8,8 @@ import sys
 import tempfile
 import unittest
 
-from test_output_contract import VALIDATOR_PATH, cost_result, shortfall_result
+from test_output_contract import VALIDATOR_PATH, shortfall_result
+from test_client_output import client_document
 from test_stop_policy import STARTED_AT, action
 from linkedin_fixtures import write_linkedin_receipts
 import budget_guard
@@ -16,7 +17,12 @@ import run_attempt
 
 
 def completed_document():
-    document = cost_result([], accepted_contacts=2)
+    document = client_document()
+    document["budget"] = {"policy": "reserved", "limits": {"deepline_credits": 10,
+        "scrapingdog_credits": 0}, "spent": {"deepline_credits": 0,
+        "scrapingdog_credits": 0}, "paid_calls": 0, "status": "within_budget"}
+    document["request"]["budget"] = {"deepline_credits": 10,
+        "scrapingdog_credits": 0, "hard_stop": True}
     document.pop("stop_reason")
     document["stop_audit"] = {"route_frontier": [
         {"route_id": r["route_id"], "state": "exhausted", "reason": "Source reviewed.",
@@ -49,7 +55,7 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual(after["stop_reason"], "target_met")
         self.assertTrue(after["stop_audit"]["frontier_complete"])
         for field in ("accepted", "unresolved", "rejected", "routes", "request", "stop_check"):
-            self.assertEqual(after[field], document[field])
+            self.assertEqual(after.get(field, []), document.get(field, []))
         self.assertEqual(checked["results_sha256"], hashlib.sha256(self.path.read_bytes()).hexdigest())
         first = self.path.read_bytes()
         run_attempt.finalize_run(self.path)

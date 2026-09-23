@@ -19,24 +19,17 @@ EXPORTER_PATH = ROOT / "scripts" / "export_xlsx.mjs"
 CONTRACT_PATH = ROOT / "references" / "output-contract.md"
 
 EXPECTED_COLUMNS = [
-    "Name",
-    "Email",
-    "Role",
     "Company",
-    "LinkedIn",
     "Website",
     "Company LinkedIn",
     "Industry",
     "Sub Industry",
-    "Contact City",
-    "Contact State",
-    "Contact Country",
     "HQ State",
     "HQ Country",
     "Company Employee Range",
     "Description",
+    "Signals",
     "Intent Details",
-    "Phone",
 ]
 
 ROWS_HELPER = """
@@ -224,63 +217,19 @@ class ExportXlsxTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(
             match.group(1).split(","),
-            EXPECTED_COLUMNS[:16] + ["Signals"] + EXPECTED_COLUMNS[16:],
+            EXPECTED_COLUMNS,
         )
 
-    def test_maps_all_contact_and_company_columns(self):
-        result = self.run_rows_json(accepted_document(["email", "phone"]))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["columns"], EXPECTED_COLUMNS)
-        self.assertEqual(len(payload["rows"]), 1)
-        row = payload["rows"][0]
-        self.assertEqual(row["Name"], "Ada Example")
-        self.assertEqual(row["Email"], "ada@example.com")
-        self.assertEqual(row["Role"], "Director of Supply Chain")
-        self.assertEqual(row["Company"], "Example Products, Inc.")
-        self.assertEqual(row["LinkedIn"], "https://www.linkedin.com/in/ada-example")
-        self.assertEqual(row["Website"], "https://www.example.com/products")
-        self.assertEqual(
-            row["Company LinkedIn"],
-            "https://www.linkedin.com/company/example-products",
-        )
-        self.assertEqual(row["Industry"], "Manufacturing")
-        self.assertEqual(row["Sub Industry"], "Consumer products")
-        self.assertEqual(row["Contact City"], "Columbus")
-        self.assertEqual(row["Contact State"], "Ohio")
-        self.assertEqual(row["Contact Country"], "United States")
-        self.assertEqual(row["HQ State"], "Ohio")
-        self.assertEqual(row["HQ Country"], "United States")
-        self.assertEqual(row["Company Employee Range"], "201-500")
-        self.assertEqual(
-            row["Description"], "Makes packaged goods, tools, and accessories."
-        )
-        self.assertIn("Signal: warehouse_system_integration", row["Intent Details"])
-        self.assertIn("Date: 2026-08-12", row["Intent Details"])
-        self.assertIn("inventory visibility & fulfillment", row["Intent Details"])
-        self.assertEqual(row["Phone"], "+1 555 010 0200")
 
     def test_zero_accepted_rows_returns_only_the_fixed_columns(self):
         result = self.run_rows_json(
-            {"request": {"contact_fields": []}, "accepted": []}
+            {"schema_version": "2.0", "request": {"target_count": 1}, "accepted": []}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload, {"columns": EXPECTED_COLUMNS, "rows": []})
 
-    def test_explicitly_unrequested_email_and_phone_stay_blank(self):
-        result = self.run_rows_json(accepted_document([]))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        row = json.loads(result.stdout)["rows"][0]
-        self.assertEqual(row["Email"], "")
-        self.assertEqual(row["Phone"], "")
 
-    def test_omitted_contact_fields_defaults_to_validated_email(self):
-        result = self.run_rows_json(accepted_document())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        row = json.loads(result.stdout)["rows"][0]
-        self.assertEqual(row["Email"], "ada@example.com")
-        self.assertEqual(row["Phone"], "")
 
     def test_requested_missing_contact_field_fails_closed(self):
         document = accepted_document(["email"])
@@ -308,60 +257,7 @@ class ExportXlsxTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("must record its paid Deepline call", result.stderr)
 
-    def test_only_explicit_valid_zerobounce_status_exports(self):
-        for status in ("valid", " VALID ", "Valid"):
-            with self.subTest(status=status):
-                document = accepted_document()
-                document["accepted"][0]["primary_contact"]["email_validation"]["status"] = status
-                result = self.run_rows_json(document)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout)["rows"][0]["Email"], "ada@example.com")
 
-        for status in ("invalid", "catch-all", "spamtrap", "abuse", "do_not_mail", "unknown", " DO_NOT_MAIL ", "new_status"):
-            with self.subTest(status=status):
-                document = accepted_document()
-                document["accepted"][0]["primary_contact"]["email_validation"]["status"] = status
-                result = self.run_rows_json(document)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("status must be valid", result.stderr)
-
-    def test_missing_optional_values_stay_blank(self):
-        document = accepted_document([])
-        company = document["accepted"][0]["company"]
-        contact = document["accepted"][0]["primary_contact"]
-        for key in (
-            "website",
-            "linkedin_url",
-            "industry",
-            "sub_industry",
-            "hq_state",
-            "hq_country",
-            "employee_count",
-            "description",
-        ):
-            company.pop(key)
-        for key in ("linkedin_url", "city", "state"):
-            contact.pop(key)
-        result = self.run_rows_json(document)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        row = json.loads(result.stdout)["rows"][0]
-        self.assertEqual(row["Website"], "https://example.com")
-        # No saved link and a website page in contact_url: the profile URL of the contact's own
-        # receipt-validated evidence is delivered, never a blank for a verified person.
-        self.assertEqual(row["LinkedIn"], contact["location_evidence"]["evidence_url"])
-        self.assertEqual(row["Company LinkedIn"], "")
-        # A company page or a post in contact_url never stands in for the person's profile link: the
-        # validator refuses the row before the exporter writes anything.
-        for other in ("https://www.linkedin.com/company/example-products", "https://www.linkedin.com/posts/example-update"):
-            contact["contact_url"] = other
-            result = self.run_rows_json(document)
-            self.assertEqual(result.returncode, 2, other)
-            self.assertIn("the saved LinkedIn link must be the same LinkedIn /in/ URL", result.stderr)
-        contact["contact_url"] = "https://www.linkedin.com/in/ada-example"
-        result = self.run_rows_json(document)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["rows"][0]["LinkedIn"], "https://www.linkedin.com/in/ada-example")
-        self.assertEqual(row["Company Employee Range"], "201-500")
 
     def test_malformed_accepted_row_fails_closed(self):
         result = self.run_rows_json(
@@ -473,7 +369,6 @@ class ExportXlsxTests(unittest.TestCase):
         )
         result_schema = json.loads(blocks[1])
         company = result_schema["$defs"]["company"]
-        contact = result_schema["$defs"]["contact"]
         self.assertEqual(company["required"], ["canonical_name", "domain", "employee_range", "employee_range_evidence"])
         self.assertTrue(
             {
@@ -487,98 +382,8 @@ class ExportXlsxTests(unittest.TestCase):
                 "description",
             }.issubset(company["properties"])
         )
-        self.assertTrue(
-            {"linkedin_url", "city", "state", "country"}.issubset(
-                contact["properties"]
-            )
-        )
 
 
-    def test_all_complete_contacts_export_in_leads_with_unchanged_company_details(self):
-        from test_contact_policy import contacts_document
-        from test_client_output import client_document
-        from linkedin_fixtures import write_linkedin_receipts
-        node_modules = os.environ.get("TYCHE_WORKSPACE_NODE_MODULES")
-        if not self.node or not node_modules:
-            self.skipTest("Codex workbook runtime is not configured")
-        for version in ("1.1", "1.2"):
-            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
-                source = pathlib.Path(directory) / "results.json"
-                destination = pathlib.Path(directory) / "leads.xlsx"
-                document = contacts_document(6)
-                document["schema_version"] = version
-                row = document["accepted"][0]
-                if version == "1.2":
-                    reference = client_document()
-                    document["retrieved_at"] = reference["retrieved_at"]
-                    for field in ("company", "account_fit", "intent_details", "signal_evidence"):
-                        row[field] = reference["accepted"][0][field]
-                row["backup_contacts"][0].update(current_title="Supply Chain Director",
-                                                city="Toronto", state="Ontario", country="Canada")
-                row["backup_contacts"][0]["location_evidence"]["evidence_text"] = "Toronto, Ontario, Canada"
-                for contact in [row["primary_contact"], *row["backup_contacts"]]:
-                    contact.update(company=row["company"]["canonical_name"],
-                                   source={"provider":"public_web", "operation":"execute", "route_id":"contact-role-1"},
-                                   evidence_url=contact["linkedin_url"], evidence_date="2026-09-01",
-                                   evidence_date_basis="observed_current",
-                                   evidence_text=f"{contact['full_name']} leads supply chain operations.")
-                pending = document["accepted"][0]["backup_contacts"][-1]
-                pending.pop("email")
-                pending.pop("email_validation")
-                source.write_text(json.dumps(document))
-                write_linkedin_receipts(source, document)
-                source.write_text(json.dumps(document))
-                before = source.read_bytes()
-                result = export_workbook(self.node, source, destination, node_modules)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                receipt = json.loads(result.stdout.strip().splitlines()[-1])
-                self.assertTrue(receipt["inspection"]["saved_workbook_values_verified"])
-                self.assertEqual((receipt["rows"], receipt["contacts"]), (5, 5))
-                leads = read_first_sheet_rows(destination)
-                self.assertEqual(len(leads), 6)
-                company_fields = ["Company", "Website", "Company LinkedIn", "Industry", "Sub Industry",
-                                  "HQ State", "HQ Country", "Company Employee Range", "Description", "Intent Details"]
-                if version == "1.2":
-                    company_fields.append("Signals")
-                for field in company_fields:
-                    index = leads[0].index(field)
-                    self.assertTrue(all(lead[index] == leads[1][index] for lead in leads[1:]), field)
-                contact_fields = {"Name":"full_name", "Email":"email", "Role":"current_title",
-                                  "LinkedIn":"linkedin_url", "Contact City":"city",
-                                  "Contact State":"state", "Contact Country":"country"}
-                expected_contacts = [row["primary_contact"], *row["backup_contacts"][:-1]]
-                for lead, contact in zip(leads[1:], expected_contacts):
-                    for column, field in contact_fields.items():
-                        self.assertEqual(lead[leads[0].index(column)], contact[field], column)
-                self.assertEqual(len({lead[1] for lead in leads[1:]}), 5)
-                tag = lambda name: "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}" + name
-                with zipfile.ZipFile(destination) as archive:
-                    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-                    self.assertEqual([sheet.attrib["name"] for sheet in workbook.iter(tag("sheet"))],
-                                     ["Leads", "Sources"] if version == "1.2" else ["Leads"])
-                    self.assertIn(b'A1:S6' if version == "1.2" else b'A1:R6', archive.read("xl/tables/table1.xml"))
-                if version == "1.2":
-                    sources = read_first_sheet_rows(destination, 2)
-                    fields = [source_row[2] for source_row in sources[1:]]
-                    self.assertIn("Role: Buyer 1", fields)
-                    self.assertIn("Contact Location: Buyer 1", fields)
-                    self.assertNotIn("Role: Buyer 5", fields)
-                self.assertEqual(source.read_bytes(), before)
-                # An older record: no saved link and a website page in contact_url. The written cell is the
-                # profile URL of the contact's own receipt-validated evidence, not a blank.
-                legacy = row["backup_contacts"][0]
-                verified = legacy["location_evidence"]["evidence_url"]
-                legacy.pop("linkedin_url"); legacy["contact_url"] = "https://example.com/team/legacy"
-                source.write_text(json.dumps(document))
-                write_linkedin_receipts(source, document)
-                source.write_text(json.dumps(document))
-                again = destination.with_name("leads-legacy.xlsx")
-                result = export_workbook(self.node, source, again, node_modules)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                leads = read_first_sheet_rows(again)
-                column = leads[0].index("LinkedIn")
-                self.assertEqual(leads[2][column], verified)
-                self.assertTrue(all("linkedin.com/in/" in lead[column] for lead in leads[1:]))
 
 
 if __name__ == "__main__":

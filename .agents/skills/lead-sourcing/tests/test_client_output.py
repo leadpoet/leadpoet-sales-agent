@@ -25,6 +25,10 @@ _export_module = importlib.util.module_from_spec(_export_tests)
 _export_tests.loader.exec_module(_export_module)
 accepted_document = _export_module.accepted_document
 EXPECTED_LEGACY_COLUMNS = _export_module.EXPECTED_COLUMNS
+EXPECTED_COMPANY_COLUMNS = [
+    "Company", "Website", "Company LinkedIn", "Industry", "Sub Industry",
+    "HQ State", "HQ Country", "Company Employee Range", "Description", "Signals", "Intent Details",
+]
 
 _validator_spec = importlib.util.spec_from_file_location("client_output_validator", VALIDATOR_PATH)
 assert _validator_spec and _validator_spec.loader
@@ -39,7 +43,7 @@ try {
   const exporter = await import(pathToFileURL(modulePath).href);
   const document = JSON.parse(await fs.readFile(inputPath, "utf8"));
   const before = JSON.stringify(document);
-  const clientOutput = document.schema_version === "1.2";
+  const clientOutput = document.schema_version === "2.0";
   const rows = exporter.rowsFor(document);
   const sources = clientOutput ? exporter.sourcesFor(document) : [];
   const after = JSON.stringify(document);
@@ -66,11 +70,13 @@ def _source(provider: str, route_id: str) -> dict:
     }
 
 
-def client_document(*, date_basis: str = "published", schema_version: str = "1.2") -> dict:
-    document = accepted_document(["email"])
+def client_document(*, date_basis: str = "published", schema_version: str = "2.0") -> dict:
+    document = accepted_document([])
     document["schema_version"] = schema_version
     document["retrieved_at"] = "2026-09-01T12:34:56Z"
     row = document["accepted"][0]
+    if schema_version == "2.0":
+        row.pop("primary_contact", None)
     row["intent_details"] = (
         "Example Products connected its acquired warehouse to a shared WMS on August 12, 2026. "
         "The project covers inventory visibility and fulfillment across the combined operation. "
@@ -97,25 +103,17 @@ def client_document(*, date_basis: str = "published", schema_version: str = "1.2
             "source": _source("public_web", "signal-1"),
         }
     )
-    row["primary_contact"].update(
-        {
-            "requested_role": "Director of Supply Chain",
-            "role_match": "exact",
-            "company": "Example Products, Inc.",
-            "domain": "example.com",
-            "evidence_url": "https://example.com/team/ada",
-            "evidence_date": "2026-08-11",
-            "evidence_date_basis": date_basis,
-            "evidence_text": "Ada leads supply chain operations.",
-            "source": _source("public_web", "contact-1"),
-        }
-    )
-    document["summary"] = {"accepted_companies": 1, "accepted_contacts": 1}
+    document["summary"] = {"accepted_companies": 1}
+    if schema_version == "2.0":
+        document["request"].pop("contact_fields", None)
+    else:
+        document["summary"]["accepted_contacts"] = 1
+        document["request"].update(contact_fields=[], requested_roles=["Director of Supply Chain"])
+        row["primary_contact"].update(requested_role="Director of Supply Chain", role_match="exact")
     document["request"].update(
         {
             "target_count": 1,
             "icp": {"exclusions": ["excluded.test"]},
-            "requested_roles": ["Director of Supply Chain"],
             "time_window": {"max_age_days": 270},
             "budget": {"deepline_credits": 5, "hard_stop": True},
         }
@@ -150,10 +148,10 @@ class ClientOutputTests(unittest.TestCase):
         result = self.run_rows_json(document)
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["legacy"], EXPECTED_LEGACY_COLUMNS)
+        self.assertEqual(payload["legacy"], EXPECTED_COMPANY_COLUMNS)
         self.assertEqual(
             payload["client"],
-            EXPECTED_LEGACY_COLUMNS[:16] + ["Signals"] + EXPECTED_LEGACY_COLUMNS[16:],
+            EXPECTED_COMPANY_COLUMNS,
         )
         self.assertNotIn("Intent Signal", payload["rows"][0])
         row = payload["rows"][0]
@@ -239,14 +237,6 @@ class ClientOutputTests(unittest.TestCase):
                 document["request"]["buying_signals"][0]["importance"] = importance
             self.assertNotEqual(self.run_rows_json(document).returncode, 0)
 
-    def test_legacy_document_keeps_legacy_row_shape_and_values(self):
-        document = accepted_document(["email", "phone"])
-        payload = json.loads(self.run_rows_json(document).stdout)
-        self.assertEqual(payload["legacy"], EXPECTED_LEGACY_COLUMNS)
-        self.assertEqual(set(payload["rows"][0]), set(EXPECTED_LEGACY_COLUMNS))
-        self.assertNotIn("Intent Signal", payload["rows"][0])
-        self.assertEqual(payload["rows"][0]["Intent Details"].split("; ")[0], "Signal: warehouse_system_integration")
-        self.assertTrue(payload["unchanged"])
 
     def test_sources_for_maps_all_evidence_and_preserves_text(self):
         document = client_document()
@@ -274,7 +264,6 @@ class ClientOutputTests(unittest.TestCase):
         self.assertEqual(by_field["Description"]["Company"], "Example Products, Inc.")
         self.assertEqual(by_field["Description"]["Signal"], "")
         self.assertEqual(by_field["Signals"]["Signal"], "warehouse_system_integration")
-        self.assertEqual(by_field["Role"]["Signal"], "")
         self.assertEqual(by_field["employee_count"]["Signal"], "")
         self.assertEqual(by_field["employee_count"]["Evidence Text"], "Exact evidence: 240 employees & growing.")
         self.assertTrue(payload["unchanged"])
@@ -360,7 +349,7 @@ class ClientOutputTests(unittest.TestCase):
         self.assertEqual(industry["Observed On"], "")
 
     def test_sources_for_rejects_missing_required_source_evidence(self):
-        for field in ("account_fit", "signal_evidence", "primary_contact"):
+        for field in ("account_fit", "signal_evidence"):
             with self.subTest(field=field):
                 document = client_document()
                 document["accepted"][0][field].pop("source")

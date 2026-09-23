@@ -13,7 +13,8 @@ def add_linkedin_fields(document):
         company = row["company"]
         company.setdefault("employee_range", "201-500")
         entities = [(company, "employee_range_evidence", "company", company["employee_range"])]
-        for contact in [row["primary_contact"], *row.get("backup_contacts", [])]:
+        for contact in [*([row["primary_contact"]] if row.get("primary_contact") else []),
+                        *row.get("backup_contacts", [])]:
             contact.setdefault("country", "United States")
             entities.append((contact, "location_evidence", "profile", ", ".join(
                 contact[k] for k in ("city", "state", "country") if contact.get(k))))
@@ -51,7 +52,9 @@ def write_linkedin_receipts(run_file, document):
     directory = Path(run_file).parent / "receipts"
     for row in document.get("accepted", []):
         entities = [(row["company"], "employee_range_evidence", "company")]
-        entities += [(c, "location_evidence", "profile") for c in [row["primary_contact"], *row.get("backup_contacts", [])]]
+        entities += [(c, "location_evidence", "profile") for c in
+                     [*([row["primary_contact"]] if row.get("primary_contact") else []),
+                      *row.get("backup_contacts", [])]]
         for entity, field, kind in entities:
             evidence = entity[field]
             source = evidence["source"]

@@ -132,7 +132,7 @@ class PageReaderResponseTests(unittest.TestCase):
             self.assertEqual(live, replay)
             self.assertEqual(captured[0]['body'], body)
 
-    def test_successful_content_with_unknown_billing_still_pauses_paid_work(self):
+    def test_successful_content_with_unknown_billing_preserves_pending_charge_and_allows_confirmed_cost_work(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'results.json'
             path.write_text(json.dumps({'run_id': 'fixture', 'request': {'target_count': 5},
@@ -147,5 +147,10 @@ class PageReaderResponseTests(unittest.TestCase):
             self.assertEqual(state['calls']['page']['state'], 'pending_billing')
             self.assertIsNone(state['calls']['page']['actual_credits'])
             self.assertEqual(budget.spending_stop(state), 'billing_pending')
-            budget.guarded_call({'spend': {'run_file': str(path), 'route_id': 'next'}},
-                'deepline', lambda: self.fail('Unknown billing must pause dispatch'))
+            followup, code = budget.guarded_call({'spend': {'run_file': str(path), 'route_id': 'next'}},
+                'deepline', lambda: ({'status': 'ok', 'billing': {'credits_charged': .1,
+                    'cost_usd': .01, 'pricing_status': 'final'}}, 0))
+            self.assertEqual((followup['status'], code), ('ok', 0))
+            state = budget.load_ledger(path)
+            self.assertEqual(state['calls']['page']['state'], 'pending_billing')
+            self.assertEqual(state['calls']['next']['actual_credits'], '0.1')

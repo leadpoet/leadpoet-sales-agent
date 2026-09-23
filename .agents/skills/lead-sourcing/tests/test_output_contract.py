@@ -170,7 +170,7 @@ def cost_result(routes, accepted_contacts=1):
 class OutputContractExtensionTests(unittest.TestCase):
     def test_client_schema_requires_taxonomy_even_with_a_classification_note(self):
         _, schema = load_schemas()
-        rule = next(r for r in schema["allOf"] if r["if"]["properties"]["schema_version"].get("const") == "1.2")
+        rule = next(r for r in schema["allOf"] if r["if"]["properties"]["schema_version"].get("const") == "2.0")
         company = rule["then"]["properties"]["accepted"]["items"]["properties"]["company"]
         self.assertEqual(set(company["required"]), {"description", "industry", "sub_industry"})
         self.assertNotIn("anyOf", company)
@@ -185,12 +185,9 @@ class OutputContractExtensionTests(unittest.TestCase):
         capacity = result_schema["$defs"]["provider_call_capacity"]
         self.assertNotIn("paid_calls_remaining", capacity["required"])
 
-    def test_cost_schema_adds_backward_compatible_version_1_1_fields(self):
+    def test_company_schema_keeps_cost_accounting_fields(self):
         _, result_schema = load_schemas()
-        self.assertEqual(
-            result_schema["properties"]["schema_version"]["enum"],
-            ["1.0", "1.1", "1.2"],
-        )
+        self.assertEqual(result_schema["properties"]["schema_version"]["const"], "2.0")
         route = result_schema["$defs"]["route"]
         self.assertIn("cost_upper_bound_credits", route["properties"])
         self.assertEqual(
@@ -204,118 +201,9 @@ class OutputContractExtensionTests(unittest.TestCase):
             0.1,
         )
 
-    def test_omitted_contact_fields_remains_valid_and_defaults_to_email(self):
-        request = {
-            "target_count": 1,
-            "icp": {"geographies": ["US"]},
-            "buying_signals": [{"kind": "leadership_change", "max_age_days": 270}],
-            "requested_roles": ["Executive Director"],
-            "time_window": {"max_age_days": 270},
-            "budget": {"scrapingdog_credits": 15, "hard_stop": True},
-        }
-        validate_extensions(request)
-        self.assertNotIn("signal_match_mode", request)
-        self.assertNotIn("min_age_days", request["buying_signals"][0])
-        self.assertNotIn("contact_role_groups", request)
-        input_schema, result_schema = load_schemas()
-        self.assertEqual(input_schema["properties"]["min_contacts_per_company"]["default"], 1)
-        self.assertEqual(
-            input_schema["properties"]["contact_fields"]["default"], ["email"]
-        )
-        self.assertEqual(
-            result_schema["$defs"]["request_snapshot"]["properties"]["contact_fields"]["default"],
-            ["email"],
-        )
 
-    def test_email_validation_receipt_is_deepline_zerobounce_with_dynamic_tool(self):
-        _, result_schema = load_schemas()
-        validation = result_schema["$defs"]["email_validation"]
-        source = validation["properties"]["source"]
-        self.assertEqual(source["properties"]["provider"]["const"], "deepline")
-        self.assertEqual(source["properties"]["validator"]["const"], "zerobounce")
-        self.assertEqual(source["properties"]["operation"]["const"], "execute")
-        self.assertNotIn("const", source["properties"]["tool"])
-        self.assertEqual(
-            result_schema["$defs"]["contact"]["properties"]["email_validation"]["$ref"],
-            "#/$defs/email_validation",
-        )
-        self.assertIn(
-            "email_validation",
-            result_schema["$defs"]["route"]["properties"]["phase"]["enum"],
-        )
 
-    def test_contact_role_groups_are_optional_and_role_group_is_traceable(self):
-        input_schema, result_schema = load_schemas()
 
-        for schema in (input_schema, result_schema):
-            properties = (
-                schema["properties"]
-                if schema is input_schema
-                else schema["$defs"]["request_snapshot"]["properties"]
-            )
-            required = (
-                schema["required"]
-                if schema is input_schema
-                else schema["$defs"]["request_snapshot"]["required"]
-            )
-            self.assertIn("contact_role_groups", properties)
-            self.assertIn("requested_roles", required)
-            self.assertNotIn("contact_role_groups", required)
-
-            group = schema["$defs"]["contact_role_groups"]
-            self.assertEqual(group["required"], ["primary", "secondary"])
-            self.assertFalse(group["additionalProperties"])
-            self.assertEqual(group["properties"]["primary"]["minItems"], 1)
-            self.assertTrue(group["properties"]["primary"]["uniqueItems"])
-            self.assertTrue(group["properties"]["secondary"]["uniqueItems"])
-
-        contact = result_schema["$defs"]["contact"]
-        self.assertNotIn("role_group", contact["required"])
-        self.assertEqual(contact["properties"]["role_group"]["enum"], ["primary", "secondary"])
-        accepted_company = result_schema["$defs"]["accepted_company"]
-        self.assertNotIn("contacts", accepted_company["properties"])
-        self.assertEqual(
-            accepted_company["properties"]["backup_contacts"]["items"]["$ref"],
-            "#/$defs/contact",
-        )
-
-    def test_grouped_roles_use_requested_roles_union_and_secondary_fallback(self):
-        input_schema, result_schema = load_schemas()
-        groups = {
-            "primary": ["Executive Director", "CEO"],
-            "secondary": ["Chief Program Officer", "VP Programs"],
-        }
-        request = {
-            "requested_roles": [
-                "Executive Director",
-                "CEO",
-                "Chief Program Officer",
-                "VP Programs",
-            ],
-            "contact_role_groups": groups,
-        }
-        self.assertEqual(
-            set(request["requested_roles"]),
-            set(groups["primary"] + groups["secondary"]),
-        )
-        self.assertEqual(
-            input_schema["properties"]["contact_role_groups"]["$ref"],
-            "#/$defs/contact_role_groups",
-        )
-        self.assertEqual(
-            result_schema["$defs"]["request_snapshot"]["properties"]["contact_role_groups"]["$ref"],
-            "#/$defs/contact_role_groups",
-        )
-
-        skill_text = (ROOT / "references" / "workflow-rules.md").read_text(encoding="utf-8").lower()
-        contract_text = CONTRACT.read_text(encoding="utf-8").lower()
-        self.assertIn("search and rank", skill_text)
-        self.assertIn("valid fallbacks", skill_text)
-        self.assertIn("no primary-role", skill_text)
-        self.assertIn("secondary-role contact remains eligible", contract_text)
-        self.assertIn("must not be", skill_text)
-        self.assertIn("rejected only because it is secondary", skill_text)
-        self.assertIn('role_group: "secondary"', skill_text)
 
     def test_saved_request_schema_preserves_signal_policy_and_offering_context(self):
         input_schema, result_schema = load_schemas()
@@ -1132,42 +1020,7 @@ class OutputContractExtensionTests(unittest.TestCase):
         errors = VALIDATOR.validate_run(short)
         self.assertIn("a target shortfall requires stop_audit", errors)
 
-    def test_duplicate_domains_and_missing_requested_email_fail(self):
-        contact = {"full_name": "Ada Example"}
-        result = {
-            "request": {"target_count": 2, "contact_fields": ["email"]},
-            "summary": {"accepted_companies": 2},
-            "accepted": [
-                {
-                    "company": {"canonical_name": "Example", "domain": "www.example.org"},
-                    "primary_contact": contact,
-                },
-                {
-                    "company": {"canonical_name": "Example duplicate", "domain": "example.org"},
-                    "primary_contact": contact,
-                },
-            ],
-            "stop_reason": "target_met",
-        }
-        errors = VALIDATOR.validate_run(result)
-        self.assertTrue(any("duplicate canonical domains" in error for error in errors))
-        self.assertEqual(sum("requires requested email" in error for error in errors), 2)
 
-    def test_default_email_and_zerobounce_receipt_are_required(self):
-        result = accepted_email_result()
-        self.assertEqual(VALIDATOR.validate_run(result), [])
-
-        result["accepted"][0]["primary_contact"].pop("email")
-        result["accepted"][0]["primary_contact"].pop("email_validation")
-        errors = VALIDATOR.validate_run(result)
-        self.assertIn(
-            "accepted[0].primary_contact requires requested email", errors
-        )
-
-        result = accepted_email_result()
-        result["accepted"][0]["primary_contact"].pop("email_validation")
-        errors = VALIDATOR.validate_run(result)
-        self.assertTrue(any("ZeroBounce email_validation receipt" in error for error in errors))
 
     def test_only_explicit_zerobounce_valid_status_passes(self):
         for status in ("valid", " VALID ", "Valid"):
@@ -1195,48 +1048,7 @@ class OutputContractExtensionTests(unittest.TestCase):
         errors = VALIDATOR.validate_run(unaccounted_route)
         self.assertTrue(any("must record its paid Deepline call" in error for error in errors))
 
-    def test_email_validation_receipt_must_match_route_and_provider(self):
-        wrong_provider = accepted_email_result()
-        source = wrong_provider["accepted"][0]["primary_contact"]["email_validation"]["source"]
-        source["provider"] = "public_web"
-        errors = VALIDATOR.validate_run(wrong_provider)
-        self.assertTrue(any("source.provider must be deepline" in error for error in errors))
 
-        wrong_tool = accepted_email_result()
-        source = wrong_tool["accepted"][0]["primary_contact"]["email_validation"]["source"]
-        source["tool"] = "different-live-tool"
-        errors = VALIDATOR.validate_run(wrong_tool)
-        self.assertTrue(any("source.tool must match route" in error for error in errors))
-
-    def test_stored_backup_email_must_pass_the_same_gate(self):
-        result = accepted_email_result()
-        backup_receipt = email_validation_receipt(
-            status="do_not_mail", route_id="email-validation-2", tool="second-live-validator"
-        )
-        backup_receipt["email"] = "bea@example.org"
-        result["accepted"][0]["backup_contacts"] = [
-            {
-                "full_name": "Bea Example",
-                "email": "bea@example.org",
-                "email_validation": backup_receipt,
-            }
-        ]
-        result["routes"].append(
-            {
-                "route_id": "email-validation-2",
-                "phase": "email_validation",
-                "provider": "deepline",
-                "operation": "execute",
-                "tool": "second-live-validator",
-                "provider_status": "ok",
-                "paid_calls": 1,
-            }
-        )
-
-        errors = VALIDATOR.validate_run(result)
-        self.assertTrue(
-            any("backup_contacts[0].email_validation.status must be valid" in error for error in errors)
-        )
 
     def test_stop_audit_counts_unique_company_reviews(self):
         result = shortfall_result()

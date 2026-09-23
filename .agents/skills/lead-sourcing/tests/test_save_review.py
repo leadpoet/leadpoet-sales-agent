@@ -94,7 +94,7 @@ class SaveReviewTests(unittest.TestCase):
     def test_unclassified_company_stays_unresolved_and_acceptance_is_atomic(self):
         from test_client_output import client_document
         document = copy.deepcopy(self.doc)
-        document["schema_version"] = "1.2"
+        document["schema_version"] = "2.0"
         accepted = client_document()["accepted"][0]
         domain = accepted["company"]["domain"]
         accepted["company"].pop("industry")
@@ -142,46 +142,7 @@ class SaveReviewTests(unittest.TestCase):
             runner.save_review(self.path, {"routes": [{"route_id": "pending-drawings", "reason": "Cannot close without a receipt"}]})
         self.assertEqual(self.path.read_bytes(), before)
 
-    def test_company_transitions_keep_email_failures_and_other_company_data(self):
-        self.attempt()
-        doc = json.loads(self.path.read_text())
-        email_failure = {"stage": "email_validation", "reason_code": "email_invalid",
-                         "candidate": {"domain": "builder.example", "email": "bad@builder.example"}}
-        doc["rejected"] = [email_failure]
-        self.path.write_text(json.dumps(doc))
-        row = company("builder.example")
-        row["qualification_checks"][1].update(status="fail", evidence=[{"url": "https://builder.example/project", "text": "Not a buyer"}])
-        row["reason_code"] = "not_icp_fit"
-        runner.save_review(self.path, {"companies": [{"state": "rejected", "row": row}]})
-        saved = json.loads(self.path.read_text())
-        self.assertIn(email_failure, saved["rejected"])
-        self.assertIn(company("untouched.example"), saved["unresolved"])
-        self.assertEqual(saved["summary"]["unresolved_rows"], 1)
-        self.assertEqual(saved["summary"]["rejected_rows"], 2)
 
-    def test_account_demotion_retires_unsent_contact_work_but_keeps_recovery(self):
-        self.attempt()
-        doc = json.loads(self.path.read_text())
-        doc["stop_check"]["next_actions"] = [
-            dict(fixtures.action("stale-email", scope="builder.example"), phase="email_validation"),
-            dict(fixtures.action("pending-contact", scope="builder.example"), phase="contact_verification"),
-            dict(fixtures.action("other-company", scope="untouched.example"), phase="account_verification")]
-        doc["stop_audit"]["route_frontier"].append({"route_id": "pending-contact", "scope": "builder.example",
-            "state": "untried", "phase": "contact_verification", "provider": "public_web", "operation": "search",
-            "request_summary": "Previously planned profile check", "reason": "Pending source", "approach": "profile"})
-        self.path.write_text(json.dumps(doc))
-        ledger = self.path.with_suffix(".json.budget.json").read_bytes()
-        receipt = (self.path.parent / "receipts/review-source.json").read_bytes()
-        result = runner.save_review(self.path, {"companies": [{"state": "unresolved", "row": company("builder.example")}],
-            "next_actions": [dict(fixtures.action("stale-finder", scope="builder.example"), phase="contact_discovery"),
-                             dict(fixtures.action("new-account-evidence", scope="builder.example"), phase="account_verification")]})
-        self.assertEqual({a["id"] for a in result["next_actions"]},
-                         {"pending-contact", "new-account-evidence", "other-company"})
-        saved = json.loads(self.path.read_text())
-        self.assertEqual(saved["stop_audit"]["route_frontier"], doc["stop_audit"]["route_frontier"])
-        self.assertEqual(saved["routes"], doc["routes"])
-        self.assertEqual(self.path.with_suffix(".json.budget.json").read_bytes(), ledger)
-        self.assertEqual((self.path.parent / "receipts/review-source.json").read_bytes(), receipt)
 
     def test_size_is_checked_against_saved_icp_for_passes_and_rejections(self):
         for count, size_status, error in ((3, "pass", False), (3, "fail", True),
@@ -198,35 +159,7 @@ class SaveReviewTests(unittest.TestCase):
         doc["unresolved"][0]["stage"] = "account"
         self.assertEqual(VALIDATOR.qualification_errors(doc), [])
 
-    def test_incomplete_accepted_lead_is_refused_without_retiring_contact_work(self):
-        doc = json.loads(self.path.read_text())
-        doc["schema_version"] = "1.2"
-        doc["request"]["contact_fields"] = ["email"]
-        doc["stop_check"]["next_actions"] = [dict(fixtures.action("find-email", scope="builder.example"), approach="buyer-email")]
-        self.path.write_text(json.dumps(doc));before = self.path.read_bytes()
-        row = {"company": {"canonical_name": "Builder", "domain": "builder.example"}}
-        with self.assertRaisesRegex(ValueError, "primary_contact|intent_details"):
-            runner.save_review(self.path, {"companies": [{"state": "accepted", "row": row}]})
-        self.assertEqual(self.path.read_bytes(), before)
-        row.update(intent_details="Current steel project", primary_contact={"full_name": "Example Buyer"})
-        row["company"]["classification_note"] = "Unclassified"
-        with self.assertRaisesRegex(ValueError, "requested email"):
-            runner.save_review(self.path, {"companies": [{"state": "accepted", "row": row}]})
-        self.assertEqual(self.path.read_bytes(), before)
-        row["primary_contact"].update(email="buyer@builder.example")
-        with self.assertRaisesRegex(ValueError, "email_validation"):
-            runner.save_review(self.path, {"companies": [{"state": "accepted", "row": row}]})
-        self.assertEqual(self.path.read_bytes(), before)
 
-    def test_partial_email_job_requires_status_recovery_instead_of_exhaustion(self):
-        self.attempt()
-        doc = json.loads(self.path.read_text());doc["routes"][-1]["provider_status"] = "partial"
-        self.path.write_text(json.dumps(doc));before = self.path.read_bytes()
-        rp = self.path.parent / "receipts/review-source.json";receipt = json.loads(rp.read_text())
-        receipt.update(status="partial", pending_verification={"job_id": "already-dispatched"});rp.write_text(json.dumps(receipt))
-        with self.assertRaisesRegex(ValueError, "status continuation"):
-            runner.save_review(self.path, {"routes": [{"route_id": "review-source", "reason": "No rows yet"}]})
-        self.assertEqual(self.path.read_bytes(), before)
 
 
 if __name__ == "__main__":

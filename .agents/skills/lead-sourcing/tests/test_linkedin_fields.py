@@ -109,19 +109,6 @@ class LinkedInFieldContractTests(unittest.TestCase):
         if valid:
             return json.loads(result.stdout)["rows"][0]
 
-    def test_country_required_but_city_state_optional_after_email_opt_out(self):
-        document = client_document()
-        document["request"]["contact_fields"] = []
-        contact = document["accepted"][0]["primary_contact"]
-        contact.pop("city")
-        contact.pop("state")
-        row = self.check_fields(document, True)
-        self.assertEqual(row["Contact City"], "")
-        self.assertEqual(row["Contact State"], "")
-        self.assertEqual(row["Contact Country"], "United States")
-        for value in (None, "", " ", "Unknown", "Remote", 42):
-            contact["country"] = value
-            self.check_fields(document, False, ".country")
 
     def test_range_required_and_exact_count_is_never_a_fallback(self):
         document = client_document()
@@ -135,7 +122,7 @@ class LinkedInFieldContractTests(unittest.TestCase):
         self.assertEqual(self.check_fields(document, True)["Company Employee Range"], "1001-5000")
 
     def test_field_evidence_must_match_harvest_getter_and_entity(self):
-        for owner, field in (("company", "employee_range_evidence"), ("primary_contact", "location_evidence")):
+        for owner, field in (("company", "employee_range_evidence"),):
             for mutation in ("missing", "wrong_entity", "other_provider", "failed_route", "search_route", "missing_date"):
                 with self.subTest(owner=owner, mutation=mutation):
                     document = client_document()
@@ -150,13 +137,6 @@ class LinkedInFieldContractTests(unittest.TestCase):
                     else: route["tool"] = evidence["source"]["tool"] = "harvestapi_search_posts"
                     self.check_fields(document, False, field)
 
-    def test_backup_country_gate_and_sources_export(self):
-        document = client_document()
-        contact = document["accepted"][0]["primary_contact"]
-        backup = copy.deepcopy(contact)
-        backup.pop("country")
-        document["accepted"][0]["backup_contacts"] = [backup]
-        self.check_fields(document, False, "backup_contacts[0].country")
 
     def test_company_size_uses_entire_range_and_ignores_exact_count(self):
         document = client_document()

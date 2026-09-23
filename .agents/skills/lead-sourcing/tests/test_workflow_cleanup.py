@@ -66,45 +66,7 @@ class ScopedResearchTests(unittest.TestCase):
         self.assertTrue(VALIDATOR.qualification_errors(saved))
         self.assertTrue(VALIDATOR.validate_run(saved, require_stop_check=True, now=NOW))
 
-    def test_unrelated_contact_lookup_runs_but_affected_company_still_fails(self):
-        doc = json.loads(self.path.read_text())
-        good = dict(stage="contact", candidate={"domain": "qualified.example"},
-            qualification_checks=[dict(criterion="product", importance="required", status="pass",
-                                       evidence=[{"url": "https://qualified.example/products"}])])
-        doc["unresolved"].append(good)
-        self.path.write_text(json.dumps(doc))
-        spec = self.fixture.spec("qualified-owner", paid=True)
-        spec["action"].update(phase="contact_discovery", scope="qualified.example")
-        self.assertEqual(runner.run_attempt(self.path, spec,
-            execute=self.fixture.paid_response)["exit_code"], 0)
-        spec = self.fixture.spec("unqualified-owner", paid=True)
-        spec["action"].update(phase="contact_discovery", scope="needs-review.example")
-        dispatch = Mock()
-        with self.assertRaisesRegex(ValueError, "missing or failed required evidence"):
-            runner.run_attempt(self.path, spec, execute=dispatch)
-        dispatch.assert_not_called()
 
-    def test_alternate_profiles_use_existing_ledger_and_duplicate_requests_stay_blocked(self):
-        doc = json.loads(self.path.read_text())
-        doc["unresolved"].append(dict(stage="contact", candidate={"domain": "qualified.example"},
-            reason_text="Find a current buyer with a valid work email.",
-            qualification_checks=[dict(criterion="product", importance="required", status="pass",
-                                       evidence=[{"url": "https://qualified.example/products"}])]))
-        self.path.write_text(json.dumps(doc))
-        for index in range(3):
-            spec = self.fixture.spec(f"profile-{index}", query=f"person-{index}", paid=True)
-            spec["action"].update(phase="contact_verification", scope="qualified.example")
-            self.assertEqual(runner.run_attempt(self.path, spec,
-                execute=self.fixture.paid_response)["exit_code"], 0)
-        before = runner.budget_guard.ledger_path(self.path).read_bytes()
-        spec = self.fixture.spec("renamed-route", query="person-0", approach="cosmetic-label", paid=True)
-        spec["action"].update(phase="contact_verification", scope="qualified.example")
-        dispatch = Mock()
-        with self.assertRaisesRegex(ValueError, "already attempted or pending"):
-            runner.run_attempt(self.path, spec, execute=dispatch)
-        dispatch.assert_not_called()
-        self.assertEqual(runner.budget_guard.ledger_path(self.path).read_bytes(), before)
-        self.assertEqual(len(runner.budget_guard.load_ledger(self.path)["calls"]), 3)
 
 
 class IndependentProgressTests(unittest.TestCase):

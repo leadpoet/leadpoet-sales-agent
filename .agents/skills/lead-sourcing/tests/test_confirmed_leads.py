@@ -78,7 +78,7 @@ class ConfirmedLeadTests(unittest.TestCase):
     def test_partial_projection_rechecks_saved_receipt_evidence(self):
         self.approve(self.add(1))
         document = self.tools._document()
-        rid = document["accepted"][0]["primary_contact"]["source"]["route_id"]
+        rid = document["accepted"][0]["company"]["employee_range_evidence"]["source"]["route_id"]
         (self.path.parent / "receipts" / (rid + ".json")).unlink()
         with self.assertRaises(ValueError):
             confirmed_leads.export_view(self.path, document)
@@ -123,12 +123,10 @@ class ConfirmedLeadTests(unittest.TestCase):
 
     def add(self, number, *, signal_text=None, intent_details=None, accept=True):
         row = copy.deepcopy(self.template["accepted"][0])
-        company, person = row["company"], row["primary_contact"]
+        company = row["company"]
         target = f"example{number}.com"
         company_url = f"https://www.linkedin.com/company/example-products-{number}/"
-        person_url = f"https://www.linkedin.com/in/ada-example-{number}/"
         name = f"Example Products {number}"
-        email = "ada@" + target
 
         def lookup(**options):
             return self.tools.call("tyche_lookup", {"checks": [check(target, **options)]})["lookups"][0]["results"][0]["ref"]
@@ -142,7 +140,8 @@ class ConfirmedLeadTests(unittest.TestCase):
             text=row["account_fit"]["evidence_text"], date=row["account_fit"]["evidence_date"])
         signal = captured_page(self.tools, self.provider, target=target, url=f"https://{target}/integration",
             text=signal_text or row["signal_evidence"]["evidence_text"], date=row["signal_evidence"]["evidence_date"])
-        self.tools.call("tyche_review", {"companies": [{"target": target, "decision": "qualify_account",
+        return self.tools.call("tyche_review", {"companies": [{"target": target,
+            "decision": "accept" if accept else "hold_account",
             "reason": "Captured business and integration evidence reviewed",
             "company": {"ref": selected, **{k: company[k] for k in ("industry", "sub_industry", "description", "classification_note")}},
             "account_fit": {"ref": fit, "fit_claim": row["account_fit"]["fit_claim"]},
@@ -152,18 +151,6 @@ class ConfirmedLeadTests(unittest.TestCase):
                 "claim": "Integrated an acquired warehouse", "evidence": [{"ref": signal, "event_date": "2026-08-12"}]}],
             "intent_details": intent_details or row["intent_details"]}],
             "sources": [{"refs": [fit, signal], "state": "exhausted", "reason": "Captured source passages reviewed"}]})
-        self.provider.raw = {"status": "ok", "element": {"linkedinUrl": person_url,
-            "firstName": "Ada", "lastName": "Example", "email": email, "currentPosition": [{"companyName": name,
-                "title": person["current_title"], "companyLinkedinUrl": company_url}],
-            "location": {"parsed": {"city": "Columbus", "state": "Ohio", "countryFull": "United States"}}}}
-        profile = lookup(phase="contact_verification", tool="harvestapi_get_profile", inputs={"url": person_url})
-        self.tools.call("tyche_review", {"companies": [{"target": target, "decision": "hold_contact",
-            "reason": "Current buyer verified; email verification remains",
-            "primary_contact": {"ref": profile, "requested_role": person["requested_role"], "role_match": "exact"}}]})
-        self.provider.raw = {"status": "ok", "data": {"address": email, "status": "valid", "sub_status": ""}}
-        email_ref = lookup(phase="email_validation", tool="zerobounce_validate", inputs={"email": email})
-        return self.tools.call("tyche_review", {"companies": [{"target": target, "decision": "accept" if accept else "hold_contact",
-            "reason": "Company, signal, buyer and exact email verified", "primary_contact": {"email_ref": email_ref}}]})
 
     def approve(self, packet):
         self.assertEqual(packet["status"], "review_required", packet)
@@ -259,7 +246,7 @@ class ConfirmedLeadTests(unittest.TestCase):
         self.assertNotEqual(fresh["review_ref"], final["review_ref"])
         self.assertEqual(self.file()["review_findings"], [])
 
-    def test_correcting_optional_status_keeps_lead_contact_and_receipts(self):
+    def test_correcting_optional_status_keeps_company_and_receipts(self):
         passage = "Example completed warehouse integration on August 12, 2026. Additional equipment will be consolidated next year."
         original = self.template["accepted"][0]["intent_details"]
         draft = original + " Additional equipment has already been consolidated."
@@ -282,7 +269,7 @@ class ConfirmedLeadTests(unittest.TestCase):
         self.tools.review(review_ref=fresh["review_ref"], review_findings=findings)
         saved = self.file()["leads"][0]
         self.assertEqual(saved["intent_details"], corrected)
-        for field in ("company", "primary_contact", "qualification_checks"):
+        for field in ("company", "qualification_checks"):
             self.assertEqual(saved[field], before[field])
         self.assertEqual(budget_guard.ledger_path(self.path).read_bytes(), ledger)
         self.assertEqual(len(self.provider.requests), calls)
@@ -386,8 +373,8 @@ class ConfirmedLeadTests(unittest.TestCase):
         self.assertEqual(self.file()["leads"], [])
         self.assertEqual(self.tools.review(review_ref=changed["review_ref"])["status"], "review_required")
         self.approve(revised)
-        self.tools.call("tyche_review", {"companies": [{"target": "example1.com", "decision": "hold_contact",
-            "reason": "New evidence requires another buyer review"}]})
+        self.tools.call("tyche_review", {"companies": [{"target": "example1.com", "decision": "hold_account",
+            "reason": "New evidence requires another company review"}]})
         self.assertEqual(self.file()["leads"], [])
         self.assertEqual(len(json.loads(self.path.read_text())["unresolved"]), 1)
 
@@ -414,17 +401,6 @@ class ConfirmedLeadTests(unittest.TestCase):
         self.approve(second)
         self.assertEqual(self.file()["confirmed_count"], 2)
         self.assertEqual(len(self.provider.requests), calls)
-
-    def test_unverified_email_never_enters_confirmed_file(self):
-        self.approve(self.add(1))
-        self.add(2)
-        saved = json.loads(self.path.read_text())
-        saved["accepted"][1]["primary_contact"]["email_validation"]["status"] = "invalid"
-        self.path.write_text(json.dumps(saved))
-        blocked = self.tools.call("tyche_review", {})
-        self.assertEqual(blocked["status"], "needs_repair")
-        self.assertTrue(blocked["errors"])
-        self.assertEqual(self.file()["confirmed_count"], 1)
 
     def test_spending_pause_does_not_discard_a_completed_lead(self):
         packet = self.add(1)
@@ -466,7 +442,7 @@ class ConfirmedLeadTests(unittest.TestCase):
         packet = self.add(1)
         with self.assertRaisesRegex(ValueError, "separately"):
             self.tools.call("tyche_review", {"review_ref": packet["review_ref"], "companies": [
-                {"target": "example1.com", "decision": "hold_contact", "reason": "Recheck"}]})
+                {"target": "example1.com", "decision": "hold_account", "reason": "Recheck"}]})
         self.assertEqual(self.file()["leads"], [])
 
     def test_foreign_or_corrupted_snapshot_is_preserved(self):

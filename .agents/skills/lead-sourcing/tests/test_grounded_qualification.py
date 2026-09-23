@@ -20,14 +20,15 @@ class GroundedQualificationTests(unittest.TestCase):
         self.provider = FixtureProvider()
         self.tools = ResearchTools(self.path, execute=self.provider)
         self.request = {
-            'target_count': 1, 'as_of_date': '2026-09-17', 'contact_fields': [],
+            'target_count': 1, 'as_of_date': '2026-09-17',
             'icp': {'company_types': ['Private Equity'],
                     'industries': ['Industrial manufacturing', 'Contract manufacturing'],
                     'geographies': ['United States, Midwest']},
-            'requested_roles': ['Operations leader'],
             'buying_signals': [{'kind': 'FACILITY_OPENING', 'importance': 'required',
                                'max_age_days': 365, 'query': 'Opened, expanded capacity or completed an acquisition'}]}
         self.tools.start(self.request, max_usd=1)
+        self.company_ref = self.tools.lookup([check(tool='harvestapi_get_company',
+            inputs={'url': 'https://www.linkedin.com/company/examplepay/'})])['lookups'][0]['results'][0]['ref']
 
     def evidence(self, **kwargs):
         ref = captured_page(self.tools, self.provider, **kwargs)
@@ -102,7 +103,7 @@ class GroundedQualificationTests(unittest.TestCase):
         self.assertGreater(sources[ref]['total_characters'], 12000)
         self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
 
-    def test_all_company_filters_gate_contact_work_and_reuse_one_capture(self):
+    def test_all_company_filters_gate_acceptance_and_reuse_one_capture(self):
         body = 'The PE-backed manufacturer operates a machining plant in Ohio. It completed an acquisition on April 20, 2026.'
         evidence, ref = self.evidence(date='2026-04-20', text=body)
         requirements = self.tools.inspect(field='requirements')['requirements']
@@ -113,8 +114,11 @@ class GroundedQualificationTests(unittest.TestCase):
                    'evidence': [{'ref': ref}]} for r in filters]
         checks.append({'requirement_ref': 'signal:0', 'status': 'pass', 'claim': 'Completed acquisition',
                        'evidence': [{'ref': ref, 'event_date': '2026-04-20'}]})
-        finding = {'target': 'example.test', 'decision': 'qualify_account', 'reason': 'Reviewed criteria',
-                   'qualification_checks': checks}
+        finding = {'target': 'example.test', 'decision': 'accept', 'reason': 'Reviewed criteria',
+                   'company': {'ref': self.company_ref, 'industry': 'Manufacturing', 'sub_industry': 'Textiles',
+                       'description': 'ExamplePay manufactures industrial products. It operates production facilities in the Midwest.'},
+                   'account_fit': {'ref': ref}, 'qualification_checks': checks,
+                   'intent_details': 'ExamplePay completed an acquisition in April 2026. The combined operation may require new coordination.'}
         for omitted in range(3):
             partial = copy.deepcopy(finding)
             partial['qualification_checks'].pop(omitted)
@@ -124,9 +128,9 @@ class GroundedQualificationTests(unittest.TestCase):
             self.assertEqual((self.path.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
         self.tools.review(companies=[finding])
         document = json.loads(self.path.read_text())
-        self.assertEqual(document['unresolved'][0]['stage'], 'contact')
+        self.assertEqual(document['accepted'][0]['company']['domain'], 'example.test')
         self.assertEqual(document['request']['icp'], self.request['icp'])
-        self.assertEqual(len([r for r in self.provider.requests if r['operation'] == 'execute']), 1)
+        self.assertEqual(len([r for r in self.provider.requests if r['operation'] == 'execute']), 2)
 
     def test_old_ownership_date_and_partial_event_precision_are_preserved(self):
         evidence, ref = self.evidence(date='2024-04-08', text='April 8, 2024: Lincoln announces the sale to a private equity portfolio company.')

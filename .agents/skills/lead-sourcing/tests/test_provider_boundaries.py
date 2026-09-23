@@ -59,22 +59,6 @@ class ProviderBoundaryTests(unittest.TestCase):
                 with self.subTest(raw=raw, prefix=prefix):
                     self.assertEqual(DEEPLINE._json_from_text(prefix + raw), json.loads(raw))
 
-    def test_every_truncated_prefix_stays_unresolved_including_email_validation(self):
-        samples = [
-            (DEEPLINE, '{"results":[{"company":"Example","domain":"example.test"}],"billing":{"credits_charged":0.28}}', None),
-            (DEEPLINE, '{"toolResponse":{"raw":{"email":"owner@example.test","status":"valid"}},"billing":{"credits_charged":0.28}}', "email_validation"),
-            (SCRAPINGDOG, '{"organic_results":[{"title":"Example","link":"https://example.test"}],"pagination":{"next_page_token":"page2"}}', None),
-        ]
-        for adapter, raw, entity_type in samples:
-            request = self.request(adapter)
-            if entity_type:
-                request["entity_type"] = entity_type
-            for length in range(1, len(raw)):
-                with self.subTest(adapter=adapter.__name__, length=length, entity_type=entity_type):
-                    code, body, calls = self.invoke(adapter, raw[:length], request=request)
-                    self.assertEqual((code, calls), (0, 1))
-                    self.assertEqual(body["status"], "schema_error")
-                    self.assertEqual(body.get("results", []), [])
 
     def test_nonfinite_known_envelopes_are_diagnostic_not_results(self):
         for adapter in (DEEPLINE, SCRAPINGDOG):

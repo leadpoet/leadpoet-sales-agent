@@ -693,41 +693,6 @@ class ProviderScriptTests(unittest.TestCase):
         self.assertEqual(summary_body["results"][0]["count"], 7)
         self.assertEqual(summary_body["results"][0]["total"], 12)
 
-    def test_deepline_normalizes_scalar_email_validation_without_treating_status_as_route_failure(self):
-        response = {
-            "status": "completed",
-            "toolResponse": {
-                "raw": {
-                    "address": "ada@example.com",
-                    "status": "invalid",
-                    "sub_status": "mailbox_not_found",
-                    "processed_at": "2026-09-03 12:00:00",
-                }
-            },
-        }
-        body = DEEPLINE._execute_output(
-            response, "runtime-email-validator", "email_validation"
-        )
-
-        self.assertEqual(body["status"], "ok")
-        self.assertEqual(len(body["results"]), 1)
-        row = body["results"][0]
-        self.assertEqual(row["email"], "ada@example.com")
-        self.assertEqual(row["email_status"], "invalid")
-        self.assertEqual(row["email_sub_status"], "mailbox_not_found")
-        self.assertEqual(row["entity_type"], "email_validation")
-        self.assertNotIn("contact", row)
-
-        contact_row = {
-            "full_name": "Ada Example",
-            "job_title": "VP Sales",
-            "email": "ada@example.com",
-            "status": "valid",
-        }
-        contact = DEEPLINE.normalize_evidence(contact_row, entity_type="contact")
-        self.assertEqual(contact["full_name"], "Ada Example")
-        self.assertEqual(contact["current_title"], "VP Sales")
-        self.assertEqual(contact["entity_type"], "contact")
 
     def test_bounceban_preserves_verdict_separately_from_api_status(self):
         for verdict in ("deliverable", "risky", "undeliverable", "unknown"):
@@ -745,15 +710,6 @@ class ProviderScriptTests(unittest.TestCase):
                 self.assertEqual(row["score"], 42)
                 self.assertNotIn("contact", row)
 
-    def test_email_validation_schema_error_keeps_redacted_diagnostics(self):
-        response = {"unexpected_envelope": {"verification_id": "job-123", "api_key": "secret-value"}}
-        body = DEEPLINE._execute_output(response, "dynamic-validator", "email_validation")
-        self.assertEqual(body["status"], "schema_error")
-        self.assertEqual(body["results"], [])
-        self.assertEqual(body["provider_response"]["unexpected_envelope"]["verification_id"], "job-123")
-        self.assertNotIn("secret-value", json.dumps(body))
-        ordinary = DEEPLINE._execute_output(response, "dynamic-company-tool", "company")
-        self.assertNotIn("provider_response", ordinary)
 
     def test_deepline_keeps_explicit_zerobounce_status_when_default_verdict_fails(self):
         response = json.dumps(

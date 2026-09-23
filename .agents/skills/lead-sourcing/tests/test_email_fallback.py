@@ -35,7 +35,6 @@ class EmailFallbackTests(unittest.TestCase):
     def check_both(self, status="catch-all", mutate=None, passes=True):
         for factory, check in (
             (accepted_email_result, lambda d: not VALIDATOR.validate_run(d)),
-            (exporter_tests.accepted_document, lambda d: exporter_tests.ExportXlsxTests().run_rows_json(d).returncode == 0),
         ):
             document = with_fallback(factory(), status)
             if mutate:
@@ -136,13 +135,6 @@ class EmailFallbackTests(unittest.TestCase):
             document["accepted"][0]["backup_contacts"][0]["email_validation"]["fallback"]["result"] = "risky"
         self.check_both(mutate=bad_backup, passes=False)
 
-    def test_schema_preserves_original_and_single_fallback(self):
-        definitions = load_schemas()[1]["$defs"]
-        self.assertEqual(definitions["email_validation"]["properties"]["fallback"]["$ref"], "#/$defs/bounceban_validation")
-        fallback = definitions["bounceban_validation"]
-        self.assertFalse(fallback["additionalProperties"])
-        self.assertIn("result", fallback["required"])
-        self.assertNotIn("fallback", fallback["properties"])
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ class BudgetGuardTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "results.json"
-        self.document = {"request": {"target_count": 10, "contact_fields": []},
+        self.document = {"request": {"target_count": 10},
                          "accepted": [], "routes": [], "budget": {"paid_calls": 0, "limits": {
                              "deepline_credits": 50, "scrapingdog_credits": 50}}}
         self.write()
@@ -184,19 +184,7 @@ except (ValueError, OSError):
         self.assertEqual(codes.count(0), 1)
         self.assertEqual(len(read_object(ledger_path(self.path))["calls"]), 1)
 
-    def test_verification_allowance_is_protected_and_consumed_only_by_verification(self):
-        self.init(verification_reserve_credits=5)
-        reserve(self.spend(cost=45), "deepline")
-        with self.assertRaises(BudgetError):
-            reserve(self.spend("discovery", 1), "deepline")
-        reserve(self.spend("verify", 5), "deepline", verification=True)
-        self.assertEqual(len(read_object(ledger_path(self.path))["calls"]), 2)
 
-    def test_email_requires_explicitly_priced_verification_reserve(self):
-        del self.document["request"]["contact_fields"]
-        self.write()
-        with self.assertRaisesRegex(BudgetError, "verification_reserve_credits"):
-            self.init()
 
     def test_scrapingdog_completed_empty_search_settles_documented_tariff(self):
         self.init()
@@ -268,23 +256,6 @@ except (ValueError, OSError):
             reconcile_overruns(self.path, [receipt], pricing_note="price corrected")
         self.assertEqual(ledger_path(self.path).read_bytes(), before)
 
-    def test_reconcile_respects_protected_verification_and_next_lead_caps(self):
-        for key in ("reserve", "next_lead", "credits"):
-            with self.subTest(key=key):
-                ledger_path(self.path).unlink(missing_ok=True)
-                self.document["routes"] = []
-                self.document["budget"]["limits"].pop("max_deepline_credits_per_next_lead", None)
-                self.document["budget"]["limits"]["deepline_credits"] = .1 if key == "credits" else 50
-                if key == "next_lead":
-                    self.document["budget"]["limits"]["max_deepline_credits_per_next_lead"] = .1
-                self.write()
-                self.init(max_usd=.02 if key == "reserve" else 5,
-                          verification_reserve_credits=.1 if key == "reserve" else 0)
-                receipt = self.overrun_receipt()
-                before = ledger_path(self.path).read_bytes()
-                with self.assertRaises(BudgetError):
-                    reconcile_overruns(self.path, [receipt], pricing_note="price corrected")
-                self.assertEqual(ledger_path(self.path).read_bytes(), before)
 
     def test_reconcile_rejects_mismatched_or_incomplete_receipts(self):
         self.init()
@@ -353,27 +324,6 @@ except (ValueError, OSError):
         with self.assertRaisesRegex(BudgetError, "per-next-lead"):
             reserve(self.spend("two", 2), "deepline")
 
-    def test_review_demotion_resumes_without_rewriting_spend_or_releasing_reserve(self):
-        self.document["accepted"] = [{}] * 7
-        self.write()
-        self.init(verification_reserve_credits=5)
-        path, rid = reserve(self.spend(cost=30), "deepline")
-        settle(path, rid, {"credits_charged": 10, "cost_usd": 1})
-        before = read_object(path)
-        self.document["accepted"] = [{}]
-        self.write()
-        reserve(self.spend("after-review", 35), "deepline")
-        after = read_object(path)
-        self.assertEqual(after["calls"][rid], before["calls"][rid])
-        self.assertEqual(after["calls"]["after-review"]["accepted_leads_before_call"], 1)
-        self.assertEqual({k: v for k, v in after.items() if k != "calls"},
-                         {k: v for k, v in before.items() if k != "calls"})
-        with self.assertRaisesRegex(BudgetError, "shared USD cap"):
-            reserve(self.spend("over-budget", 0.01), "scrapingdog")
-        with self.assertRaisesRegex(BudgetError, "already reserved"):
-            reserve(self.spend(rid, 0), "deepline")
-        # The protected verification allowance remains usable.
-        reserve(self.spend("verify", 5), "deepline", verification=True)
 
     def test_demotion_and_reacceptance_cannot_reset_optional_allowance(self):
         self.document["budget"]["limits"]["max_deepline_credits_per_next_lead"] = 5
@@ -475,11 +425,6 @@ except (ValueError, OSError):
             self.assertEqual(result.returncode, 2)
             self.assertTrue(any("execution ledger" in error for error in json.loads(result.stdout)["errors"]))
 
-    def test_missing_priced_rate_and_false_reserve_are_refused(self):
-        with self.assertRaisesRegex(BudgetError, "USD-per-credit"):
-            initialize(self.path)
-        with self.assertRaises(BudgetError):
-            self.init(verification_reserve_credits=False)
 
     def test_dollar_receipt_releases_only_the_dollar_reservation(self):
         self.init()
@@ -541,23 +486,6 @@ except (ValueError, OSError):
             reserve(self.spend("too-much", 3), "deepline")
         reserve(self.spend("fits", 2), "deepline")
 
-    def test_stop_cli_excludes_discovery_but_allows_reserved_verification(self):
-        self.init(verification_reserve_credits=5)
-        reserve(self.spend("discovery-spent", 45), "deepline")
-        routes = [{"route_id": "discovery-spent", "provider": "deepline", "paid_calls": 1,
-                   "cost_credits": None, "cost_upper_bound_credits": 45, "cost_basis": "estimated",
-                   "accepted_leads_before_call": 0}]
-        actions = [action("discover", provider="deepline", paid_calls=1, cost_upper_bound_credits=1),
-                   dict(action("verify", provider="deepline", paid_calls=1, cost_upper_bound_credits=5),
-                        entity_type="email_validation")]
-        result = self.planned_document(actions, routes)
-        self.assertEqual(result["eligible_actions"], ["verify"])
-        completed = subprocess.run([sys.executable, str(ROOT / "scripts/validate_run.py"), str(self.path), "--check-stop"],
-                                   capture_output=True, text=True, timeout=10)
-        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        self.assertEqual(json.loads(completed.stdout)["eligible_actions"], ["verify"])
-        self.assertEqual(len(read_object(ledger_path(self.path))["calls"]), 1)
-        reserve(self.spend("verify", 5), "deepline", verification=True)
 
 
 class BudgetValidationTests(unittest.TestCase):

@@ -49,35 +49,11 @@ class CompanyFinalizationTests(unittest.TestCase):
 
     def finalize(self, ref):
         return self.tools.call("tyche_review", {"companies": [{"target": "example1.com", "decision": "accept",
-            "reason": "Finalized supported context and planned activity; checked all contacts and client prose.",
+            "reason": "Finalized supported context, company facts and client prose.",
             "supporting_findings": findings(ref), "intent_details": NARRATIVE}]})
 
-    def add_contact(self, number):
-        company = "https://www.linkedin.com/company/example-products-1/"
-        profile = f"https://www.linkedin.com/in/buyer-{number}/"
-        email = f"buyer{number}@example1.com"
-        self.provider.raw = {"status": "ok", "element": {"linkedinUrl": profile,
-            "firstName": "Buyer", "lastName": str(number), "email": email, "currentPosition": [{
-                "companyName": "Example Products 1", "title": "Director of Supply Chain", "companyLinkedinUrl": company}],
-            "location": {"parsed": {"city": "Columbus", "state": "Ohio", "countryFull": "United States"}}}}
-        ref = self.tools.lookup([check("example1.com", phase="contact_verification", tool="harvestapi_get_profile",
-            inputs={"url": profile})])["lookups"][0]["results"][0]["ref"]
-        row = self.tools._document()["unresolved"][0]
-        contacts = copy.deepcopy(row.get("backup_contacts", []))
-        contacts.append({"ref": ref, "requested_role": "Director of Supply Chain", "role_match": "exact"})
-        self.tools.review(companies=[{"target": "example1.com", "decision": "hold_contact", "reason": "Verified additional buyer",
-                                     "backup_contacts": contacts}])
-        self.provider.raw = {"status": "ok", "data": {"address": email, "status": "valid", "sub_status": ""}}
-        email_ref = self.tools.lookup([check("example1.com", phase="email_validation", tool="zerobounce_validate",
-            contact_ref=ref, inputs={"email": email})])["lookups"][0]["results"][0]["ref"]
-        contacts[-1]["email_ref"] = email_ref
-        self.tools.review(companies=[{"target": "example1.com", "decision": "hold_contact", "reason": "Exact email verified",
-                                     "backup_contacts": contacts}])
-
-    def test_company_and_all_contacts_finalize_before_run_completion_and_resume_without_lookup(self):
+    def test_company_finalizes_before_run_completion_and_resumes_without_lookup(self):
         ref = self.enrich()
-        self.add_contact(2)
-        self.add_contact(3)
         before = copy.deepcopy(self.tools._document())
         calls = len(self.provider.requests)
         packet = self.finalize(ref)
@@ -85,7 +61,6 @@ class CompanyFinalizationTests(unittest.TestCase):
         frontier = self.tools._document()["stop_audit"]["route_frontier"]
         self.assertEqual(next(r for r in frontier if r["route_id"] == ref.split(":")[0])["state"], "exhausted")
         review = packet["companies"][0]
-        self.assertEqual(len(review["backup_contacts"]), 2)
         self.assertEqual(review["company"]["hq_state"], "Ohio")
         self.assertTrue(review["company_evidence"]["source_refs"])
         self.assertEqual(review["sources"][ref]["text"], PASSAGE)
@@ -96,8 +71,6 @@ class CompanyFinalizationTests(unittest.TestCase):
         self.assertEqual((saved["confirmed_count"], saved["target_count"]), (1, 5))
         self.assertEqual(saved["leads"][0]["intent_details"], NARRATIVE)
         self.assertEqual(saved["leads"][0]["company"], before["unresolved"][0]["candidate"])
-        self.assertEqual(saved["leads"][0]["primary_contact"], before["unresolved"][0]["primary_contact"])
-        self.assertEqual(saved["leads"][0]["backup_contacts"], before["unresolved"][0]["backup_contacts"])
         self.assertEqual(self.tools._document()["request"], before["request"])
         output_before = self.path.with_name("leads.json").read_bytes()
         ledger_before = budget_guard.ledger_path(self.path).read_bytes()
@@ -121,10 +94,8 @@ class CompanyFinalizationTests(unittest.TestCase):
             workers.append(tools)
         self.tools = self.fixture.tools = workers[0]
         ref = self.enrich()
-        self.add_contact(2)
         first = self.finalize(ref)
         self.assertEqual(first["expected_targets"], ["example1.com"])
-        self.assertEqual(len(first["companies"][0]["backup_contacts"]), 1)
 
         self.fixture.tools = workers[1]
         second = self.fixture.add(2)
@@ -147,7 +118,6 @@ class CompanyFinalizationTests(unittest.TestCase):
         self.assertEqual(saved["example2.com"], peer)
         self.assertEqual(saved["example1.com"]["supporting_findings"][0]["label"], "Retail footprint")
         self.assertEqual(saved["example1.com"]["intent_details"], NARRATIVE)
-        self.assertEqual(len(saved["example1.com"]["backup_contacts"]), 1)
         self.assertTrue(all(worker["current_company"] is None
                             for worker in coordination.snapshot(self.path)["workers"].values()))
 
@@ -177,13 +147,13 @@ class CompanyFinalizationTests(unittest.TestCase):
         calls = len(self.provider.requests)
         ledger = budget_guard.ledger_path(self.path).read_bytes()
         packet = self.tools.review(companies=[{"target": target, "decision": "accept",
-            "reason": "Optional research added no usable facts; original company and contact evidence remains sufficient.",
+            "reason": "Optional research added no usable facts; original company evidence remains sufficient.",
             "supporting_findings": []}], sources=[{"ref": lookup["route"],
             "state": "blocked" if status == "provider_error" else "exhausted",
             "reason": "Optional lookup reviewed; no usable new fact and no new required evidence gap."}])
         self.fixture.approve(packet)
         saved = next(row for row in self.fixture.file()["leads"] if row["company"]["domain"] == target)
-        for field in ("qualification_checks", "primary_contact", "intent_details"):
+        for field in ("qualification_checks", "intent_details"):
             self.assertEqual(saved[field], before[field])
         self.assertEqual(saved["company"], before["candidate"])
         self.assertEqual(saved["supporting_findings"], [])
@@ -213,7 +183,7 @@ class CompanyFinalizationTests(unittest.TestCase):
                 errors = validate_run.qualification_errors(dict(document, accepted=[row], unresolved=[]), run_file=self.path)
                 self.assertTrue(errors, "Optional findings cannot satisfy the original required signal")
 
-    def test_optional_finding_corrections_require_review_and_preserve_verified_contacts(self):
+    def test_optional_finding_corrections_require_review_and_preserve_company_evidence(self):
         ref = self.enrich()
         first = self.finalize(ref)
         self.fixture.approve(first)
@@ -227,7 +197,7 @@ class CompanyFinalizationTests(unittest.TestCase):
         self.assertEqual(stale["review_ref"], corrected["review_ref"])
         self.fixture.approve(corrected)
         saved = self.fixture.file()["leads"][0]
-        self.assertEqual(saved["primary_contact"], original["primary_contact"])
+        self.assertEqual(saved["company"], original["company"])
         self.assertEqual(saved["qualification_checks"], original["qualification_checks"])
 
     def test_unsupported_optional_evidence_is_repairable_without_rejecting_company(self):
@@ -285,8 +255,6 @@ class CompanyFinalizationTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("TYCHE_WORKSPACE_NODE_MODULES"), "bundled workbook runtime required")
     def test_finalized_records_reach_verified_workbook_with_shared_prose_and_matching_sources(self):
         ref = self.enrich()
-        self.add_contact(2)
-        self.add_contact(3)
         self.fixture.approve(self.finalize(ref))
         self.assert_optional_lookup_preserves_qualified_company(
             {"status": "error", "error": "Optional page fetch failed"}, "provider_error", number=2)
@@ -300,22 +268,22 @@ class CompanyFinalizationTests(unittest.TestCase):
         self.assertTrue(result["export"]["saved_workbook_values_verified"])
         workbook = self.path.with_name("leads.xlsx")
         leads = read_first_sheet_rows(workbook)
-        self.assertEqual(len(leads), 8)  # Five companies, seven complete contacts, plus header.
+        self.assertEqual(len(leads), 6)  # Five companies plus header.
         row = dict(zip(leads[0], leads[1]))
         self.assertEqual(row["Intent Details"], NARRATIVE)
         self.assertIn("Context: Distribution footprint", row["Signals"])
         self.assertIn("Signal: Replenishment pilot", row["Signals"])
         self.assertIn("Activity date: 2026-08", row["Signals"])
         self.assertIn("Source: https://example1.com/roadmap", row["Signals"])
-        # All complete contacts share the Leads sheet; Sources retains their evidence.
+        # Each accepted company has one Leads row; Sources retains its evidence.
         sources = read_first_sheet_rows(workbook, 2)
         source_rows = [dict(zip(sources[0], r)) for r in sources[1:]]
         roadmap = [r for r in source_rows if r["Source URL"] == "https://example1.com/roadmap"]
         self.assertEqual(len(roadmap), 2)
         self.assertTrue(all(r["Field"] == "Signals" and PASSAGE in r["Evidence Text"] for r in roadmap))
-        company_contacts = [dict(zip(leads[0], r)) for r in leads[1:] if "Example Products 1" in r]
-        self.assertEqual(len(company_contacts), 3)
-        self.assertTrue(all(r["Intent Details"] == NARRATIVE and r["Signals"] == row["Signals"] for r in company_contacts))
+        company_rows = [dict(zip(leads[0], r)) for r in leads[1:] if "Example Products 1" in r]
+        self.assertEqual(len(company_rows), 1)
+        self.assertTrue(all(r["Intent Details"] == NARRATIVE and r["Signals"] == row["Signals"] for r in company_rows))
         self.assertEqual(json.loads(self.path.with_name("validation.json").read_text())["errors"], [])
 
 

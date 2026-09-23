@@ -14,7 +14,7 @@ class ActualCostTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.path = self.root / "results.json"
-        self.path.write_text(json.dumps({"request": {"target_count": 5, "contact_fields": ["email"]},
+        self.path.write_text(json.dumps({"request": {"target_count": 5},
             "accepted": [], "routes": [], "budget": {"policy": "actual_cost", "paid_calls": 0,
                 "limits": {"deepline_credits": 25, "scrapingdog_credits": 0}}}))
         budget.initialize(self.path, max_usd=2.5)

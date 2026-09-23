@@ -37,10 +37,12 @@ class CapturedPageTests(unittest.TestCase):
         self.path = Path(directory.name) / 'results.json'
         self.provider = FixtureProvider()
         self.tools = ResearchTools(self.path, execute=self.provider)
-        self.tools.start({'target_count': 1, 'as_of_date': '2026-09-17', 'contact_fields': [],
-            'requested_roles': ['Operations leader'], 'icp': {'exclusions': ['excluded.test']},
+        self.tools.start({'target_count': 2, 'as_of_date': '2026-09-17',
+            'icp': {'exclusions': ['excluded.test']},
             'buying_signals': [{'kind': 'FACILITY_OPENING', 'importance': 'required',
                 'max_age_days': 365, 'query': 'Completed acquisition'}]}, max_usd=1)
+        self.company_ref = self.tools.lookup([check(tool='harvestapi_get_company',
+            inputs={'url': 'https://www.linkedin.com/company/examplepay/'})])['lookups'][0]['results'][0]['ref']
 
     def capture(self, row=None, url=URL):
         self.provider.raw = response([page() if row is None else row])
@@ -49,8 +51,11 @@ class CapturedPageTests(unittest.TestCase):
         return result['lookups'][0]['results'][0]['ref']
 
     def finding(self, ref, **evidence):
-        return {'target': 'example.test', 'decision': 'qualify_account', 'reason': 'Captured acquisition',
+        return {'target': 'example.test', 'decision': 'accept', 'reason': 'Captured acquisition',
+            'company': {'ref': self.company_ref, 'industry': 'Manufacturing', 'sub_industry': 'Textiles',
+                'description': 'ExamplePay manufactures packaged products. It supplies retailers across the United States.'},
             'account_fit': {'ref': ref},
+            'intent_details': 'ExamplePay completed an acquisition in August 2026. The acquired operation may increase coordination needs.',
             'qualification_checks': [{'requirement_ref': 'signal:0', 'status': 'pass',
                 'claim': 'Completed acquisition', 'evidence': [{'ref': ref,
                     'event_date': '2026-08-26', **evidence}]}]}
@@ -67,26 +72,36 @@ class CapturedPageTests(unittest.TestCase):
         self.assertNotIn(selected.split(':')[0], pending)
         self.assertIn(unselected.split(':')[0], pending)
         self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
-        self.assertEqual(self.tools._document()['accepted'], [])
-        self.assertEqual(self.tools._document()['unresolved'][0]['stage'], 'contact')
+        self.assertEqual(self.tools._document()['accepted'][0]['company']['domain'], 'example.test')
 
     def test_native_page_readers_reach_existing_qualification_review(self):
         from test_page_reader_responses import native_page_response
         for tool in ('discolike_extract', 'generic_http_request'):
-            with self.subTest(tool=tool):
-                self.provider.raw = native_page_response(tool, URL, TEXT)
-                lookup = self.tools.lookup([check(tool=tool, inputs={'url': URL})])
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'results.json'
+                provider = FixtureProvider()
+                tools = ResearchTools(path, execute=provider)
+                tools.start({'target_count': 1, 'as_of_date': '2026-09-17',
+                    'icp': {'exclusions': ['excluded.test']},
+                    'buying_signals': [{'kind': 'FACILITY_OPENING', 'importance': 'required',
+                        'max_age_days': 365, 'query': 'Completed acquisition'}]}, max_usd=1)
+                company_ref = tools.lookup([check(tool='harvestapi_get_company',
+                    inputs={'url': 'https://www.linkedin.com/company/examplepay/'})])['lookups'][0]['results'][0]['ref']
+                provider.raw = native_page_response(tool, URL, TEXT)
+                lookup = tools.lookup([check(tool=tool, inputs={'url': URL})])
                 ref = lookup['lookups'][0]['results'][0]['ref']
-                receipt = self.path.parent / 'receipts' / (ref.split(':')[0] + '.json')
-                before = receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)
-                self.tools.review(companies=[self.finding(ref)])
-                document = self.tools._document()
-                self.assertEqual(document['unresolved'][0]['stage'], 'contact')
-                self.assertEqual(validate_run.qualification_errors(document, run_file=self.path), [])
+                receipt = path.parent / 'receipts' / (ref.split(':')[0] + '.json')
+                before = receipt.read_bytes(), budget_guard.ledger_path(path).read_bytes(), len(provider.requests)
+                finding = self.finding(ref)
+                finding['company']['ref'] = company_ref
+                tools.review(companies=[finding])
+                document = tools._document()
+                self.assertEqual(document['accepted'][0]['company']['domain'], 'example.test')
+                self.assertEqual(validate_run.qualification_errors(document, run_file=path), [])
                 sources = {}
-                self.tools._company_review(document['unresolved'][0], sources)
+                tools._company_review(document['accepted'][0], sources)
                 self.assertIn(TEXT, sources[ref]['text'])
-                self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
+                self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(path).read_bytes(), len(provider.requests)), before)
 
     def test_selected_search_or_multi_page_result_still_needs_source_review(self):
         for tool, inputs, rows in (
@@ -95,7 +110,7 @@ class CapturedPageTests(unittest.TestCase):
                  [{'url': URL, 'text': TEXT, 'content_kind': 'captured_page'}])):
             with self.subTest(tool=tool):
                 self.provider.raw = response(rows)
-                result = self.tools.lookup([check(tool=tool, inputs=inputs)])
+                result = self.tools.lookup([check(tool=tool, inputs=inputs, purpose='Review ' + tool)])
                 ref = result['lookups'][0]['results'][0]['ref']
                 self.tools.review(companies=[{'target': 'example.test', 'decision': 'hold_account',
                     'reason': 'Still reviewing fit', 'account_fit': {'ref': ref}}])
@@ -156,7 +171,7 @@ class CapturedPageTests(unittest.TestCase):
         self.assertEqual(sources[ref]['content_kind'], 'search_excerpt')
         captured = self.capture()
         self.tools.review(companies=[self.finding(captured)])
-        self.assertEqual(self.tools._document()['unresolved'][0]['stage'], 'contact')
+        self.assertEqual(self.tools._document()['accepted'][0]['company']['domain'], 'example.test')
         self.assertEqual(receipt.read_bytes(), original)
 
     def test_page_label_on_unknown_provider_text_does_not_invent_a_capture(self):
@@ -218,10 +233,10 @@ class CapturedPageTests(unittest.TestCase):
         before = budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)
         self.tools.review(companies=[self.finding(ref)])
         document = json.loads(self.path.read_text())
-        self.assertEqual(document['unresolved'][0]['stage'], 'contact')
+        self.assertEqual(document['accepted'][0]['company']['domain'], 'example.test')
         self.assertEqual(validate_run.qualification_errors(document, run_file=self.path), [])
         sources = {}
-        self.tools._company_review(document['unresolved'][0], sources)
+        self.tools._company_review(document['accepted'][0], sources)
         self.assertEqual(sources[ref]['text'], TEXT)
         self.assertEqual((budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
         for change in ({'success': False}, {'success': 'true'}, {'success': 1}, {'error': 'Failed capture'},
@@ -239,8 +254,8 @@ class CapturedPageTests(unittest.TestCase):
         before = receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)
         self.tools.review(companies=[self.finding(ref)])
         document = self.tools._document()
-        self.assertEqual(document['unresolved'][0]['stage'], 'contact')
-        evidence = document['unresolved'][0]['qualification_checks'][0]['evidence'][0]
+        self.assertEqual(document['accepted'][0]['company']['domain'], 'example.test')
+        evidence = document['accepted'][0]['qualification_checks'][0]['evidence'][0]
         self.assertEqual((evidence['date'], evidence['date_basis']), ('2026-08-26', 'published'))
         self.assertEqual(validate_run.qualification_errors(document, run_file=self.path), [])
         self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(),
@@ -276,7 +291,7 @@ class CapturedPageTests(unittest.TestCase):
         before = receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)
         self.tools.review(companies=[self.finding(ref)])
         document = self.tools._document()
-        self.assertEqual(document['unresolved'][0]['stage'], 'contact')
+        self.assertEqual(document['accepted'][0]['company']['domain'], 'example.test')
         self.assertEqual(validate_run.qualification_errors(document, run_file=self.path), [])
         self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(),
                           len(self.provider.requests)), before)
@@ -295,7 +310,7 @@ class CapturedPageTests(unittest.TestCase):
             self.assertEqual((receipt.read_bytes(), self.path.read_bytes(),
                               budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
         self.tools.review(companies=[self.finding(ref)])
-        self.assertEqual(self.tools._document()['unresolved'][0]['stage'], 'contact')
+        self.assertEqual(self.tools._document()['accepted'][0]['company']['domain'], 'example.test')
         self.assertEqual((receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(),
                           len(self.provider.requests)), (before[0], before[2], before[3]))
 
@@ -305,8 +320,8 @@ class CapturedPageTests(unittest.TestCase):
         before = receipt.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)
         self.tools.review(companies=[self.finding(ref)])
         document = json.loads(self.path.read_text())
-        row = document['unresolved'][0]
-        self.assertEqual(row['stage'], 'contact')
+        row = document['accepted'][0]
+        self.assertEqual(row['company']['domain'], 'example.test')
         self.assertEqual(validate_run.qualification_errors(document, run_file=self.path), [])
         sources = {}
         packet = self.tools._company_review(row, sources)
@@ -325,16 +340,16 @@ class CapturedPageTests(unittest.TestCase):
                 self.tools.review(companies=[self.finding(ref, **override)])
             self.assertEqual((self.path.read_bytes(), budget_guard.ledger_path(self.path).read_bytes(), len(self.provider.requests)), before)
 
-    def test_saved_invalid_quote_blocks_existing_contact_gate_without_spend(self):
+    def test_saved_invalid_quote_blocks_company_acceptance_without_spend(self):
         ref = self.capture()
         self.tools.review(companies=[self.finding(ref)])
         document = json.loads(self.path.read_text())
-        document['unresolved'][0]['qualification_checks'][0]['evidence'][0]['text'] = 'Invented claim.'
+        document['accepted'][0]['qualification_checks'][0]['evidence'][0]['text'] = 'Invented claim.'
         self.path.write_text(json.dumps(document))
         before = budget_guard.ledger_path(self.path).read_bytes()
         paid = sum(r['operation'] == 'execute' for r in self.provider.requests)
-        with self.assertRaisesRegex(ValueError, 'quote captured source'):
-            self.tools.lookup([check(phase='contact_discovery', tool='fixture-search', inputs={'query': 'senior buyer'})])
+        self.assertIn('quote captured source', ' '.join(
+            validate_run.qualification_errors(document, run_file=self.path)))
         self.assertEqual(budget_guard.ledger_path(self.path).read_bytes(), before)
         self.assertEqual(sum(r['operation'] == 'execute' for r in self.provider.requests), paid)
 

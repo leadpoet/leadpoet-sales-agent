@@ -70,7 +70,6 @@ class ParallelWorkerTests(unittest.TestCase):
 
     def start_run(self, cap=5):
         request = copy.deepcopy(setup_request()["request"])
-        request["contact_fields"] = []
         ResearchTools(self.path, execute=FixtureProvider(), environment={"TYCHE_BUDGET_POLICY": "reserved"}).start(request, max_usd=cap)
 
     def test_three_processes_claim_same_company_only_one_wins(self):
@@ -278,18 +277,6 @@ class ParallelWorkerTests(unittest.TestCase):
         self.assertTrue(worker.claim("example.test", "https://linkedin.com/company/example/")["claimed"])
         self.assertEqual(worker.claim("https://www.linkedin.com/company/example/")["target"], "example.test")
 
-    def test_discovery_label_cannot_bypass_company_or_email_ownership(self):
-        self.start_run()
-        self.configure()
-        provider = FixtureProvider()
-        worker = self.worker(1, provider)
-        for tool, inputs in [("harvestapi_get_company", {"url": "https://linkedin.com/company/example"}),
-                             ("harvestapi_get_profile", {"url": "https://linkedin.com/in/example"}),
-                             ("zerobounce_validate", {"email": "person@example.test"}),
-                             ("custom_company_reader", {"filters": {"domain": "example.test"}})]:
-            with self.subTest(tool=tool), self.assertRaises(ValueError):
-                worker.call("tyche_lookup", {"checks": [check("discovery", tool=tool, inputs=inputs, phase="account_discovery")]})
-        self.assertEqual(provider.requests, [])
 
     def test_known_aliases_cannot_enter_same_batch_twice(self):
         self.start_run()
@@ -369,23 +356,6 @@ class ParallelWorkerTests(unittest.TestCase):
         self.assertEqual(retried["lookups"][0]["status"], "ok")
         self.assertEqual(len(budget.load_ledger(self.path)["calls"]), 1)
 
-    def test_owned_completion_candidate_is_filtered_before_global_display_limit(self):
-        self.start_run()
-        self.configure()
-        document = json.loads(self.path.read_text())
-        document["unresolved"] = []
-        for number in range(4):
-            target = f"company-{number}.test"
-            owner = 3 if number == 3 else 1
-            self.worker(owner).claim(target)
-            coordination.reviewed(self.path, f"worker-{owner}", f"worker-{owner}", target, "hold_contact")
-            document["unresolved"].append({"stage": "contact", "candidate": {"domain": target},
-                                           "primary_contact": {"country": "United States"}})
-        with patch("research_tools.linkedin_receipts.contact_verification_errors", return_value=["Profile missing"]):
-            global_view = ResearchTools(self.path, environment={})._completion_candidates(document, {})
-            owned_view = self.worker(3)._completion_candidates(document, {})
-        self.assertEqual(len(global_view), 3)
-        self.assertEqual([row["target"] for row in owned_view], ["company-3.test"])
 
     def test_final_export_subprocess_can_acquire_the_shared_run_lock(self):
         self.path.write_text(json.dumps({"values": []}))

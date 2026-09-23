@@ -32,6 +32,8 @@ class WebPassageTests(unittest.TestCase):
         req = setup_request()['request']
         req['icp'] = {'exclusions': ['excluded.test']}
         self.tools.start(req, max_usd=1)
+        self.company_ref = self.tools.lookup([lookup_check(tool='harvestapi_get_company',
+            inputs={'url': 'https://www.linkedin.com/company/examplepay/'})])['lookups'][0]['results'][0]['ref']
 
     def observed(self, operation='open', field='text'):
         result = self.tools.review(web=[{'target': 'example.test', 'purpose': 'Read partnership source ' + operation + ' ' + field,
@@ -41,12 +43,16 @@ class WebPassageTests(unittest.TestCase):
         return result['web_references']['web:0'] + ':0'
 
     def company(self, ref, **evidence):
-        return {'target': 'example.test', 'decision': 'qualify_account', 'reason': 'Compare source with request',
-                'account_fit': {'ref': ref}, 'qualification_checks': [{'requirement_ref': 'signal:0',
+        return {'target': 'example.test', 'decision': 'accept', 'reason': 'Compare source with request',
+                'company': {'ref': self.company_ref, 'industry': 'Manufacturing', 'sub_industry': 'Textiles',
+                    'description': 'ExamplePay manufactures packaged products. It supplies retailers across the United States.'},
+                'account_fit': {'ref': ref},
+                'intent_details': 'ExamplePay announced a partnership in January 2026. The partnership may increase coordination needs.',
+                'qualification_checks': [{'requirement_ref': 'signal:0',
                     'status': 'pass', 'claim': 'The source announces a planned partnership.',
                     'evidence': [{'ref': ref, 'event_date': '2026-01-01', **evidence}]}]}
 
-    def test_search_text_and_open_snippets_cannot_pass_before_contact_spend(self):
+    def test_search_text_and_open_snippets_cannot_pass_company_acceptance(self):
         for operation, field in [('search_query', 'text'), ('search_query', 'snippet'), ('open', 'snippet')]:
             with self.subTest(operation=operation, field=field):
                 ref = self.observed(operation, field)
@@ -60,8 +66,8 @@ class WebPassageTests(unittest.TestCase):
         before = len(self.provider.requests)
         self.tools.review(companies=[self.company(ref)])
         document = json.loads(self.tools.path.read_text())
-        row = document['unresolved'][0]
-        self.assertEqual(row['stage'], 'contact')
+        row = document['accepted'][0]
+        self.assertEqual(row['company']['domain'], 'example.test')
         self.assertEqual(row['qualification_checks'][0]['evidence'][0]['text'], 'Example announced a planned partnership.')
         self.assertFalse(validate_run.qualification_errors(document, run_file=self.tools.path))
         self.assertEqual(len(self.provider.requests), before)
@@ -85,8 +91,12 @@ class WebPassageTests(unittest.TestCase):
                    'date': '2026-01-01', 'date_basis': 'published'}]}}
         old = self.tools.review(web=[web])['web_references']['web:0']
         receipt = self.tools.path.parent / 'receipts' / (old + '.json')
+        self.tools.review(sources=[{'ref': old + ':0', 'state': 'exhausted',
+            'reason': 'Snippet response reviewed and cannot support acceptance'},
+            {'ref': self.company_ref, 'state': 'exhausted', 'reason': 'Company identity reviewed'}])
         before, ledger, calls = receipt.read_bytes(), budget_guard.ledger_path(self.tools.path).read_bytes(), len(self.provider.requests)
         web['response']['results'][0]['text'] = web['response']['results'][0].pop('snippet')
+        web['purpose'] = 'Read full announcement'
         new = self.tools.review(web=[web])['web_references']['web:0']
         self.assertNotEqual(old, new)
         with self.assertRaisesRegex(ValueError, 'tool-captured'):
@@ -106,7 +116,11 @@ class WebPassageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'tool-captured'):
             self.tools.review(companies=[self.company(old + ':0')])
         self.assertEqual((budget_guard.ledger_path(self.tools.path).read_bytes(), len(self.provider.requests)), before)
+        self.tools.review(sources=[{'ref': old + ':0', 'state': 'exhausted',
+            'reason': 'Failed response reviewed and cannot support acceptance'},
+            {'ref': self.company_ref, 'state': 'exhausted', 'reason': 'Company identity reviewed'}])
         web['response']['results'][0]['text'] = 'Example announced a partnership to address Internal Error () reports.'
+        web['purpose'] = 'Read corrected announcement source'
         new = self.tools.review(web=[web])['web_references']['web:0']
         self.assertNotEqual(old, new)
         with self.assertRaisesRegex(ValueError, 'tool-captured'):
@@ -136,21 +150,6 @@ class WebPassageTests(unittest.TestCase):
         self.assertIn('another run', validate_run.qualification_evidence_error(original, 'check', document, {},
             {'importance': 'required', 'status': 'pass'}, self.tools.path))
 
-    def test_old_snippet_qualification_is_blocked_at_contact_and_export(self):
-        ref = self.observed('search_query', 'snippet')
-        evidence = self.tools._evidence({'ref': ref})
-        document = json.loads(self.tools.path.read_text())
-        row = {'candidate': {'domain': 'example.test'}, 'stage': 'contact',
-            'qualification_checks': [{'criterion': 'partnership', 'signal': 'PARTNERSHIP', 'importance': 'required',
-                'status': 'pass', 'claim': 'Earlier judgment', 'evidence': [evidence]}]}
-        document['unresolved'] = [row]
-        self.tools.path.write_text(json.dumps(document))
-        before = budget_guard.ledger_path(self.tools.path).read_bytes(), sum(r['operation'] == 'execute' for r in self.provider.requests)
-        with self.assertRaisesRegex(ValueError, 'required web evidence'):
-            self.tools.lookup([lookup_check(phase='contact_discovery', tool='fixture_search', inputs={'query': 'buyer'})])
-        self.assertEqual((budget_guard.ledger_path(self.tools.path).read_bytes(), sum(r['operation'] == 'execute' for r in self.provider.requests)), before)
-        document['accepted'], document['unresolved'] = [row], []
-        self.assertIn('required web evidence', ' '.join(validate_run.source_evidence_errors(document, run_file=self.tools.path)))
 
 
 class SignalTimingTests(unittest.TestCase):
@@ -294,6 +293,7 @@ class ReviewQualityTests(unittest.TestCase):
             provider = FixtureProvider()
             wrapper = "https://linkedin.com/redir/suspicious-page?url=example%2etest"
             provider.raw["element"]["website"] = wrapper
+            provider.raw["element"]["domain"] = "example.test"
             tools = ResearchTools(Path(directory) / "results.json", execute=provider)
             tools.start(request(), max_usd=1)
             ref = tools.lookup([lookup_check()])["lookups"][0]["results"][0]["ref"]

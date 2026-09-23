@@ -7,8 +7,9 @@ import tempfile
 import unittest
 
 from test_output_contract import VALIDATOR_PATH, cost_result, shortfall_result
+from test_client_output import client_document
 from test_stop_policy import STARTED_AT, action, stop_document
-from linkedin_fixtures import write_linkedin_receipts
+from linkedin_fixtures import add_linkedin_fields, write_linkedin_receipts
 
 
 def checkpoint_document():
@@ -21,12 +22,26 @@ def checkpoint_document():
          "cost_upper_bound_credits": 24.07},
     ]
     document = cost_result(routes, accepted_contacts=5)
+    document["schema_version"] = "2.0"
+    template = client_document()["accepted"][0]
+    document["accepted"] = []
+    for index in range(5):
+        row = copy.deepcopy(template)
+        row["company"].update(canonical_name=f"Example {index}", domain=f"example-{index}.org",
+                              website=f"https://example-{index}.org",
+                              linkedin_url=f"https://www.linkedin.com/company/example-{index}/")
+        row["company"]["employee_range_evidence"]["evidence_url"] = row["company"]["linkedin_url"]
+        row["company"]["employee_range_evidence"]["source"]["route_id"] = f"harvest-fields-{index}-0"
+        document["accepted"].append(row)
+    document["retrieved_at"] = "2026-09-01T12:34:56Z"
+    document["request"].pop("contact_fields", None)
+    document["summary"].pop("accepted_contacts", None)
     document["request"]["target_count"] = 25
     document["budget"]["limits"].update(scrapingdog_credits=0, max_paid_calls=40)
     document.pop("stop_reason")
     document["unresolved"] = [
-        {"stage": "account", "reason_code": "missing_contact_evidence",
-         "reason_text": "Requested buyer evidence remains incomplete.",
+        {"stage": "account", "reason_code": "missing_company_evidence",
+         "reason_text": "Requested company evidence remains incomplete.",
          "candidate": {"company": f"Pending {index}", "domain": f"pending-{index}.org"}}
         for index in range(20)
     ]
@@ -54,7 +69,12 @@ class DeliveryGateTests(unittest.TestCase):
         document = checkpoint_document()
         extra = copy.deepcopy(document['accepted'][-1])
         extra['company']['domain'] = 'sixth.example'
+        extra['company']['website'] = 'https://sixth.example'
+        extra['company']['linkedin_url'] = 'https://www.linkedin.com/company/sixth-example/'
+        extra['company']['employee_range_evidence']['evidence_url'] = extra['company']['linkedin_url']
+        extra['company']['employee_range_evidence']['source']['route_id'] = 'harvest-fields-5-0'
         document['accepted'].append(extra)
+        add_linkedin_fields(document)
         document['request'].update(target_count=15, max_duration_seconds=7200)
         from datetime import datetime, timezone
         document['stop_check'] = {'started_at': datetime.now(timezone.utc).isoformat(), 'next_actions': []}

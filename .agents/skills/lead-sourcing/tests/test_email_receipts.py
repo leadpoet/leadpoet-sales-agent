@@ -192,73 +192,11 @@ class EmailReceiptTests(unittest.TestCase):
                                    payload={'email': 'buyer@target.example', 'mode': 'auto'})
         return fixture, fallback
 
-    def test_actual_pending_fallback_cannot_be_repeated_with_a_different_mode(self):
-        fixture, spec = self.prepared_run()
-        run_attempt._start_attempt(fixture.path, run_attempt._validate_spec(spec))
-        pending = json.loads(fixture.path.read_text())['stop_audit']['route_frontier'][-1]
-        self.assertNotIn('tool', pending)
-        spec['action']['id'] = 'bounceban-repeated'
-        spec['request']['payload']['mode'] = 'realtime'
-        before = fixture.path.read_bytes()
-        with patch.object(receipts.deepline, '_invoke') as provider, \
-             patch.object(run_attempt.budget_guard, 'reserve') as reserve:
-            with self.assertRaisesRegex(ValueError, 'already attempted'):
-                run_attempt.run_attempt(fixture.path, spec)
-            provider.assert_not_called()
-            reserve.assert_not_called()
-        self.assertEqual(fixture.path.read_bytes(), before)
 
-    def test_raw_schema_error_cannot_be_relabelled_as_eligible_failure(self):
-        raw = {'ok': False, 'status': 'schema_error',
-               'error': {'message': 'Invalid schema: email is required'}}
-        fixture, spec = self.prepared_run(raw, exit_code=1)
-        document = json.loads(fixture.path.read_text())
-        next(r for r in document['routes'] if r.get('tool') == 'zerobounce_validate')['provider_status'] = 'provider_error'
-        fixture.path.write_text(json.dumps(document))
-        path = fixture.path.parent / 'receipts/zerobounce-original.json'
-        saved = json.loads(path.read_text())
-        saved['status'] = 'provider_error'
-        path.write_text(json.dumps(saved))
-        with patch.object(receipts.deepline, '_invoke') as provider, \
-             patch.object(run_attempt.budget_guard, 'reserve') as reserve:
-            with self.assertRaisesRegex(ValueError, 'original provider response'):
-                run_attempt.run_attempt(fixture.path, spec)
-            provider.assert_not_called()
-            reserve.assert_not_called()
 
-    def test_empty_transport_timeout_is_saved_and_allows_fallback(self):
-        fixture, spec = self.prepared_run(timeout=True)
-        path = fixture.path.parent / 'receipts/zerobounce-original.json'
-        saved = json.loads(path.read_text())
-        self.assertTrue(saved.get('provider_response', {}).get('timed_out'))
-        run_attempt._start_attempt(fixture.path, run_attempt._validate_spec(spec))
 
-    def test_actual_service_failure_allows_fallback(self):
-        raw = {'ok': False, 'status': 'rate_limited', 'error': {'message': 'Too many requests'}}
-        fixture, spec = self.prepared_run(raw, exit_code=1)
-        run_attempt._start_attempt(fixture.path, run_attempt._validate_spec(spec))
 
-    def test_failure_envelope_cannot_override_an_explicit_hard_negative(self):
-        raw = {'status': 'provider_error', 'error': {'message': 'Upstream unavailable'},
-               'results': [{'address': 'buyer@target.example', 'status': 'invalid'}]}
-        fixture, spec = self.prepared_run(raw, exit_code=1)
-        with patch.object(receipts.deepline, '_invoke') as provider:
-            with self.assertRaisesRegex(ValueError, 'cannot use fallback'):
-                run_attempt.run_attempt(fixture.path, spec)
-            provider.assert_not_called()
 
-    def test_pending_fallback_does_not_block_another_email(self):
-        fixture, spec = self.prepared_run()
-        run_attempt._start_attempt(fixture.path, run_attempt._validate_spec(spec))
-        second = copy.deepcopy(spec)
-        second['action'].update(id='zerobounce-second', approach='zerobounce-validation')
-        second['request'].update(tool='zerobounce_validate', payload={'email': 'other@target.example'})
-        with patch.object(receipts.deepline, '_invoke', return_value=(
-                0, json.dumps({'address': 'other@target.example', 'status': 'unknown'}), '')):
-            run_attempt.run_attempt(fixture.path, second)
-        second['action'].update(id='bounceban-other-email', approach='bounceban-validation')
-        second['request']['tool'] = 'bounceban_verify_single'
-        run_attempt._start_attempt(fixture.path, run_attempt._validate_spec(second))
 
     def verification_chain(self, response_email=False):
         fixture, spec = self.prepared_run()
@@ -295,79 +233,9 @@ class EmailReceiptTests(unittest.TestCase):
         fixture.path.write_text(json.dumps(document))
         return fixture, document, pending
 
-    def test_status_chain_uses_original_submission_email_without_resubmitting(self):
-        for response_email in (False, True):
-            with self.subTest(response_email=response_email):
-                fixture, document, pending = self.verification_chain(response_email)
-                paths = fixture.path.parent / 'receipts'
-                original = {p: p.read_bytes() for p in paths.iterdir()}
-                ledger = run_attempt.budget_guard.ledger_path(fixture.path)
-                ledger_before = ledger.read_bytes()
-                for rid in ('bounceban-first', 'bounceban-wait'):
-                    self.assertTrue(receipts.verification_finished(fixture.path, document, rid, pending))
-                self.assertEqual(receipts.pending_verification_errors(document, fixture.path), [])
-                with patch.object(receipts.deepline, '_invoke', side_effect=AssertionError('Unexpected provider call')):
-                    run_attempt.save_review(fixture.path, {'routes': [
-                        {'route_id': rid, 'reason': 'Completed status receipt reviewed'}
-                        for rid in ('bounceban-getter', 'bounceban-wait', 'bounceban-first')]})
-                after = json.loads(fixture.path.read_text())
-                self.assertTrue(all(r['state'] == 'exhausted' for r in after['stop_audit']['route_frontier']
-                                    if r['route_id'].startswith('bounceban')))
-                self.assertEqual({p: p.read_bytes() for p in paths.iterdir()}, original)
-                self.assertEqual(ledger.read_bytes(), ledger_before)
 
-    def test_status_chain_rejects_conflicting_or_unbound_receipts(self):
-        fixture, document, pending = self.verification_chain()
-        paths = fixture.path.parent / 'receipts'
-        original = {p: p.read_bytes() for p in paths.iterdir()}
-        mutations = [
-            ('bounceban-first', lambda s: s['attempt']['request']['payload'].update(email='other@example.org')),
-            ('bounceban-first', lambda s: s.update(run_fingerprint='another-run')),
-            ('bounceban-first', lambda s: s.update(request_fingerprint='another-request')),
-            ('bounceban-first', lambda s: (s['pending_verification'].update(email='other@example.org'),
-                                         s['provider_response']['body'].update(email='other@example.org'))),
-            ('bounceban-wait', lambda s: s['attempt']['request']['payload'].update(id='other-job')),
-            ('bounceban-getter', lambda s: s['attempt']['request']['payload'].update(id='other-job')),
-            ('bounceban-getter', lambda s: s['provider_response']['body'].update(email='other@example.org')),
-            ('bounceban-getter', lambda s: s['provider_response'].update(body={'status': 'error', 'error': 'Failed status read'})),
-        ]
-        for rid, change in mutations:
-            with self.subTest(route=rid, change=change):
-                path = paths / (rid + '.json')
-                saved = json.loads(original[path]);change(saved);path.write_text(json.dumps(saved))
-                self.assertFalse(receipts.verification_finished(fixture.path, document, 'bounceban-first', pending))
-                self.assertTrue(receipts.pending_verification_errors(document, fixture.path))
-                path.write_bytes(original[path])
-        document['stop_audit']['route_frontier'][-2].pop('continuation_route_ids')
-        self.assertFalse(receipts.verification_finished(fixture.path, document, 'bounceban-first', pending))
 
-    def test_failed_status_read_requires_a_later_completed_verdict(self):
-        fixture, document, pending = self.verification_chain()
-        route = next(r for r in document['routes'] if r['route_id'] == 'bounceban-wait')
-        path = fixture.path.parent / 'receipts/bounceban-wait.json'
-        saved = json.loads(path.read_text())
-        route['provider_status'] = saved['status'] = 'provider_error'
-        saved.pop('pending_verification')
-        saved['provider_response']['body'] = {'status': 'error', 'error': 'Failed read'}
-        path.write_text(json.dumps(saved))
-        self.assertTrue(receipts.verification_finished(fixture.path, document, 'bounceban-first', pending))
-        document['stop_audit']['route_frontier'][-2].pop('continuation_route_ids')
-        self.assertFalse(receipts.verification_finished(fixture.path, document, 'bounceban-first', pending))
 
-    def test_rejected_dispatch_does_not_reserve_or_call_provider(self):
-        fixture=attempt_tests.AttemptExecutionTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
-        fixture.doc['unresolved'] = [{'stage': 'contact', 'candidate': {'domain': 'example.com'},
-            'account_fit': {'evidence_url': 'https://example.com/product', 'evidence_text': 'Verified platform fit.'}}]
-        fixture.path.write_text(json.dumps(fixture.doc))
-        selected_profile(fixture.path, fixture.doc, 'example.com')
-        spec=fixture.spec('bad-fallback',paid=True)
-        spec['action'].update(phase='email_validation', scope='example.com')
-        spec['request'].update(tool='bounceban_verify_single',payload={'email':'buyer@example.com'})
-        with patch.object(run_attempt,'check_fallback',side_effect=ValueError('no eligible same-email receipt')) as guard:
-            with patch.object(run_attempt.budget_guard,'reserve') as reserve:
-                with self.assertRaisesRegex(ValueError,'no eligible'):
-                    run_attempt.run_attempt(fixture.path,spec,execute=lambda *_:self.fail('Provider called'))
-                guard.assert_called_once();reserve.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()

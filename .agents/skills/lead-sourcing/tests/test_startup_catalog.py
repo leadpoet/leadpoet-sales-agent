@@ -123,7 +123,6 @@ class StartupCatalogTests(unittest.TestCase):
     def test_native_start_passes_original_user_deadline_to_every_prerequisite(self):
         request = setup_request()['request']
         request['max_duration_seconds'] = 20
-        request['contact_fields'] = ['email']
         old_start = (self.clock.origin - timedelta(seconds=30)).isoformat()
         self.tools.execute = lambda *args: self.fail('Expired setup cannot dispatch')
         with patch.dict('os.environ', {'TYCHE_RUN_STARTED_AT': old_start}):
