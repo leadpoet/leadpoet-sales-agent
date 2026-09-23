@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-/** Export accepted TYCHE company-contact pairs to a styled Excel workbook. */
+/** Export accepted TYCHE companies to a styled Excel workbook. */
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -11,41 +11,28 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 export const XLSX_COLUMNS = [
-  "Name",
-  "Email",
-  "Role",
   "Company",
-  "LinkedIn",
   "Website",
   "Company LinkedIn",
   "Industry",
   "Sub Industry",
-  "Contact City",
-  "Contact State",
-  "Contact Country",
   "HQ State",
   "HQ Country",
   "Company Employee Range",
   "Description",
+  "Signals",
   "Intent Details",
-  "Phone",
 ];
 
-export const CLIENT_XLSX_COLUMNS = [
-  ...XLSX_COLUMNS.slice(0, 16), "Signals", ...XLSX_COLUMNS.slice(16),
-];
+export const CLIENT_XLSX_COLUMNS = XLSX_COLUMNS;
 export const SOURCE_COLUMNS = [
   "Company", "Domain", "Field", "Signal", "Evidence Date", "Date Basis",
   "Observed On", "Source URL", "Evidence Text",
 ];
-const COLUMN_LETTERS = [
-  "A", "B", "C", "D", "E", "F", "G", "H", "I",
-  "J", "K", "L", "M", "N", "O", "P", "Q", "R",
-];
+const COLUMN_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"];
 
 const COLUMN_WIDTHS = [
-  24, 28, 38, 26, 44, 30, 40, 20, 28,
-  18, 18, 18, 18, 18, 16, 48, 72, 20,
+  26, 30, 40, 20, 28, 18, 18, 20, 48, 72, 72,
 ];
 
 export class ExportError extends Error {}
@@ -59,10 +46,10 @@ class ExportTimeoutError extends ExportError {
 
 function isClientOutput(document) {
   const version = document.schema_version;
-  if (version !== undefined && !["1.0", "1.1", "1.2"].includes(version)) {
-    throw new ExportError("schema_version must be 1.0, 1.1 or 1.2");
+  if (version !== "2.0") {
+    throw new ExportError("schema_version must be 2.0");
   }
-  return version === "1.2";
+  return true;
 }
 
 function validateOutput(document, resultsPath, partial = false) {
@@ -94,32 +81,6 @@ function clientText(value) {
   return text(value).replace(/\s*—\s*/g, " - ").replace(/[ \t]+$/gm, "").trim();
 }
 
-function isLinkedInUrl(value) {
-  if (!value) return false;
-  try {
-    const host = new URL(value).hostname.toLowerCase();
-    return host === "linkedin.com" || host.endsWith(".linkedin.com");
-  } catch {
-    return false;
-  }
-}
-
-function isLinkedInProfileUrl(value) {
-  if (!isLinkedInUrl(value)) return false;
-  return /^\/in\/[^/]+\/?$/i.test(new URL(value).pathname);
-}
-
-function contactLinkedIn(contact) {
-  const explicit = text(contact.linkedin_url);
-  if (explicit) return explicit;
-  // Older records: a person's profile page in contact_url stands in, otherwise the profile URL of the
-  // contact's own receipt-validated evidence. A company page or a post never does, and nothing is invented.
-  const contactUrl = text(contact.contact_url);
-  if (isLinkedInProfileUrl(contactUrl)) return contactUrl;
-  const evidenceUrl = text(object(contact.location_evidence).evidence_url);
-  return isLinkedInProfileUrl(evidenceUrl) ? evidenceUrl : "";
-}
-
 function employeeRange(value, field) {
   const normalized = text(value).replace(/[\s,]/g, "").replace(/[–—]/g, "-");
   const match = /^(\d+)(?:-(\d+)|(\+))$/.exec(normalized);
@@ -127,20 +88,6 @@ function employeeRange(value, field) {
     throw new ExportError(`${field} requires the LinkedIn employee range`);
   }
   return normalized;
-}
-
-function intentDetails(signal) {
-  const parts = [
-    ["Signal", signal.signal],
-    ["Date", signal.evidence_date],
-    ["Details", signal.evidence_text],
-    ["Source", signal.evidence_url],
-  ];
-  return parts
-    .map(([label, value]) => [label, text(value)])
-    .filter(([, value]) => value)
-    .map(([label, value]) => `${label}: ${value}`)
-    .join("; ");
 }
 
 function reviewedSignals(row) {
@@ -181,30 +128,6 @@ function signalsFor(row) {
   }))].join("\n\n");
 }
 
-function requestedContactFields(document) {
-  const request = object(document.request);
-  const fields = request.contact_fields;
-  if (fields === undefined) return new Set(["email"]);
-  if (!Array.isArray(fields)) {
-    throw new ExportError("results.json request.contact_fields must be an array");
-  }
-  return new Set(fields);
-}
-
-function requestedValue(contact, field, requestedFields, index) {
-  if (!requestedFields.has(field)) return "";
-  const value = text(contact[field]);
-  if (!value) {
-    throw new ExportError(
-      `accepted[${index}].primary_contact.${field} is required because contact_fields requests it`,
-    );
-  }
-  if (field === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
-    throw new ExportError(`accepted[${index}].primary_contact.email is invalid`);
-  }
-  return value;
-}
-
 export function rowsFor(document, resultsPath) {
   if (!document || typeof document !== "object" || Array.isArray(document)) {
     throw new ExportError("results.json must contain one JSON object");
@@ -218,57 +141,32 @@ export function rowsFor(document, resultsPath) {
 }
 
 function validatedRows(document, validated) {
-  const clientOutput = isClientOutput(document);
-  const requestedFields = requestedContactFields(document);
-  return document.accepted.flatMap((acceptedRow, index) => {
+  isClientOutput(document);
+  return document.accepted.map((acceptedRow, index) => {
     if (!acceptedRow || typeof acceptedRow !== "object" || Array.isArray(acceptedRow)) {
       throw new ExportError(`accepted[${index}] must be an object`);
     }
     const company = object(acceptedRow.company);
-    const signal = object(acceptedRow.signal_evidence);
-    return [acceptedRow.primary_contact, ...(acceptedRow.backup_contacts || [])]
-      .filter((_, contactIndex) => validated.contact_indexes[index].includes(contactIndex)).map((person) => {
-      const contact = object(person);
-      if (!Object.keys(company).length || !Object.keys(contact).length) {
-        throw new ExportError(
-          `accepted[${index}] requires company and primary_contact objects`,
-        );
-      }
-
-      const requiredValues = {
-        Name: clientText(contact.full_name),
-        Role: clientText(contact.current_title),
-        Company: clientText(company.canonical_name),
-      };
+    if (!Object.keys(company).length) throw new ExportError(`accepted[${index}] requires company`);
+      const requiredValues = { Company: clientText(company.canonical_name) };
       for (const [label, value] of Object.entries(requiredValues)) {
         if (!value) throw new ExportError(`accepted[${index}] requires ${label}`);
       }
 
       const range = employeeRange(company.employee_range, `accepted[${index}].company.employee_range`);
-      const email = requestedValue(contact, "email", requestedFields, index);
-      const phone = requestedValue(contact, "phone", requestedFields, index);
       return {
-        Name: requiredValues.Name,
-        Email: email,
-        Role: requiredValues.Role,
         Company: requiredValues.Company,
-        LinkedIn: contactLinkedIn(contact),
         Website: validated.websites[index],
         "Company LinkedIn": text(company.linkedin_url),
         Industry: clientText(company.industry),
         "Sub Industry": clientText(company.sub_industry),
-        "Contact City": clientText(contact.city),
-        "Contact State": clientText(contact.state),
-        "Contact Country": clientText(contact.country),
         "HQ State": clientText(company.hq_state),
         "HQ Country": clientText(company.hq_country),
         "Company Employee Range": range,
         Description: clientText(company.description),
-        ...(clientOutput ? { Signals: signalsFor(acceptedRow) } : {}),
-        "Intent Details": clientOutput ? clientText(acceptedRow.intent_details) : intentDetails(signal),
-        Phone: phone,
+        Signals: signalsFor(acceptedRow),
+        "Intent Details": clientText(acceptedRow.intent_details),
       };
-    });
   });
 }
 
@@ -289,11 +187,11 @@ function matrixFor(rows, columns = XLSX_COLUMNS, literalText = false) {
 }
 
 export function sourcesFor(document, resultsPath) {
-  const validated = validateOutput(document, resultsPath);
-  return sourceRowsFor(document, validated.contact_indexes);
+  validateOutput(document, resultsPath);
+  return sourceRowsFor(document);
 }
 
-function sourceRowsFor(document, contactIndexes) {
+function sourceRowsFor(document) {
   const rows = [];
   for (const [index, row] of document.accepted.entries()) {
     const company = object(row.company);
@@ -317,13 +215,6 @@ function sourceRowsFor(document, contactIndexes) {
     };
     add("Description", row.account_fit);
     for (const signal of reviewedSignals(row)) add("Signals", signal, signal.signal);
-    add("Role", row.primary_contact);
-    add("Contact Location", row.primary_contact.location_evidence);
-    for (const [backupIndex, contact] of (row.backup_contacts || []).entries()) {
-      if (!contactIndexes[index].includes(backupIndex + 1)) continue;
-      add(`Role: ${contact.full_name}`, contact);
-      add(`Contact Location: ${contact.full_name}`, contact.location_evidence);
-    }
     add("Company Employee Range", company.employee_range_evidence);
     for (const check of row.qualification_checks || []) {
       for (const evidence of check.evidence || []) {
@@ -381,20 +272,20 @@ export async function exportXlsx(document, destination, options = {}) {
   const validated = validateOutput(document, options.resultsPath, options.partial);
   if (options.partial) document = validated.document;
   const rows = validatedRows(document, validated);
-  const clientOutput = isClientOutput(document);
-  const columns = clientOutput ? CLIENT_XLSX_COLUMNS : XLSX_COLUMNS;
-  const sourceRows = clientOutput ? sourceRowsFor(document, validated.contact_indexes) : [];
-  const lastColumn = clientOutput ? "S" : "R";
+  isClientOutput(document);
+  const columns = XLSX_COLUMNS;
+  const sourceRows = sourceRowsFor(document);
+  const lastColumn = "K";
   const { Workbook, SpreadsheetFile, FileBlob } = await loadArtifactTool(options.nodeModules);
   const workbook = Workbook.create();
-  const sheet = workbook.worksheets.add("Leads");
+  const sheet = workbook.worksheets.add("Companies");
   const lastRow = rows.length + 1;
   const usedRangeAddress = `A1:${lastColumn}${lastRow}`;
 
-  sheet.getRange(usedRangeAddress).values = matrixFor(rows, columns, clientOutput);
+  sheet.getRange(usedRangeAddress).values = matrixFor(rows, columns, true);
   sheet.showGridLines = false;
   sheet.freezePanes.freezeRows(1);
-  sheet.freezePanes.freezeColumns(4);
+  sheet.freezePanes.freezeColumns(2);
 
   const header = sheet.getRange(`A1:${lastColumn}1`);
   header.format = {
@@ -414,21 +305,20 @@ export async function exportXlsx(document, destination, options = {}) {
       verticalAlignment: "top",
       rowHeight: 66,
     };
-    sheet.getRange(`C2:C${lastRow}`).format.wrapText = true;
-    sheet.getRange(`P2:${clientOutput ? "R" : "Q"}${lastRow}`).format.wrapText = true;
-    sheet.getRange(`O2:O${lastRow}`).format.numberFormat = "#,##0";
+    sheet.getRange(`A2:K${lastRow}`).format.wrapText = true;
+    sheet.getRange(`H2:H${lastRow}`).format.numberFormat = "#,##0";
 
-    const table = sheet.tables.add(usedRangeAddress, true, "LeadsTable");
+    const table = sheet.tables.add(usedRangeAddress, true, "CompaniesTable");
     table.style = "TableStyleMedium2";
     table.showFilterButton = true;
   }
 
-  const widths = clientOutput ? [...COLUMN_WIDTHS.slice(0, 16), 72, ...COLUMN_WIDTHS.slice(16)] : COLUMN_WIDTHS;
-  const letters = clientOutput ? [...COLUMN_LETTERS, "S"] : COLUMN_LETTERS;
+  const widths = COLUMN_WIDTHS;
+  const letters = COLUMN_LETTERS;
   letters.forEach((column, index) => {
     sheet.getRange(`${column}1:${column}${lastRow}`).format.columnWidth = widths[index];
   });
-  if (clientOutput) {
+  {
     if (rows.length) sheet.getRange(`A2:${lastColumn}${lastRow}`).format.wrapText = true;
     rows.forEach((row, index) => {
       sheet.getRange(`A${index + 2}:${lastColumn}${index + 2}`).format.rowHeight = wrappedRowHeight(
@@ -471,10 +361,10 @@ export async function exportXlsx(document, destination, options = {}) {
 
   const partialStatus = options.partial ? [
     ["Status", "Partial: research incomplete"],
-    ["Confirmed leads", validated.confirmed_count],
-    ["Requested leads", validated.target_count],
+    ["Confirmed companies", validated.confirmed_count],
+    ["Requested companies", validated.target_count],
     ["Remaining", validated.shortfall],
-    ["Scope", "Confirmed leads only. Research is incomplete."],
+    ["Scope", "Confirmed companies only. Research is incomplete."],
   ] : null;
   if (partialStatus) {
     const status = workbook.worksheets.add("Status");
@@ -488,20 +378,20 @@ export async function exportXlsx(document, destination, options = {}) {
   workbook.recalculate();
   const regionInspection = await workbook.inspect({
     kind: "region",
-    sheetId: "Leads",
+    sheetId: "Companies",
     range: usedRangeAddress,
     maxChars: 12000,
   });
   const formulaInspection = await workbook.inspect({
     kind: "formula",
-    sheetId: "Leads",
+    sheetId: "Companies",
     range: usedRangeAddress,
     maxChars: 4000,
     options: { maxResults: 50 },
   });
   const errorInspection = await workbook.inspect({
     kind: "match",
-    sheetId: "Leads",
+    sheetId: "Companies",
     range: usedRangeAddress,
     searchTerm: "#REF!|#DIV/0!|#VALUE!|#NAME\\?|#N/A",
     maxChars: 4000,
@@ -511,7 +401,7 @@ export async function exportXlsx(document, destination, options = {}) {
   if (options.preview) {
     await fs.mkdir(path.dirname(path.resolve(options.preview)), { recursive: true });
     const preview = await workbook.render({
-      sheetName: "Leads",
+      sheetName: "Companies",
       autoCrop: "all",
       scale: 1,
       format: "png",
@@ -529,14 +419,14 @@ export async function exportXlsx(document, destination, options = {}) {
     const temporaryWorkbook = path.join(temporaryDirectory, "leads.xlsx");
     await output.save(temporaryWorkbook);
     const restored = await SpreadsheetFile.importXlsx(await FileBlob.load(temporaryWorkbook));
-    const actual = restored.worksheets.getItem("Leads").getRange(usedRangeAddress).values;
+    const actual = restored.worksheets.getItem("Companies").getRange(usedRangeAddress).values;
     const expected = matrixFor(rows, columns);
-    const formulas = restored.worksheets.getItem("Leads").getRange(usedRangeAddress).formulas;
+    const formulas = restored.worksheets.getItem("Companies").getRange(usedRangeAddress).formulas;
     if (formulas.flat().some(value => typeof value === "string" && value.startsWith("="))) throw new WorkbookVerificationError("Saved lead cells must be literal values");
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
       throw new WorkbookVerificationError("Saved workbook values differ from validated lead rows");
     }
-    if (clientOutput) {
+    {
       const sourceValues = restored.worksheets.getItem("Sources").getRange(`A1:I${sourceRows.length + 1}`).values;
       const expectedSources = matrixFor(sourceRows, SOURCE_COLUMNS);
       const sourceFormulas = restored.worksheets.getItem("Sources").getRange(`A1:I${sourceRows.length + 1}`).formulas;
@@ -579,7 +469,7 @@ export async function exportXlsx(document, destination, options = {}) {
   }
 
   const { document: projected, websites, errors, valid, ...partialMetadata } = validated;
-  return { rows: rows.length, contacts: rows.length, columns: columns.length, inspection,
+  return { rows: rows.length, companies: rows.length, columns: columns.length, inspection,
     ...(options.partial ? partialMetadata : {}) };
 }
 

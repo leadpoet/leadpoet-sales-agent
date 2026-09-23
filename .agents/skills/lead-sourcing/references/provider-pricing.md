@@ -5,7 +5,7 @@ The local launcher counts provider charges plus estimated base LLM
 cost from individual response usage, including retries and compaction. The
 budget is a stopping threshold. A call already in flight can cross it; no new
 paid work starts after the threshold is observed. No money is reserved for
-future calls or email verification, and the model supplies no price guesses.
+future calls, and the model supplies no price guesses.
 
 Historical reserved-budget runs retain catalog-backed and versioned managed-price reservations. Their original ledgers, verification reserve and hard provider caps are preserved.
 
@@ -30,12 +30,6 @@ An exact matching billing record with `status: error`, `charge_state: failed`,
 response with no returned results. The error response alone cannot settle it.
 Preserve IDs, receipts and the
 original limits; never repeat a paid call to discover its cost.
-
-The one-person `zerobounce_email_finder`, `leadmagic_email_finder`, and
-`leadmagic_profile_search` calls use their published one-result rate only when
-the request identifies the person and the catalog declares no numeric quantity
-input. Open searches and unclear contracts remain unpriced. This price
-calculation does not reserve money or change actual-cost admission.
 
 `run-costs.json` shows `provider_usd`, `estimated_llm_usd`, `total_usd` and
 `pending_provider_calls`. The total is the known subtotal when status is

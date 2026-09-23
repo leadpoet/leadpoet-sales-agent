@@ -39,9 +39,8 @@ def strings(value, label, *, empty=False):
 
 def normalize_request(value, run_file, *, saved=None, started_at=None):
     """Apply mechanical defaults to new inputs; never infer roles or intent."""
-    allowed = {"target_count", "icp", "buying_signals", "requested_roles", "time_window",
-               "budget", "contact_fields", "contacts_per_company", "min_contacts_per_company", "target_contacts_per_company", "contact_role_groups",
-               "contacts_required", "signal_match_mode", "run_id", "as_of_date", "max_duration_seconds", "product_service", "original_text"}
+    allowed = {"target_count", "icp", "buying_signals", "time_window", "budget",
+               "signal_match_mode", "run_id", "as_of_date", "max_duration_seconds", "product_service", "original_text"}
     object_fields(value, allowed, "request")
     request = copy.deepcopy(value)
     prior = saved or {}
@@ -75,23 +74,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
                 raise ValueError("company_size bounds are reversed")
         else:
             strings(values, "icp." + key, empty=key == "exclusions")
-    contacts_required = request.get("contacts_required", True)
-    if type(contacts_required) is not bool:
-        raise ValueError("contacts_required must be true or false")
-    contact_policy_fields = {
-        "requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
-        "min_contacts_per_company", "target_contacts_per_company",
-    }
-    if not contacts_required and contact_policy_fields & request.keys():
-        raise ValueError("contacts_required=false cannot include contact roles, fields or counts")
-    if "contact_role_groups" in request:
-        groups = request["contact_role_groups"]
-        object_fields(groups, {"primary", "secondary"}, "contact_role_groups")
-        strings(groups.get("primary"), "primary roles")
-        strings(groups.get("secondary"), "secondary roles", empty=True)
-        request.setdefault("requested_roles", list(dict.fromkeys(groups["primary"] + groups["secondary"])))
-    if contacts_required:
-        strings(request.get("requested_roles"), "requested_roles")
     if not isinstance(request.get("buying_signals"), list) or not request["buying_signals"]:
         raise ValueError("buying_signals must contain the agent's interpreted signals")
     window = request.setdefault("time_window", {})
@@ -126,26 +108,8 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
     fallback_id = Path(run_file).parent.name
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", fallback_id):
         fallback_id = "run-" + hashlib.sha256(str(Path(run_file).resolve()).encode()).hexdigest()[:16]
-    from validate_run import contact_limits, explicit_contact_policy
-    if prior and prior.get("contacts_required", True) != contacts_required:
-        raise ValueError("resume must preserve contacts_required")
-    if not contacts_required:
-        contact_limits(request)
-    elif prior and not explicit_contact_policy(prior) and not explicit_contact_policy(request):
-        # Preserve old request fingerprints and their best-effort backup policy.
-        request.setdefault("contacts_per_company", prior.get("contacts_per_company", 1))
-        contact_limits(request)
-    else:
-        for key in ("min_contacts_per_company", "target_contacts_per_company"):
-            if key in prior:
-                request.setdefault(key, prior[key])
-        minimum, contact_target = contact_limits(request)
-        request.pop("contacts_per_company", None)
-        request.update(min_contacts_per_company=minimum, target_contacts_per_company=contact_target)
     defaults = {"signal_match_mode": "any", "run_id": fallback_id,
                 "as_of_date": window.get("as_of_date", date)}
-    if contacts_required:
-        defaults["contact_fields"] = ["email"]
     if not prior:
         defaults["max_duration_seconds"] = None
     elif "max_duration_seconds" in prior:
@@ -228,7 +192,9 @@ def start_document(run_file, setup, *, existing=None, ledger=None):
     policy = setup.get("budget_policy", saved_policy)
     if policy not in {"actual_cost", "reserved"} or (existing or ledger) and policy != saved_policy:
         raise ValueError("Budget policy must be supported and preserve the saved ledger")
-    document = dict(schema_version="1.2", run_id=request.get("run_id", existing.get("run_id")), retrieved_at=started,
+    from validate_run import COMPANY_RESULT_SCHEMA_VERSION
+    document = dict(schema_version=COMPANY_RESULT_SCHEMA_VERSION,
+        run_id=request.get("run_id", existing.get("run_id")), retrieved_at=started,
         request=request, budget={"policy": policy, "limits": limits,
                                 "spent": {"deepline_credits": 0, "scrapingdog_credits": 0}, "paid_calls": 0, "status": "within_budget"},
         routes=[], accepted=[], rejected=[], unresolved=[], summary={},
@@ -258,7 +224,7 @@ def normalize_provider_request(provider, request, label):
 def prepare_lookup(value, label="lookup"):
     """The agent selects target, purpose and request; derive bookkeeping only."""
     object_fields(value, {"provider", "request", "scope", "phase", "purpose", "approach",
-                          "max_cost_credits", "status_read", "pricing_basis", "contact_ref"}, label)
+                          "max_cost_credits", "status_read", "pricing_basis"}, label)
     provider = value.get("provider", "deepline")
     _, request = normalize_provider_request(provider, value.get("request"), label)
     catalog = provider == "deepline" and request.get("operation") in {"search", "describe"}
@@ -273,8 +239,6 @@ def prepare_lookup(value, label="lookup"):
         action["status_read"] = value["status_read"]
     if "pricing_basis" in value:
         action["pricing_basis"] = copy.deepcopy(value["pricing_basis"])
-    if "contact_ref" in value:
-        action["contact_ref"] = text(value["contact_ref"], label + ".contact_ref")
     return {"action": action, "request": request}
 
 
@@ -311,14 +275,6 @@ def check_tool_contract(receipt, request):
         if kind in valid and not valid[kind]:
             raise ValueError(f"provider payload.{name} must be {kind}")
     _check_native_schema(native, payload)
-    if request["tool"] == "hunter_email_finder":
-        if any(isinstance(payload.get(key), str) and re.search(r"[()]", payload[key])
-               for key in ("first_name", "last_name")):
-            raise ValueError("Hunter rejects parenthesized names. Choose an eligible LinkedIn-based email lookup for this verified profile; do not guess or override its identity. No paid call was made.")
-    if request["tool"] == "hunter_email_finder" and "last_name" in payload:
-        last = payload["last_name"]
-        if isinstance(last, str) and sum(c.isalpha() for c in last) < 2:
-            raise ValueError("Hunter requires at least two surname letters; the selected surname is too short for this endpoint. Verify the full surname or choose an eligible LinkedIn-based lookup. Do not guess a name. No paid call was made.")
 
 
 def _catalog_schema(schema):
@@ -381,29 +337,17 @@ def _criterion_key(value):
     return " ".join(text(value, "criterion").split()).casefold()
 
 
-def canonical_requested_role(value, roles):
-    """Resolve spacing/case and unambiguous C-suite abbreviations in saved roles."""
-    aliases = {"ceo": "chief executive officer", "coo": "chief operating officer"}
-    # Sector-dependent abbreviations need an explicit choice from saved roles.
-    def key(role):
-        return " ".join(role.casefold().split()) if isinstance(role, str) else ""
-    exact = [r for r in roles if key(r) == key(value)]
-    if len(exact) == 1:
-        return exact[0]
-    expanded = aliases.get(key(value), key(value))
-    matches = [r for r in roles if aliases.get(key(r), key(r)) == expanded]
-    return matches[0] if len(matches) == 1 else value
-
-
 def company_update(document, item):
     """Apply explicit field/criterion updates, preserving unrelated evidence."""
     object_fields(item, {"scope", "state", "stage", "reason_code", "reason_text", "company",
-                         "qualification_checks", "supporting_findings", "account_fit", "signal_evidence", "intent_details",
-                         "primary_contact", "backup_contacts"}, "company update")
+                         "qualification_checks", "supporting_findings", "account_fit", "signal_evidence",
+                         "intent_details"}, "company update")
     from validate_run import _company_key, company_website
+    if item.get("stage") not in {None, "account"}:
+        raise ValueError("Company sourcing has only the account stage")
     scope = text(item.get("scope"), "company update.scope").casefold().removeprefix("www.")
     matches = [(state, row) for state in ("accepted", "unresolved", "rejected") for row in document.get(state, [])
-               if _company_key(row) == scope and (state == "accepted" or row.get("stage") in {"account", "contact"})]
+               if _company_key(row) == scope and (state == "accepted" or row.get("stage") == "account")]
     if len(matches) > 1:
         raise ValueError("company has multiple saved records; reconcile before updating")
     old_state, old = matches[0] if matches else ("unresolved", {})
@@ -482,10 +426,10 @@ def company_update(document, item):
         errors = supporting_finding_errors(item["supporting_findings"], "supporting_findings")
         if errors:
             raise ValueError("; ".join(errors))
-    for key in ("account_fit", "signal_evidence", "supporting_findings", "intent_details", "primary_contact", "backup_contacts"):
+    for key in ("account_fit", "signal_evidence", "supporting_findings", "intent_details"):
         if key in item:
             # These are explicit complete replacements, never an implicit
-            # recursive merge of contacts or conflicting source identities.
+            # recursive merge of conflicting source identities.
             row[key] = copy.deepcopy(item[key])
     primary = row.get("signal_evidence") or {}
     canonical = (not primary or primary.get("criterion") or
@@ -507,19 +451,10 @@ def company_update(document, item):
     if state == "accepted":
         for key in ("stage", "reason_code", "reason_text"):
             row.pop(key, None)
-        if document["request"].get("contacts_required", True):
-            row.setdefault("backup_contacts", [])
-        else:
-            row.pop("primary_contact", None)
-            row.pop("backup_contacts", None)
-        row["contact_candidate_count"] = int(bool(row.get("primary_contact"))) + len(row.get("backup_contacts", []))
-        from validate_run import contact_count, contact_limits
-        row["backup_shortfall"] = max(0, contact_limits(document["request"])[1] - contact_count(row, document["request"]))
     else:
         row.setdefault("stage", item.get("stage", "account"))
         if state != old_state or item.get("stage", row["stage"]) != row["stage"] or "reason_code" not in row:
-            row["reason_code"] = ("not_icp_fit" if state == "rejected" else
-                                  "missing_contact_evidence" if item.get("stage", row["stage"]) == "contact" else "missing_account_evidence")
+            row["reason_code"] = "not_icp_fit" if state == "rejected" else "missing_account_evidence"
         for key in ("stage", "reason_code", "reason_text"):
             if key in item:
                 row[key] = item[key]

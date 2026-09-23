@@ -20,11 +20,9 @@ def setup_request():
     return {"request": {"target_count": 5,
         "icp": {"industries": ["Payments infrastructure"], "geographies": ["Singapore"],
                 "exclusions": ["tazapay.com"]},
-        "requested_roles": ["Head of Payments", "Chief Operating Officer"],
-        "contact_role_groups": {"primary": ["Head of Payments"], "secondary": ["Chief Operating Officer"]},
         "buying_signals": [{"kind": "PARTNERSHIP", "importance": "required", "query": "Required partnership or market expansion"},
                            {"kind": "HIRING", "importance": "preferred", "query": "Preferred integrations or ops hiring", "max_age_days": 90}],
-        "time_window": {"max_age_days": 365}, "contact_fields": []}}
+        "time_window": {"max_age_days": 365}}}
 
 
 def catalog(request, capture):
@@ -51,7 +49,8 @@ class StartRunTests(unittest.TestCase):
     def test_start_and_resume_preserve_request_clock_evidence_and_spend(self):
         status = runner.start_run(self.path, self.setup)
         initial = json.loads(self.path.read_text())
-        self.assertEqual(status["request"]["target_contacts_per_company"], 1)
+        self.assertNotIn("target_contacts_per_company", status["request"])
+        self.assertEqual(initial["schema_version"], "2.0")
         self.assertIsNone(status["request"]["max_duration_seconds"])
         for key, value in self.setup["request"].items():
             self.assertEqual(initial["request"][key], value)
@@ -64,6 +63,8 @@ class StartRunTests(unittest.TestCase):
         receipts = {p.name: p.read_bytes() for p in self.path.parent.joinpath("receipts").glob("*.json")}
         runner.start_run(self.path, self.setup)
         self.assertEqual(self.path.read_bytes(), before)
+
+
         self.assertEqual(guard.ledger_path(self.path).read_bytes(), ledger)
         self.assertEqual({p.name: p.read_bytes() for p in self.path.parent.joinpath("receipts").glob("*.json")}, receipts)
         self.assertEqual(json.loads(self.path.read_text())["stop_check"]["started_at"], initial["stop_check"]["started_at"])
@@ -125,26 +126,26 @@ class StartRunTests(unittest.TestCase):
         variants[2]["request"]["contact_fields"] = "email"
         variants[3]["request"]["budget"] = {"deepline_credits": "25", "hard_stop": True}
         variants[4]["request"]["budget"] = {"hard_stop": False}
-        variants[5]["request"].pop("requested_roles")
-        variants[5]["request"].pop("contact_role_groups")
+        variants[5]["request"].pop("buying_signals")
         for setup in variants:
             with self.subTest(setup=setup), self.assertRaises(ValueError):
                 runner.start_run(self.path, setup)
             self.assertFalse(self.path.exists())
             self.assertFalse(self.path.with_name("results.json.budget.json").exists())
 
-    def test_role_groups_supply_combined_list_and_preserve_it_on_resume(self):
-        expected = self.setup["request"].pop("requested_roles")
+    def test_company_request_is_preserved_on_resume(self):
+        expected = copy.deepcopy(self.setup["request"])
         before_input = copy.deepcopy(self.setup)
         status = runner.start_run(self.path, self.setup)
-        self.assertEqual(status["request"]["requested_roles"], expected)
+        self.assertEqual(status["request"]["icp"], expected["icp"])
+        self.assertEqual(status["request"]["buying_signals"], expected["buying_signals"])
         self.assertEqual(self.setup, before_input)
         before, ledger = self.path.read_bytes(), guard.ledger_path(self.path).read_bytes()
         runner.start_run(self.path, self.setup)
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(guard.ledger_path(self.path).read_bytes(), ledger)
         changed = copy.deepcopy(self.setup)
-        changed["request"]["contact_role_groups"]["secondary"] = ["Head of Sales"]
+        changed["request"]["icp"]["industries"] = ["Manufacturing"]
         with self.assertRaises(ValueError):
             runner.start_run(self.path, changed)
         self.assertEqual(self.path.read_bytes(), before)
@@ -181,19 +182,12 @@ class StartRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "disabled"):
             guard.check_allowance(guard.load_ledger(self.path), "deepline", .1, 0)
 
-    def test_explicit_contacts_and_cap_survive_resume_without_reserve(self):
+    def test_contact_request_fields_are_rejected_without_files(self):
         self.setup["request"].update(contacts_per_company=3, contact_fields=["email"])
-        self.setup["request"]["max_duration_seconds"] = None
-        self.setup.update(max_usd=2)
-        runner.start_run(self.path, self.setup)
-        saved = json.loads(self.path.read_text())
-        self.assertEqual(saved["request"]["target_contacts_per_company"], 3)
-        before, ledger = self.path.read_bytes(), guard.ledger_path(self.path).read_bytes()
-        for key, value in [("max_usd", 3), ("started_at", "2020-01-01T00:00:00Z")]:
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                runner.start_run(self.path, {**self.setup, key: value})
-            self.assertEqual(self.path.read_bytes(), before)
-            self.assertEqual(guard.ledger_path(self.path).read_bytes(), ledger)
+        with self.assertRaisesRegex(ValueError, "unexpected fields"):
+            runner.start_run(self.path, self.setup)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.path.with_name("results.json.budget.json").exists())
 
     def test_interrupted_initialization_retains_original_settings(self):
         replace = guard.os.replace
@@ -219,7 +213,7 @@ class StartRunTests(unittest.TestCase):
         subprocess.run(command + ["--start-file", "-"], input=json.dumps(self.setup), text=True, capture_output=True, check=True)
         before = self.path.read_bytes()
         status = subprocess.run(command + ["--status"], text=True, capture_output=True, check=True)
-        self.assertEqual(json.loads(status.stdout)["request"]["target_contacts_per_company"], 1)
+        self.assertEqual(json.loads(status.stdout)["request"]["target_count"], 5)
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_legacy_resume_does_not_backfill_defaults_or_reset_records(self):
@@ -728,6 +722,30 @@ class SavedWorkbookJourneyTests(unittest.TestCase):
         self.assertIn(observations[0][2], original_receipt.decode())
         self.assertEqual(json.loads(path.read_text())["accepted"], before["accepted"])
         self.assertEqual(guard.ledger_path(path).read_bytes(), ledger)
+
+class CompanyToolBoundaryTests(unittest.TestCase):
+    RETAINED_TOOLS = (
+        "contextdev_get_web_scrape_markdown", "contextdev_post_news_search",
+        "contextdev_post_web_search", "exa_answer", "exa_company_search", "exa_contents",
+        "exa_search", "firecrawl_scrape", "free_simple_company_search", "generic_http_request",
+        "harvestapi_get_company", "harvestapi_get_job", "harvestapi_get_post", "hunter_discover",
+        "predictleads_company_financing_events", "predictleads_company_job_openings",
+        "predictleads_company_news_events", "twitterapi_tweets_by_ids",
+    )
+
+    def test_all_retained_company_tools_are_permitted(self):
+        for tool in self.RETAINED_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertIsNone(runner.company_stage_refusal(
+                    {}, phase="account_verification", tool=tool,
+                    provider="deepline", operation="execute"))
+
+    def test_exact_retired_contact_tools_are_refused(self):
+        for tool in runner.CONTACT_ONLY_TOOL_IDS:
+            with self.subTest(tool=tool):
+                self.assertIn("No call was made", runner.company_stage_refusal(
+                    {}, phase="account_verification", tool=tool,
+                    provider="deepline", operation="execute"))
 
 
 if __name__ == "__main__":

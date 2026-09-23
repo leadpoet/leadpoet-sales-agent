@@ -37,7 +37,6 @@ receipts. Do not call an endpoint directly from this skill.
 | `universal_search` | `GET https://api.scrapingdog.com/search` | `query` or `q` | `country`, `language` | 20. A search result is not evidence until its source is verified. |
 | `scrape` | `GET https://api.scrapingdog.com/scrape` | `url` or compatibility `target_url` (HTTP(S)) | `dynamic`, `premium`, `wait`, `country` | 1 with `dynamic=false`; 5 by default (JS enabled), 10 for premium without JS, 25 for JS + premium, and 10 for country without JS/premium. Country combined with JS/premium has no verified combined tariff. Returns bounded normalized evidence, not a full raw payload. |
 | `linkedin_company` | `GET https://api.scrapingdog.com/profile` (`type=company`, `id`) | `id` or `company_id`, or `url`/`company_url` with a LinkedIn company URL | none | 10 per company request according to the endpoint reference. Profile facts can support identity or fit, not a buying signal. |
-| `linkedin_person` (`linkedin_profile`, `linkedin_person_profile`) | `GET https://api.scrapingdog.com/profile` (`type=profile`, `id`) | `id`, `profile_id`, or `public_identifier`, or `url`, `profile_url`, `person_url`, or `linkedin_url` with a LinkedIn person URL | `premium`, `webhook` | 50–100 depending on protected status; hold 100 until attributable billing distinguishes it. This is exact-profile current-role verification, not broad contact discovery. A `webhook=202` response is unsupported polling and remains unresolved. |
 | `linkedin_job` (`linkedin_job_details`, `linkedin_job_overview`) | `GET https://api.scrapingdog.com/jobs` (`job_id`) | `job_id` or `id`, or `url`, `job_url`, `job_link`, or `linkedin_url` with a LinkedIn job URL | none | 5. One exact job detail; normalizes hiring URL/text/date when present. |
 | `google_jobs` | `GET https://api.scrapingdog.com/google_jobs` | `query` or `q` | `country`, `language`, `uule`, `domain`, `next_page_token`, `chips`, `lrad`, `ltype`, `uds` | 5. Normalized job/company/link/date fields may be null; relative provider dates stay as returned. |
 | `linkedin_jobs` | `GET https://api.scrapingdog.com/jobs` (`field`) | `field`, or compatibility `query`/`q` (copied to `field`) | `geoid`, `location`, `page`, `sort_by`, `job_type`, `exp_level`, `work_type`, `filter_by_company` | 5. One bounded page; only recognized response shapes become rows. |
@@ -50,7 +49,6 @@ python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation
 python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"universal_search","query":"<company> hiring","limit":10}'
 python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"scrape","url":"https://example.com/news/<article>","dynamic":false,"limit":1}'
 python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"linkedin_company","url":"https://www.linkedin.com/company/<slug>","limit":1}'
-python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"linkedin_person","url":"https://www.linkedin.com/in/<public-id>","limit":1}'
 python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"linkedin_job","job_id":"<linkedin-job-id>","limit":1}'
 python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"google_jobs","query":"<company> engineer","country":"us","limit":10}'
 python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation":"linkedin_jobs","field":"<company> engineer","geoid":"90000084","page":1,"limit":10}'
@@ -67,7 +65,7 @@ endpoint tariff and forwarded price options with each receipt. Completed HTTP
 An explicit provider failure settles at zero under the published failed-request
 policy. A local timeout is not proof that the provider failed.
 
-Documented ranges (person profiles 50–100; LinkedIn posts 5 in the endpoint
+Documented ranges (LinkedIn posts are 5 credits in the endpoint
 reference versus 25 on the pricing page), queued responses and lost responses
 retain the full documented ceiling as a separate budget hold. They do not become
 confirmed charges and are never replayed automatically. Those holds count toward
@@ -99,7 +97,7 @@ shape, evidence, budget, and no-retry rules as the core routes.
 | `google_ai_mode` | `GET https://api.scrapingdog.com/google/ai_mode` | `query` or `q` | `country`, `language`, `uule`, `location`, `safe`, `html`; `uule` and `location` cannot both be set | 10. Normalizes answer/text blocks and references into common evidence fields when recognized; text without a source URL is not accepted account evidence. |
 | `google_news` | `GET https://api.scrapingdog.com/google_news` | `query` or `q` | `results`, `country`, `page`, `domain`, `language`, `lr`, `uule`, `tbs`, `safe`, `nfpr`, `html`; `results` is always bounded by `limit` | 5. Normalizes headline/snippet/link/date fields; relative provider dates stay as returned. |
 | `linkedin_post` | `GET https://api.scrapingdog.com/profile/post` (`id`) | `id` or `post_id` | none | 5. The public post schema is not fixed. Only recognized content/identity shapes become rows; unknown successful shapes are `schema_error`. |
-| `x_profile` | `GET https://api.scrapingdog.com/x/profile` (`profileId`) | `profileId`, `profile_id`, or `id` | none | 5. Normalizes profile text and source URL when present; it does not establish a company or current contact role by itself. |
+| `x_profile` | `GET https://api.scrapingdog.com/x/profile` (`profileId`) | `profileId`, `profile_id`, or `id` | none | 5. Normalizes profile text and source URL when present; it does not establish company identity by itself. |
 | `x_post` | `GET https://api.scrapingdog.com/x/post` (`tweetId`) | `tweetId`, `tweet_id`, or `id` | none | 5. Normalizes post text and source URL when present; post identity is not company identity without corroboration. |
 | `youtube_search` | `GET https://api.scrapingdog.com/youtube/search` | `search_query` | `country`, `language`, `sp` (filters or provider next-page token) | 5. Combines recognized `channel_results`, `video_results`, `shorts_results`, and `movie_results` arrays before applying `limit`; common title/link/date/text fields may be null. |
 | `youtube_video` | `GET https://api.scrapingdog.com/youtube/video` | `v` or `video_id`, or a supported YouTube `url` | `country`, `language` | 5. Normalizes video title/description/link and selected metadata; a video is not a company signal without dated, company-linked evidence. |
@@ -129,7 +127,6 @@ python3 .agents/skills/lead-sourcing/scripts/scrapingdog.py --input '{"operation
 ```
 
 The accepted operation aliases are: `linkedin_profile` and
-`linkedin_person_profile` → `linkedin_person`; `linkedin_job_details` and
 `linkedin_job_overview` → `linkedin_job`; `google_maps_search` and
 `google_maps_lookup` → `google_maps`; `google_place`, `google_places`, and
 `google_maps_places` → `google_maps_place`; and `youtube_transcripts` →
@@ -141,17 +138,14 @@ rejected. The dedicated Instagram contract is incomplete, so do not call an
 Instagram endpoint directly or claim Instagram support. If no supported
 operation or live Deepline capability exists for a route, record
 `route_not_connected` as unresolved. Use search-index results to discover URLs
-only; scrape the exact source page before using its text as evidence. A public
-profile can support identity/current role only when it names the person, role,
-and company; it does not prove a buying signal by itself. A CEO is not an
-automatic contact fallback.
+only; scrape the exact source page before using its text as evidence. A public company source can support identity only when it identifies the
+company; it does not prove a buying signal by itself.
 
 Official references: [Documentation overview](https://www.scrapingdog.com/documentation/),
 [Google Search](https://www.scrapingdog.com/documentation/google-search-api/),
 [Universal Search](https://www.scrapingdog.com/documentation/universal-search-api/),
 [web scraping options](https://www.scrapingdog.com/documentation/request-customization/),
 [LinkedIn company profile](https://www.scrapingdog.com/documentation/company-profile-scraper/),
-[LinkedIn person profile](https://www.scrapingdog.com/documentation/person-profile-scraper/),
 [LinkedIn post](https://www.scrapingdog.com/documentation/post-scraper/),
 [LinkedIn Jobs](https://www.scrapingdog.com/documentation/scrape-jobs-search-results/),
 [LinkedIn job details](https://www.scrapingdog.com/documentation/scrape-job-overview/),
@@ -185,10 +179,7 @@ metadata keys are `rank`, `job_id`, `linkedin_id`, `profile_id`, `profileId`,
 `username`, `post_id`,
 `company_url`, `place_id`, `data_id`, `ludocid`, `title`, `location`, `industry`,
 `company_size`, `address`, `phone`, `rating`, `reviews`, and
-`gps_coordinates`, when supplied by the provider. `linkedin_person` can also
-normalize `contact`, `contact_name`, `full_name`, `contact_url`,
-`contact_title`, `current_title`, and `contact_email`; this remains role
-verification, not contact discovery. Missing fields are not inferred.
+`gps_coordinates`, when supplied by the provider. Missing fields are not inferred.
 
 For YouTube search, recognized `channel_results`, `video_results`,
 `shorts_results`, and `movie_results` arrays are combined before `limit` is

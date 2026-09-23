@@ -24,9 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = ROOT / '.agents' / 'skills'
 sys.path.insert(0, str(SKILL_ROOT / 'lead-sourcing' / 'scripts'))
 CODEX_VERSION = '0.154.0'
-# gpt-6-luna is priced and selectable through TYCHE_MODEL. The default stays
-# gpt-5.6-luna until the pinned runtime advertises the candidate for this login.
-DEFAULT_MODEL = 'gpt-5.6-luna'
+# Arena prefixes this model with "openai/" for its OpenRouter Responses route.
+DEFAULT_MODEL = 'gpt-6-luna'
 
 
 def selected_model(environ=os.environ):
@@ -517,7 +516,7 @@ def close_worker(request_file, receipt, environment=None):
     path = directory / 'results.json'
     from research_tools import ResearchTools
     from run_attempt import delivery_preflight, review_fingerprint
-    from validate_run import contact_coverage, sourcing_target_met
+    from validate_run import sourcing_target_met
     def current_invocation(value):
         try:
             stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
@@ -560,7 +559,6 @@ def close_worker(request_file, receipt, environment=None):
             target_met = sourcing_target_met(document)
             status.update(status='complete' if target_met else 'partial', delivery_allowed=True,
                           artifact_verified=True, target_met=target_met,
-                          contact_coverage=contact_coverage(document),
                           shortfall=max(0, status['target_count'] - status['accepted_count']),
                           stop_reason=document.get('stop_reason'), reason='verified_saved_workbook')
         elif not reviewed and not receipt.data.get('failure_kind'):

@@ -21,7 +21,7 @@ Interpret all evidence against the actual request.
 | **Expansion/facilities/capacity** | **PredictLeads:** news-event discovery. **Openmart:** location/opening filters. Company announcements establish planned versus completed activity. | `PredictLeads news events` · [Events](provider-capabilities.md#hiring-events-and-capital) |
 | **Product/service launches** | **PredictLeads:** products and news discovery. Official product pages/changelogs establish launch dates; first detection is not launch. | `PredictLeads products` · [Products](provider-capabilities.md#products-technology-and-operations) |
 | **Acquisitions/ownership changes** | **PredictLeads:** news and relationships. Announcements/filings confirm buyer, target and transaction status. **SEC EDGAR:** relevant US filings. | `PredictLeads acquisitions` · [Events](provider-capabilities.md#hiring-events-and-capital) |
-| **Leadership changes** | Announcements identify changes. **HarvestAPI:** current profiles. **Forager:** role history. **Datagma:** job-change checks. | `Forager role search` · [Roles](provider-capabilities.md#buyers-and-contact-data) |
+| **Leadership changes** | Company announcements and current company pages identify changes. Confirm the named company, position, and effective date. | `company leadership change` · [Events](provider-capabilities.md#hiring-events-and-capital) |
 | **Contracts/regulatory milestones** | Public procurement, regulator records and company announcements; **SEC EDGAR** where applicable. Check jurisdiction and award/approval status. | `contract regulatory news` · [Registries](provider-capabilities.md#registries-vertical-sources-and-source-retrieval) |
 | **Technology adoption/removal** | **BuiltWith:** installed technology/history. **Bloomberry:** changes. **PredictLeads/TheirStack:** detections. Presence alone does not prove a new purchase. | `Bloomberry tech changes` · [Technology](provider-capabilities.md#products-technology-and-operations) |
 | **Advertising/channel investment** | **Adyntel:** advertiser/creative discovery. **HarvestAPI:** LinkedIn ads. **ScrapingDog:** Google/TikTok ads. Activity is not verified spend. | `Adyntel ads` · [Advertising](provider-capabilities.md#advertising-public-statements-and-reviews) |
@@ -40,17 +40,15 @@ pain, layoffs or other request-specific activity missing from the table.
 | **Patents/specialist datasets** | **ScrapingDog:** patents. **DataForSEO:** datasets, catalogs and app discovery. Official registries supply jurisdiction-specific evidence. | [Specialist sources](provider-capabilities.md#registries-vertical-sources-and-source-retrieval) |
 | **Exact-page retrieval** | **Firecrawl:** map/scrape/extract. **Exa:** contents. **ScrapingDog:** rendered pages. **Deepline generic HTTP:** approved public APIs. **Parallel:** bounded research for difficult gaps. | [Retrieval](provider-capabilities.md#registries-vertical-sources-and-source-retrieval) |
 
-### Company and contact checks
+### Company checks
 
 | Need | Providers and strengths | Details |
 |---|---|---|
 | **Company discovery** | **Crustdata/Prospeo/Forager:** structured filters. **DiscoLike/Exa:** niche/semantic discovery. **Aviato:** company search/lookalikes. **Deepline corpus:** bounded SQL discovery. | [Companies](provider-capabilities.md#company-discovery-and-identity) |
 | **Local sites/branches** | **Openmart:** businesses versus brands. **ScrapingDog/Serper/OpenWebNinja:** Maps/local discovery. Resolve the actual operator; branches are not separate companies. | [Companies](provider-capabilities.md#company-discovery-and-identity) |
-| **Identity/location/size** | **Crustdata:** identity resolution. **Limadata:** domain-to-LinkedIn. **HarvestAPI:** company/profile fields. Use Harvest LinkedIn employee ranges; distinguish contact location from HQ. Name-only matches need corroboration. | [LinkedIn contract](output-contract.md#linkedin-location-and-company-size) |
+| **Identity/location/size** | **Crustdata:** identity resolution. **Limadata:** domain-to-LinkedIn. **HarvestAPI:** company fields. Use Harvest LinkedIn employee ranges and company headquarters evidence. Name-only matches need corroboration. | [LinkedIn contract](output-contract.md#linkedin-company-size) |
 | **Business/product fit** | **DiscoLike:** website context. **BuiltWith:** product search. **DataForSEO:** homepage terms. Official product/service pages support qualification. | [Products](provider-capabilities.md#products-technology-and-operations) |
 | **Legal identity** | **GovFiles/OpenSOSData:** covered US registries. **SEC EDGAR:** filings. Relevant official registries elsewhere; a registered agent is not necessarily an owner. | [Registries](provider-capabilities.md#registries-vertical-sources-and-source-retrieval) |
-| **Buyers/current roles** | **HarvestAPI/Crustdata/Forager:** people/roles. **Datagma/Leadmagic:** targeted titles. **Exa:** public-profile gaps. **Aviato:** founders when relevant to requested roles. | [Buyers](provider-capabilities.md#buyers-and-contact-data) |
-| **Work email/validation** | **Hunter/Datagma/ContactOut:** selected-person email. Reuse verified profiles. **ZeroBounce:** required validation; **BounceBan:** eligible fallback only. | [Email gate](deepline-adapter.md#deepline-zerobounce-email-gate) |
 
 ## Use the guide without extra work
 
@@ -73,4 +71,4 @@ Categories are not permissions; disconnected, monitor-only or
 [vendor-only](provider-capabilities.md#documented-only-not-local-operations)
 capabilities are not executable alternatives. Other useful approved reads can
 be discovered dynamically. Preserve qualification, budget, uncertain-charge,
-identity-before-email and stopping rules; no outreach or new subscriptions.
+identity and stopping rules; no outreach or new subscriptions.

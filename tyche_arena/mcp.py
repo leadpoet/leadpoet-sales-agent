@@ -14,7 +14,6 @@ from .output import (checkpoint_transition, checkpointed_companies, deliver,
                      projection_preflight, publish_confirmed, read_output)
 from .public_web import PublicWeb
 import confirmed_leads
-from email_receipts import verification_status_parent
 from research_tools import ResearchTools, TOOLS, validate
 import budget_guard
 import run_attempt
@@ -31,8 +30,8 @@ def lab_tools():
         "For web qualifications use a successful research page captured by tyche_open or tyche_lookup (ScrapingDog scrape or a Deepline page reader), under the same native quote and date checks; authored web notes and finalization rereads remain nonqualifying observations.",
     )
     review_description += (
-        " Arena validates the accepted lead projection before approval and publishes the native "
-        "confirmed snapshot through the host checkpoint writer after approval."
+        " Arena validates the accepted company projection before approval and publishes the native "
+        "confirmed company snapshot through the host checkpoint writer after approval."
     )
     review_schema["properties"]["review_ref"] = {
         "type": "string", "minLength": 1,
@@ -42,15 +41,6 @@ def lab_tools():
         "type": "string",
         "description": "For an Arena stage constraint, supply the concise observed current stage label supported by the same reviewed stage evidence (for example Series B); omit explanatory prose and never copy the requested stage without proof. If the observed stage does not satisfy the request, reject the company and continue research.",
     }
-    company_fields = review_schema["properties"]["companies"]["items"]["properties"]
-    for contact in (company_fields["primary_contact"], company_fields["backup_contacts"]["items"]):
-        contact["properties"]["email"] = {
-            "description": "The exact chosen address from saved discovery evidence; selecting it does not verify it. email_source attributes this same address.",
-        }
-        contact["properties"]["email_ref"] = {
-            **contact["properties"]["email_ref"],
-            "description": "A saved same-address ZeroBounce or eligible BounceBan validation verdict, separate from finder provenance in email_source.",
-        }
     tools["tyche_review"] = review_description, review_schema
     tools["tyche_open"] = (
         "Read one exact public HTTP(S) page through the Arena host proxy. Native TYCHE first "
@@ -68,7 +58,7 @@ def lab_tools():
         "Compatibility checkpoint tool. Normally tyche_review approval saves automatically. "
         "Review the evidence packet, then approve its current review_ref with company-specific "
         "review_findings. Only reviewed, fully "
-        "qualified companies and contacts are checkpointed for the lab deadline. This does not "
+        "qualified companies are checkpointed for the lab deadline. This does not "
         "end research or change the target; use tyche_finish to close the run.",
         {"type": "object", "properties": {
             key: copy.deepcopy(TOOLS["tyche_finish"][1]["properties"][key])
@@ -81,40 +71,6 @@ def lab_tools():
 LAB_TOOLS = lab_tools()
 MODEL_RESULT_MAX_CHARACTERS = 24000
 EVIDENCE_REVIEW_PAGE_CHARACTERS = 8000
-
-
-def tools_for_request(run_file):
-    """Hide contact-stage inputs when the bound Arena request is company-only."""
-    tools = copy.deepcopy(LAB_TOOLS)
-    document = budget_guard.read_object(run_file)
-    if document["request"].get("contacts_required", True):
-        return tools
-    description, schema = tools["tyche_review"]
-    company = schema["properties"]["companies"]["items"]
-    company["properties"].pop("primary_contact")
-    company["properties"].pop("backup_contacts")
-    company["properties"]["decision"]["enum"] = ["hold_account", "reject", "accept"]
-    description = description.replace(
-        "Preserve its valid description and verified contacts.",
-        "Preserve its valid description and company evidence. This request is company-only: "
-        "accept after company fit, intent and writing review; do not research people or contacts.",
-    ).replace(
-        "Contact example: {ref, requested_role, role_match}; code derives the role group. ",
-        "",
-    ).replace(
-        "Select an email validation result with email_ref to supply its exact address and verdict. ",
-        "",
-    )
-    tools["tyche_review"] = description, schema
-    checkpoint_description, checkpoint_schema = tools["tyche_checkpoint"]
-    tools["tyche_checkpoint"] = (
-        checkpoint_description.replace(
-            "fully qualified companies and contacts",
-            "fully qualified companies",
-        ),
-        checkpoint_schema,
-    )
-    return tools
 
 
 def broker_resume_state(run_file):
@@ -302,7 +258,7 @@ def lookup_model_result(result, budget):
                 item["available_fields"] = fields
                 item["omitted_field_count"] = len(row["facts"]) - len(fields)
             summary["results"].append(item)
-        for key in ("error", "recovery_note", "selection_note", "email_search_guidance", "catalog_note"):
+        for key in ("error", "recovery_note", "selection_note", "catalog_note"):
             if key in lookup:
                 value = lookup[key]
                 encoded = json.dumps(value, ensure_ascii=True)
@@ -391,7 +347,6 @@ class LabTools:
             # A peer can own this gate longer than Codex's MCP startup timeout.
             # Every lookup refreshes durable state under the gate before dispatch.
             provider_calls, provider_blocked = 0, False
-        self.tools = tools_for_request(run_file)
         self.broker = Broker(os.environ["LAB_ARENA_WORKER_SOCKET"], deadline,
                              response_deadline=response_deadline,
                              initial_calls=provider_calls,
@@ -402,7 +357,6 @@ class LabTools:
         self.icp = icp
         self.write_checkpoint = lab_arena_checkpoint.write
         self.output_path = os.environ["LAB_ARENA_OUTPUT_PATH"]
-        self._completion_assessments = set()
 
         def save(path, validation):
             before = self._checkpoint_rows()
@@ -416,24 +370,8 @@ class LabTools:
         self._native_review_delivery = self.research.review_delivery
 
     def _execute(self, request, capture):
-        """Let only native-authorized free verification recovery use finalization time."""
-        allow_after_deadline = False
-        try:
-            owner = capture.__self__
-            metadata = owner.metadata
-            action = metadata["attempt"]["action"]
-            document = budget_guard.read_object(self.research.path)
-            allow_after_deadline = bool(
-                verification_status_parent(self.research.path, document, action, request)
-            )
-        except (AttributeError, KeyError, OSError, TypeError, ValueError):
-            # Only the exact validated native attempt can receive this narrow
-            # exception. Direct, malformed or damaged-state adapter calls keep
-            # the normal research deadline.
-            pass
-        return self.broker.execute(
-            request, capture, allow_after_deadline=allow_after_deadline
-        )
+        """Execute company research within the normal Arena deadline."""
+        return self.broker.execute(request, capture)
 
     def _accepted_source_url(self, url):
         """Allow only exact URLs already saved in the pending native review."""
@@ -494,73 +432,11 @@ class LabTools:
             return
 
     def _review_delivery(self, document, review_ref=None, review_findings=None):
-        if review := self._completion_review_gate():
-            return review
         errors = projection_preflight(self.research.path, document, self.icp)
         if errors:
             return {"status": "needs_repair", "delivery_allowed": False, "errors": errors,
                     "next": "Correct the named Arena output fields with review/inspect before final evidence review. No approval or delivery occurred."}
         return self._native_review_delivery(document, review_ref, review_findings)
-
-    def _ready_contact_candidates(self):
-        """Return fully ready unresolved contacts bound to their current evidence."""
-        document = self.research._document()
-        if not document["request"].get("contacts_required", True):
-            return []
-        if len(document.get("accepted", [])) >= document["request"]["target_count"]:
-            return []
-        progress = self.research._overview()
-        ready = []
-        for row in document.get("unresolved", []):
-            if row.get("stage") != "contact":
-                continue
-            scoped = dict(document, unresolved=[row])
-            candidates = self.research._completion_candidates(
-                scoped, {"blocked_actions": progress.get("blocked_actions", {})}
-            )
-            if not candidates:
-                continue
-            candidate = candidates[0]
-            target = candidate["target"]
-            if (not candidate.get("profile_verified")
-                    or not candidate.get("email_usable") or candidate.get("missing")):
-                continue
-            snapshot = json.dumps(
-                {"candidate": candidate, "row": row}, ensure_ascii=True,
-                allow_nan=False, separators=(",", ":"), sort_keys=True,
-            )
-            ready.append({
-                "target": target,
-                "assessment_ref": "ready-contact:" + hashlib.sha256(snapshot.encode("ascii")).hexdigest(),
-                "saved_hold_reason": row.get("reason_text"),
-                "profile_verified": True,
-                "email_usable": True,
-                "missing": [],
-            })
-        return ready
-
-    def _completion_review_gate(self):
-        """Require a model decision for each ready shortfall candidate."""
-        if self.research.environment.get("TYCHE_FINALIZATION_ONLY") != "1":
-            return None
-        if not hasattr(self, "_completion_assessments"):
-            self._completion_assessments = set()
-        pending = [candidate for candidate in self._ready_contact_candidates()
-                   if candidate["assessment_ref"] not in self._completion_assessments]
-        if not pending:
-            return None
-        return {
-            "status": "completion_review_required",
-            "delivery_allowed": False,
-            "completion_candidates": pending,
-            "next": (
-                "Inspect each candidate's saved evidence with tyche_inspect(target=..., "
-                "field='evidence_review'), then make an explicit tyche_review decision. Accept only "
-                "when the current evidence satisfies every requirement. Otherwise use hold_contact "
-                "for a legitimate unresolved buyer issue or reject for an evidenced required mismatch. "
-                "Retry tyche_finish after the decision. No candidate was promoted automatically."
-            ),
-        }
 
     def checkpoint(self, review_ref=None, review_findings=None):
         document = self.research._document()
@@ -579,11 +455,11 @@ class LabTools:
 
     def _inspect_lab_tool(self, arguments):
         """Use native field/paging semantics with the exact served Arena contract."""
-        validate(arguments, self.tools["tyche_inspect"][1])
+        validate(arguments, LAB_TOOLS["tyche_inspect"][1])
         if any(arguments.get(key) is not None for key in ("target", "ref", "query", "recover")):
             raise ValueError("Inspect one company, result, capability query, tool or recovery reference at a time")
         name = arguments["tool"]
-        description, schema = self.tools[name]
+        description, schema = LAB_TOOLS[name]
         contract = {"toolId": name, "description": description, "inputSchema": schema}
         if not arguments.get("field"):
             return {"tool": self.research._description_view(contract)}
@@ -598,7 +474,7 @@ class LabTools:
         return {"tool": copy.deepcopy(value)}
 
     def call(self, name, arguments):
-        if name not in self.tools:
+        if name not in LAB_TOOLS:
             raise ValueError("The lab initialized this run; use its bound research tools")
         if name == "tyche_review" and "web" in arguments:
             raise ValueError("Lab evidence must come through the bound provider adapter")
@@ -636,22 +512,18 @@ class LabTools:
     def _call(self, name, arguments):
         if self.delivered and (name != "tyche_inspect" or any(key in arguments for key in ("recover", "refresh", "query", "tool"))):
             raise ValueError("Reviewed JSON is delivered; end the Codex turn now")
-        if name == "tyche_inspect" and arguments.get("tool") in self.tools:
+        if name == "tyche_inspect" and arguments.get("tool") in LAB_TOOLS:
             result = self._inspect_lab_tool(arguments)
         elif name == "tyche_checkpoint":
-            validate(arguments, self.tools[name][1])
+            validate(arguments, LAB_TOOLS[name][1])
             result = self.checkpoint(**arguments)
         elif name == "tyche_review":
-            validate(arguments, self.tools[name][1])
+            validate(arguments, LAB_TOOLS[name][1])
             document = self.research._document()
             if arguments.get("review_ref") is not None and (repair := self._projection_repair(document)):
                 result = repair
             else:
                 result = self.research.call(name, arguments)
-                reviewed_holds = {
-                    item["target"] for item in arguments.get("companies", [])
-                    if item.get("decision") == "hold_contact"
-                }
                 if (result.get("review_scope") == "confirmed_leads"
                         and (repair := self._projection_repair(self.research._document()))):
                     result = repair
@@ -662,20 +534,11 @@ class LabTools:
                         result["checkpoint_saved"] = saved["checkpoint_saved"]
                         if result.get("status") == "confirmed_leads_saved":
                             result["next"] = (
-                                "Confirmed leads are saved to /output/companies.json. Continue toward the original "
+                                "Confirmed companies are saved to /output/companies.json. Continue toward the original "
                                 "target; cost/time limits retain this partial list. Use tyche_finish to close a completed run."
                             )
-                if (reviewed_holds and result.get("status") != "needs_repair"
-                        and self.research.environment.get("TYCHE_FINALIZATION_ONLY") == "1"):
-                    if not hasattr(self, "_completion_assessments"):
-                        self._completion_assessments = set()
-                    self._completion_assessments.update(
-                        candidate["assessment_ref"]
-                        for candidate in self._ready_contact_candidates()
-                        if candidate["target"] in reviewed_holds
-                    )
         elif name == "tyche_open":
-            validate(arguments, self.tools[name][1])
+            validate(arguments, LAB_TOOLS[name][1])
             document = self.research._document()
             state = confirmed_leads.status(self.research.path, document)
             if ((state["pending_review"] or state["sync_required"])
@@ -704,7 +567,7 @@ class LabTools:
         elif name == "tyche_finish":
             # Let native finish retain its blocker, stop and budget order;
             # only insert the Arena projection at its review boundary.
-            validate(arguments, self.tools[name][1])
+            validate(arguments, LAB_TOOLS[name][1])
             self.research.review_delivery = self._review_delivery
             try:
                 result = self.research.call(name, arguments)
@@ -754,7 +617,7 @@ def main():
     session = LabTools(args.run_file, args.deadline, args.response_deadline)
     try:
         # Already isolated by the lab. Do not use the local Codex sandbox relay.
-        serve(session, tools=session.tools)
+        serve(session, tools=LAB_TOOLS)
     finally:
         session.broker.stopped.set()
         stopped.set()

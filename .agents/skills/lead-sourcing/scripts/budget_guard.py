@@ -215,10 +215,7 @@ def _initial_state(run_file, document, *, max_usd=None, scrapingdog_usd_per_cred
         if Decimal(credits[provider]) > 0 and (rates[provider] is None or Decimal(rates[provider]) <= 0):
             raise BudgetError(f"a positive USD-per-credit rate is required for enabled {provider}")
     actual_cost = document["budget"].get("policy") == "actual_cost"
-    email_required = not actual_cost and "email" in request.get("contact_fields", ["email"])
-    if email_required and verification_reserve_credits is None:
-        raise BudgetError("email is required: price and supply verification_reserve_credits before discovery")
-    reserve = amount(0 if actual_cost or verification_reserve_credits is None else verification_reserve_credits, "verification reserve")
+    reserve = amount(0, "verification reserve")
     cap = amount(max_usd if max_usd is not None else DEFAULT_USD_PER_COMPANY * target, "USD cap")
     if reserve > Decimal(credits["deepline"]) or reserve * Decimal(rates["deepline"]) > cap:
         raise BudgetError("verification reserve exceeds the run budget")

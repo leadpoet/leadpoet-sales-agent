@@ -65,7 +65,7 @@ AGENTS.md, user configuration, plugins, apps, or memories. It discovers skills
 through Codex itself, disables every skill outside this repository's
 `.agents/skills`, and checks the actual loaded instruction sources before
 starting. Repository instructions and `.codex/config.toml` still apply. The
-launcher pins `gpt-5.6-luna` with `high` reasoning and the `fast` service tier
+launcher pins `gpt-6-luna` with `high` reasoning and the `fast` service tier
 when the account exposes it; its price premium is not published for this model.
 Before any model turn, it reads the pinned Codex
 model list and refuses a model that does not support that reasoning effort and
@@ -125,7 +125,7 @@ sessions keep the CLI helper path because they do not supply a bound run file.
 
 `--exec-file` defaults to one researcher. Choose `--workers 2` or `--workers 3`
 to opt into parallel research; `--workers 1` selects the default explicitly. Each researcher
-runs the same discovery → company qualification → contact enrichment loop, with
+runs the same discovery → company qualification → confirmation loop, with
 different starting search approaches. The first worker initializes the ICP once;
 the others start after its setup receipts and shared ledger are saved.
 
@@ -149,14 +149,14 @@ per stage, within the existing finalization allowance; research clocks stay fixe
 The default accounting remains main's observed provider-plus-model cutoff.
 For a like-for-like historical provider-cap comparison, launch a **new** run with
 `--budget-policy reserved`; it retains the existing hard provider reservations
-and automatic email-verification reserve, with model use reported separately.
+with model use reported separately.
 A saved run cannot switch accounting policy. These are different cost contracts;
 always report which one was tested.
 
 Each researcher keeps one `current_company` in the existing worker registry.
-It follows that company through qualification, contact enrichment and confirmed
+It follows that company through qualification and confirmed
 lead review before claiming another or running broad discovery. An evidenced
-rejection or explicit `hold_account`/`hold_contact` review also clears the slot;
+rejection or explicit `hold_account` review also clears the slot;
 the hold must explain the missing evidence and why available routes cannot
 resolve it. Held companies retain their owner and evidence. A later lookup
 resumes that company only when the worker's slot is free. Restarts retain the

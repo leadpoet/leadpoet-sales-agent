@@ -17,13 +17,10 @@ research choices, not paths, route IDs or accounting envelopes.
 | `tyche_start` | Interpreted `request`, authorized `max_usd` if supplied | Original clock, files, defaults, ledger, combined cost cutoff; safe resume |
 | `tyche_claim` | Website-domain `target`, optional verified LinkedIn `company_url` | Exclusive company ownership and known-alias deduplication across workers; returns the domain target or an ownership conflict |
 | `tyche_lookup` | `checks` (1–3): `target`, `phase`, `purpose`, `tool`, `inputs` | Cached live description, schema checks, observed-cost checks, dispatch, receipts |
-| `tyche_review` | Changed findings/source reviews and optional `web`, or the current evidence packet's `review_ref` alone | Company updates, authoritative LinkedIn/email fields, bookkeeping, confirmed JSON |
+| `tyche_review` | Changed findings/source reviews and optional `web`, or the current evidence packet's `review_ref` alone | Company updates, authoritative company fields, bookkeeping, confirmed JSON |
 | `tyche_inspect` | No arguments, or `target`, `ref`, `field`, `tool`, `query`, `recover` | Compact state, saved request or detail, catalog search, local receipt recovery; `field="taxonomy"` lists canonical industries and `field="taxonomy.<industry>"` lists their subindustries |
 | `tyche_finish` | No arguments for review; then `review_ref` and research `commentary` | Mechanical preflight, claims beside saved source excerpts, strict export/readback/preview and cost summary |
 
-At start, supply the LLM-selected `contact_role_groups` without repeating
-`requested_roles`; code saves their combined list. A request without groups still
-needs `requested_roles`. Explicit conflicting lists remain errors.
 Save each requested signal's `importance` (`required` or `preferred`) and any
 supplied `product_service` with its `description` and `perspective` (`seller`
 or `target`). These are the LLM's interpretation of the current request.
@@ -38,22 +35,16 @@ their original limits on resume.
 Each requested `company_types`, `industries` and `geographies` filter needs a passing
 required check. Put additional must-haves in `icp.required_attributes`; do not repeat
 filters there. Alternatives within one filter share one judgment; preserve the
-original geographic scope. All must-haves need evidence before contact work.
+original geographic scope. All must-haves need evidence before acceptance.
 
-New runs check required company/profile/email tools through free catalog reads
+New runs check required company tools through free catalog reads
 before initializing research.
 The saved descriptions are reused by lookups. If a required tool is unavailable, report the prerequisite to the monitor and
 stop this invocation. More company searches or finalization retries cannot fix
 it. A retry refreshes failed free catalog reads while preserving the clock.
 
 `target` is the canonical company domain or `discovery`. Phases are
-`account_discovery`, `account_verification`, `contact_discovery`,
-`contact_verification`, and `email_validation`. `provider` defaults to Deepline.
-For recognized email finders and validators, omit `phase`; code derives it from
-the selected operation without changing providers or spending eligibility.
-For any provider tool used to find a reviewed buyer's email, supply `contact_ref`;
-this also identifies email work for domain/person searches. Code verifies the
-saved identity and supplies compatible native identity inputs before spending.
+`account_discovery` and `account_verification`. `provider` defaults to Deepline.
 For ScrapingDog, pass `provider: "scrapingdog"` and its wrapper input in `inputs`.
 `approach` may name a stable strategy. New runs use reported charges, so omit
 `max_cost_credits`. ScrapingDog needs its plan conversion at start. Code never chooses
@@ -73,8 +64,8 @@ Use `field` for a specific nested
 tool, company or run field; `refresh: true` is only for a confirmed schema,
 pricing or access change. Retained receipts and execution contracts remain complete.
 
-Company decisions: `hold_account` (research missing fit), `qualify_account`
-(ready for contacts), `hold_contact`, `reject` (supported mismatch), `accept`.
+Company decisions: `hold_account` (a required company fact remains unknown),
+`reject` (an evidenced required mismatch), and `accept` (all company gates pass).
 Example review inputs, with references selected from actual results:
 
 ```json
@@ -125,27 +116,13 @@ business background, and preserve timing/status for actual activity. Do not dupl
 a requested signal here. Supplying the array replaces it; omit it to preserve saved findings.
 A replacement check without `signal` removes the old label; do not copy signal
 facts into a second field. The workbook and final review use these same checks.
-Contact-stage and delivery checks compare reviewed signal dates with the saved
+Acceptance and delivery checks compare reviewed signal dates with the saved
 request's time windows. Historical evidence can remain on an unresolved account;
 it cannot be promoted as a current signal. Errors after a web observation was
 saved return its reusable reference; correct the judgment without rewriting the observation.
-A company review reuses an unambiguous saved Harvest getter with the exact target domain. Identical repeated getters reuse one selection; conflicting identities or field values require an explicit company `ref`. Existing selections remain unchanged. A requested size must be supported by its receipt before contact work.
-Company/profile `ref` values must select the matched Harvest getter. Add industry,
-subindustry and the two-sentence description as reviewed facts. For contacts,
-supply requested role and role match; code derives the saved role group.
-For email lookup, pass `contact_ref` with the selected profile reference and
-omit routine name, company domain and LinkedIn inputs; code fills the native
-fields from the verified receipt. Supply an exact email when validating it.
-After a miss, check the returned `email_search_domain`. A company website may
-use a short link or subdomain rather than its work-email domain. If unsuitable,
-choose a profile-based finder or a work email observed in company sources, then
-validate it; do not repeat domain-based calls with the same unsuitable input.
-A later `primary_contact: {"email_ref":"lookup-validation:0"}` supplies the exact
-address and verdict from the selected validation result. An existing different
-email is a conflict; explicitly select the new email to replace it. Changing
-people requires a new profile ref; changing email clears the old email evidence.
-Selecting an eligible BounceBan result automatically retains its original
-ZeroBounce receipt and links the fallback. Backup entries are full selections.
+A company review reuses an unambiguous saved Harvest getter with the exact target domain. Identical repeated getters reuse one selection; conflicting identities or field values require an explicit company `ref`. Existing selections remain unchanged. A requested size must be supported by its receipt before acceptance.
+Company `ref` values must select the matched Harvest company getter. Add industry,
+subindustry and the two-sentence description as reviewed facts.
 
 For built-in web tools, execute the chosen search/read, then send its observed
 `status` and `results` with `target`, `purpose`, `query` and `operation` under
@@ -184,16 +161,10 @@ If only a pending or raw response survived, retain the pending charge and reconc
 it locally through diagnostics. Never retry an uncertain paid call. Explicit
 `sources` reviews retain the existing continuation/exhaustion rules; saving a
 company does not exhaust search results or pagination. Selecting and saving a
-successful single-result company getter, profile getter, email verdict or opened page closes
-that individual lookup automatically. Pending jobs and multi-result lookups
-retain explicit review. A `valid` email on a catch-all
-domain stays valid; fallback eligibility is checked before spending.
+successful single-result company getter or opened page closes that individual
+lookup automatically. Multi-result lookups retain explicit review.
 
-Native email-validation results include `email_decisions`: receipt-derived
-`usable`, `fallback_allowed` and the next step. `valid` with a domain catch-all
-flag remains usable. Do not revalidate it with BounceBan or reject its company.
-Email lookup/validation requires a previously saved matching Harvest profile and
-requested-role review. Free pending-job recovery remains available.
+
 
 `completion_candidates` is derived from saved qualified candidates and receipts.
 Prefer completing these when affordable. A blocker allows the researcher to
@@ -208,14 +179,14 @@ connection failure returns a clear operational block with its captured exit code
 Before `decision: "accept"`, finalize the company: reuse saved evidence, make
 focused lookups where more ICP-relevant detail would improve the narrative within
 the existing budget/deadline, and save new findings with `intent_details`. Finding
-nothing new does not block acceptance. Preserve the valid description and contacts.
+nothing new does not block acceptance. Preserve the valid description.
 After `decision: "accept"`, `tyche_review` returns `review_required` with
 `review_scope: "confirmed_leads"` for the newly completed or changed leads.
 Follow its evidence and writing instructions immediately, then call
 `tyche_review` with the current `review_ref` and `review_findings`, separately
 from edits. Each finding is `{target, source_refs, finding}`: one brief factual
-comparison per company, citing its saved passages and covering every included
-contact, consistent Signals/Intent Details, source grounding and client-field QA.
+comparison per company, citing its saved passages and covering required company fit, consistent
+Signals/Intent Details, source grounding and client-field QA.
 Approval returns `confirmed_leads_saved` and atomically updates `leads.json`.
 Correct unsupported findings through ordinary review first; changes require a
 fresh reference. New lookups return the pending packet without dispatch until
@@ -241,7 +212,7 @@ available through ordinary result inspection. `inspect(target=..., field="eviden
 provides the same view during account research. Changes
 to research invalidate that reference. Correct named errors through `tyche_review`
 and finish again. Source observations for accepted companies can still be saved
-after reaching the target; corrections preserve verified contacts and emails.
+after reaching the target; corrections preserve verified company evidence.
 The approval and company-specific findings are saved for that exact state.
 Code checks coverage and source attribution, not semantic truth. If export is interrupted,
 code can retry it once when the worker ends without repeating research or
@@ -276,7 +247,7 @@ reading implementation code.
 
 ## Start or resume
 
-The LLM interprets the ICP, signals and role priorities. Put that
+The LLM interprets the ICP and signals. Put that
 [input request](output-contract.md#input-contract) under `request` in a setup
 object; supply it as UTF-8 JSON on stdin with `--start-file -`:
 
@@ -338,7 +309,6 @@ distinct useful route may continue while confirmed spend remains below the thres
 
 Code generates route IDs, fingerprints, receipt paths, paid-call flags and
 `spend` metadata. Catalog reads receive their own scope/phase automatically.
-Contact phases retain the existing passing-account-evidence gate.
 `review_due` returns a count and up to three company scopes with completed
 research awaiting review. It is a reminder, not another qualification rule.
 
@@ -347,9 +317,9 @@ strategy, not tool names, batch numbers or cosmetic rewordings. The helper hashe
 the actual request, so changing a route ID or approach label cannot repeat a
 possibly billed request. Two comparable research attempts within the same scope
 and phase without new verified milestones require a changed approach. Progress
-at another company does not reset that company's research. Profile/email checks
-for distinct targets and advancement to another phase remain eligible; finishing
-one source does not exhaust the company. Catalog reads do not count as progress.
+at another company does not reset that company's research. Distinct company
+targets and advancement within company research remain eligible; finishing one
+source does not exhaust the company. Catalog reads do not count as progress.
 
 The helper saves `receipts/<action-id>.json` before updating run state. A crash
 leaves the route pending and retains pending accounting. Resume a saved normalized
@@ -375,11 +345,7 @@ pending transport, failures and job submissions remain protected. Respect the
 provider's polling interval and applicable read limit; never label submission
 or enrichment as a status read. These calls still use the guarded ledger;
 missing actual charges remain unknown, even when a catalog quote is zero.
-During finalization, an email-verification getter additionally requires a
-catalog-confirmed zero price and the original pending submission in this run.
-The runtime links the getter to that submission without changing its receipt,
-spending threshold or research deadline. Unused pending addresses stay in the audit;
-every exported address still requires its own completed verification receipt.
+
 
 For built-in public-web tools, plan a single discovery pilot as an object:
 
@@ -404,20 +370,11 @@ The helper never infers qualification or market exhaustion. Assess the saved
 evidence and submit company/route decisions together with `--review-file` below.
 Full strict validation remains required before delivery.
 
-The review helper fills missing email verdicts from saved same-run provider
-responses and rejects conflicts. A valid verdict remains valid when the domain
-has a catch-all flag. Before a BounceBan verification, the attempt helper checks
-the saved same-email ZeroBounce result and refuses ineligible or repeated calls.
-Recover pending jobs with the documented free status getter; never resubmit them.
+
 
 The attempt CLI prints normalized provider results once, with the full receipt
-path. Harvest rows show company/contact facts, current-role candidates, discovered
-emails and missing fields; `omitted_fields` identifies additional saved data.
-For Harvest profile getters, the helper supplies the reviewed company's LinkedIn
-URL as local `target_company_linkedin_url` metadata to select its current role.
-It is not sent to the provider. Multiple matching roles require review; a headline
-or a historical role without an end date does not establish the current title.
-Finder email flags never replace ZeroBounce or eligible BounceBan validation.
+path. Harvest rows show company facts and missing fields; `omitted_fields`
+identifies additional saved data.
 Repeated progress snapshots, request metadata and duplicate evidence stay in
 the receipt. Reopen it with `run_attempt.py <results.json> --receipt <route-id>`
 to reuse this compact view without dispatching or changing state. The view checks
@@ -461,14 +418,13 @@ unrelated checks remain unchanged, and original provider receipts stay saved.
 Duplicate criterion updates or multiple saved matches require reconciliation;
 code does not decide which judgment is correct or whether the company fits.
 
-`account_fit`, `signal_evidence`, `supporting_findings`, `intent_details`, `primary_contact` and
-`backup_contacts` are complete replacements when supplied, and untouched when
-omitted. Review new contacts and source identities before replacing them.
+`account_fit`, `signal_evidence`, `supporting_findings`, and `intent_details` are
+complete replacements when supplied, and untouched when omitted. Review source
+identities before replacing them.
 State defaults to the saved state (new companies start unresolved); set
-`state: "accepted"` or `"rejected"` explicitly. Acceptance retains all existing
-evidence/contact gates; a missing fact cannot become a rejection without an
-evidenced required mismatch. Set `stage: "contact"` after account review passes,
-with remaining buyer gaps in `reason_text`.
+`state: "accepted"` or `"rejected"` explicitly. Acceptance retains all existing company evidence gates; a missing fact cannot
+become a rejection without an evidenced required mismatch. Unresolved rows remain
+at `stage: "account"` with the missing company fact in `reason_text`.
 
 `response` is optional and only for observed public-web results; provider
 responses are already saved by their lookup. All attached responses are checked
@@ -527,11 +483,9 @@ validators before planning or spending. Malformed fields identify their batch it
 and stop the entire batch without changing run state.
 
 Give each lookup its canonical company domain as `scope`; code assigns IDs.
-Batch mode accepts account verification, contact discovery, contact verification
-and email validation. Free catalog lookups may share discovery scope in a batch.
-Keep substantive discovery pilots on the single-attempt path. Choose
-only independent work: a company's buyer lookup waits for saved passing account
-evidence, and email validation waits for its buyer/address checks. Deduplicate
+Batch mode accepts account verification. Free catalog lookups may share discovery
+scope in a batch. Keep substantive discovery pilots on the single-attempt path.
+Choose only independent work. Deduplicate
 aliases and owner groups before choosing the batch; do not run redundant provider
 requests for the same company at once.
 
@@ -573,7 +527,7 @@ before dispatch. ScrapingDog records its documented tariff ceiling as an audit h
 all providers use the confirmed actual-cost cutoff. After the confirmed total reaches the
 threshold, new paid work stops. Already running calls may overshoot it.
 
-Do not supply `max_cost_credits` or an email-verification reserve. Missing
+Do not supply `max_cost_credits`. Missing
 billing stays pending, prevents replay and blocks final delivery until reconciled;
 it does not block a distinct route under the confirmed-cost threshold. Catalog prices
 help select tools, but do not become reported charges. Explicit zero provider
@@ -605,7 +559,7 @@ Existing transport size and timeout bounds still apply.
 Non-finite or malformed JSON is retained as redacted diagnostic text, never
 promoted to results. Non-finite input is rejected before dispatch. Available
 partial Deepline stdout/stderr is also retained after a timeout; it is not a
-successful provider result and must not promote an email or trigger a retry.
+successful provider result and must not promote a candidate or trigger a retry.
 Interrupted ScrapingDog responses retain available bytes with `incomplete: true`;
 neither broken chunks nor a short declared body is a successful empty result.
 JSON output escapes non-ASCII text so receipts and stdout also work with narrow
@@ -646,6 +600,6 @@ For each run, deliver `reports/<run-id>/report.md`,
 `reports/<run-id>/results.json`, and `reports/<run-id>/leads.xlsx`. Include the
 request, hypotheses, route commands and filters, pilot observations, statuses,
 route cost bases, confirmed and maximum credits, Deepline dollar cost and cost
-per accepted lead, accepted evidence, contact selection, and rejected or
-unresolved rows with stable reasons. Keep provider receipts separate from output state. Never
-infer evidence from memory or present an unverified company or contact as final.
+per accepted company, accepted evidence, and rejected or unresolved rows with
+stable reasons. Keep provider receipts separate from output state. Never
+infer evidence from memory or present an unverified company as final.

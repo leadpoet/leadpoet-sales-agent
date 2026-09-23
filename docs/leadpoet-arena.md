@@ -1,7 +1,7 @@
 # TYCHE in the Leadpoet lab
 
 Local tests and Arena use **one runner**, `scripts/codex_tyche.py`. Both use
-Codex 0.154.0, Luna, high reasoning, the project sourcing skill, native research
+Codex 0.154.0, GPT-6 Luna, high reasoning, the project sourcing skill, native research
 tools, saved-response recovery, continuation prompts and finalization decisions.
 `tyche_arena/runtime.py` and its separate research loop/strategy have been removed.
 
@@ -17,7 +17,8 @@ runs can opt into `--workers 2` or `--workers 3`, with company claims, a shared
 budget and final review. The default budget is $0.80 per requested company.
 Each Arena researcher has its own Codex session and execution receipt; model
 billing remains with the host. Arena serializes model and paid provider dispatch
-across these sessions because dynamic calls reserve the remaining host budget.
+across these sessions to retain dispatch and receipt ordering. Pending charges
+do not reserve money or block new work.
 That transport constraint can change timing, while research decisions use the
 same shared implementation.
 
@@ -42,8 +43,8 @@ The Arena bundle preserves the published adapter fixes from sales-agent lab
 implementation. Source publishing does not deploy the host or promote a baseline.
 A live deployed journey remains a separate release check.
 
-Arena allows 2,070 seconds of research and 600 seconds for finalization, within
-its existing 2,670-second worker bound and 2,700-second outer limit. The shared
+Arena uses the host-provided deadline, currently a 60-minute outer limit.
+The runner retains its existing finalization allowance within that limit. The shared
 runner preserves the original clock and receipts across invocations. Quota
 exhaustion stops with an explicit host limit and retains reviewed output; it does
 not wait until the deadline to manufacture an ordinary research stop. Repeated
@@ -56,8 +57,7 @@ reviews it and approves the current `review_ref` through `tyche_review`. That sa
 operation saves native `leads.json`, maps only confirmed rows to Arena's schema,
 and publishes `/output/companies.json` through the host's atomic checkpoint writer.
 No separate `tyche_checkpoint` call is required; that tool remains compatible for
-existing callers. Qualification, original sources, contacts, email provenance and
-accounting checks remain enforced. The original target and budget stay unchanged.
+existing callers. Company qualification, original sources and accounting checks remain enforced. The original target and budget stay unchanged.
 
 The compatibility checkpoint tool reviews its partial snapshot in the current
 session, including when research would hand final review to a fresh context.
@@ -92,7 +92,7 @@ checkpoint it completely read **before** the signed deadline, including when it
 kills the sandbox. It does not recover unsaved drafts or output written after the
 deadline. Two completed, reviewed companies out of a target of five can therefore
 enter normal scoring; the remaining three are unfulfilled. Factual qualification,
-contact provenance, duplicates and the round's scoring policy still determine
+duplicates and the round's scoring policy still determine
 credit. TYCHE's ordinary finish path is still available to close a completed run.
 TYCHE cannot retract a checkpoint already retained by the external Arena after a
 hard kill or an unavailable output mount. Revocations must reach the host before
@@ -100,10 +100,10 @@ its signed deadline; the recovery behavior above applies while TYCHE can run.
 
 ## Input and output
 
-- Supports `intent_details_v1` and `contacts_v1`, with the lab's v5 company
+- Supports `intent_details_v1`, with the lab's v6 company-only
   output and `LAB_ARENA_COMPANY_LIMIT` of 1–5.
-- Keeps the original ICP, roles, exclusions, company criteria, required
-  attribute, contact geography and seniority. Primary signals and required
+- Keeps the original company ICP, exclusions, company criteria and required
+  attribute. Primary signals and required
   attributes must be text. The primary signal at index 0 is mandatory.
   Generated `bonus_intents` remain optional, preserve scoring order, and use
   their individual age limits.
@@ -113,13 +113,10 @@ its signed deadline; the recovery behavior above applies while TYCHE can run.
 - Signal dates use the reviewed activity's `event_date`. A current observation
   may use its observation date. Publication dates never replace activity dates,
   and partial or unknown dates emit `null` instead of an invented day.
-- Contact email must appear in the selected HarvestAPI `get_profile` receipt
-  requested with `findEmail: "true"`. Its actual provider record ID is emitted
-  as `contact.email_source.record_id`. Local route IDs and Deepline request IDs
-  are not substituted for lab broker call IDs. The lab's verifier remains the
-  authority on factual fit and provenance.
+- Contact discovery, contact verification and contact output are removed. Company
+  source URLs, qualification evidence and intent fields retain their existing meaning.
 - Incremental confirmation, finish and checkpoint check the Arena output mapping before requesting
-  evidence approval. Missing provider provenance or an overlong intent paragraph
+  evidence approval. Missing company evidence or an overlong intent paragraph
   returns an actionable repair result before any approval or publication.
 - `tyche_finish` produces the existing evidence packet. Oversized company review
   packets are available through `tyche_inspect(target=..., field="evidence_review",
@@ -143,8 +140,9 @@ worker broker. Catalog reads are local. `tyche_open` captures exact public pages
 through the host proxy and retains run-bound receipts; authored notes and
 finalization rereads cannot become qualifying research evidence.
 
-Both paid providers share the USD 0.80-per-requested-company allowance, subordinate
-to host accounting. Unknown billing pauses further paid research. Arena owns
+Provider and model calls share the host's $4 sourcing cutoff per ICP. Final cost
+eligibility is $0.80 multiplied by the Arena-verified qualified-company count.
+Unknown billing remains pending without blocking research. Arena owns
 model charges and the combined cutoff; no personal-account model receipts are
 created. Adapter call counts are telemetry, never a second quota. Socket waits
 are bounded and interrupted paid requests are never replayed.
@@ -191,11 +189,11 @@ TYCHE_TEST_CODEX_BINARY=/path/to/codex python -m pytest tests/test_codex_wire.py
 
 TYCHE-only offline fixtures cover the trigger through reviewed saved output,
 MCP configuration/schema bounds, primary/bonus semantics, stale evidence,
-wrong email provenance, false text completion, changed checkpoints, quotas,
+invalid company evidence, false text completion, changed checkpoints, quotas,
 uncertain billing, checkpoint failure and detached MCP cleanup. Adapter tests
 also cover one completed company out of five surviving timeout/error with an
 unfinished candidate and subsequent billing uncertainty; current review approval;
-replacement checkpoints; and blocked partial delivery with invalid evidence or contacts.
+replacement checkpoints; and blocked partial delivery with invalid company evidence.
 Compatibility cases cover current request fields, event versus publication dates,
 repair before approval, research-phase checkpoints, complete large review pages,
 and raw API receipts through the same normalizer used locally and during recovery.

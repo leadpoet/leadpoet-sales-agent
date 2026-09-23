@@ -4,10 +4,10 @@ For the Codex integration that runs inside the Leadpoet lab, see
 [Leadpoet lab integration](docs/leadpoet-arena.md). It uses the lab runtime
 from subnet PR #198 and returns reviewed JSON through `harness.run_icp(icp)`.
 
-**Open-source lead sourcing with evidence, verified contacts, and spending controls.**
+**Open-source company sourcing with evidence and spending controls.**
 
 TYCHE finds companies that match your ideal customer profile, checks the facts
-and buying signals you care about, then finds people in your requested roles.
+and buying signals you care about.
 It runs in Codex and delivers an Excel lead list, structured JSON, and an audit
 report with sources and costs.
 
@@ -18,10 +18,6 @@ report with sources and costs.
 
 - **Qualifies companies first.** Checks company fit and buying signals separately,
   preserving required criteria, preferences, and missing evidence.
-- **Finds the right people.** Verifies current roles and company identity, with
-  primary and fallback role groups when requested.
-- **Validates email.** Requires a verified email by default, with explicit opt-outs
-  and receipt-backed validation.
 - **Controls run spending.** Stops new paid work at the observed provider-plus-model
   cutoff and keeps the same budget and receipts through interruptions.
 
@@ -42,7 +38,7 @@ You need:
 - [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) on `PATH`, with a reusable
   file-based login (`codex login`). You can submit requests from Codex desktop.
 - Python 3.10 or later, plus an installed, authenticated Deepline CLI for provider
-  research, LinkedIn verification, and email validation.
+  research and LinkedIn company verification.
 - The Codex workbook runtime: Node.js, Python, and `@oai/artifact-tool`. The launcher
   discovers the installed desktop bundle. Other hosts must configure the
   [runtime paths](docs/codex-isolated-testing.md#workbook-finalization-and-usage-reconciliation)
@@ -61,7 +57,7 @@ deepline health --json
 Deepline executions use the direct API with `DEEPLINE_API_KEY` or the existing
 production SDK login, preserving raw error responses and billing IDs. Custom
 CLI configurations retain their CLI transport. Catalog discovery still uses
-the CLI; a separate ZeroBounce key is unnecessary. Export `SCRAPINGDOG_API_KEY`
+the CLI. Export `SCRAPINGDOG_API_KEY`
 to enable ScrapingDog. Set `DEEPLINE_BIN` to the executable's absolute path if it
 is outside `PATH`.
 
@@ -80,8 +76,7 @@ Use that same Python environment for the launcher. Native tools and the
 `run_attempt.py` CLI check provider inputs against the saved live JSON Schema,
 including nested fields, before paid dispatch. Describe the tool in the run first.
 An invalid input returns its field path and constraint for correction; no paid
-request or spending reservation is created. Unresolved provider bills still
-block further paid work.
+request or spending reservation is created. Unresolved provider bills stay pending for reconciliation; they do not block new work.
 
 ### 2. Check the launcher
 
@@ -106,25 +101,25 @@ calls. It does not verify model-service connectivity or provider credentials.
 Use `--smoke` for an optional read-only model response with no provider calls.
 See [launcher setup and troubleshooting](docs/codex-isolated-testing.md).
 
-The [launcher](scripts/codex_tyche.py) pins **`gpt-5.6-luna`**, **`high` reasoning**
+The [launcher](scripts/codex_tyche.py) pins **`gpt-6-luna`**, **`high` reasoning**
 and the **`fast` service tier**. It loads project-local sourcing instructions in
 an isolated session while retaining the worker's sandbox and network policy.
 Before any model turn, it checks the pinned Codex model list and refuses an
 unsupported model, reasoning effort, speed tier, or silent fallback.
-`TYCHE_MODEL=gpt-6-luna` selects the priced candidate for an isolated local
-comparison. Arena stays pinned to the default model, and a resumed run must use
-the model recorded in its receipts.
+Arena uses `openai/gpt-6-luna` through OpenRouter Responses. Local Codex access
+depends on the logged-in account; an unavailable model fails before paid work.
+A resumed run must use the model recorded in its receipts. Historical model
+rates remain available for cost reconciliation.
 
 ### 3. Ask for leads
 
-Open this repository in Codex and describe the companies, signals, roles, and
+Open this repository in Codex and describe the companies, signals, and
 budget you want. For example:
 
 ```text
 Source 5 US B2B SaaS companies with 50–500 employees. Exclude agencies and
 consultancies. Each must have posted at least 3 sales openings in the last
-30 days. Find one CRO, VP Sales, or Head of Sales with a verified work email
-at each accepted company. Spend at most $5 total on sourcing providers.
+30 days. Spend at most $4 total on sourcing providers and model calls.
 ```
 
 [AGENTS.md](AGENTS.md) routes sourcing requests through the isolated launcher
@@ -145,23 +140,20 @@ python3 scripts/codex_tyche.py --exec-file reports/<run-id>/request.txt
 | --- | --- |
 | Companies | Give a target count, geography, industry, size, and exclusions. Distinguish must-haves from preferences. |
 | Buying signals | Specify the evidence and date window. Required signals match **any** by default; ask for **all** when each is mandatory. |
-| Contacts | One contact per company by default; request up to three. You can name primary roles and fallback roles. |
-| Contact data | Verified email by default. Explicitly request no email or phone (`contact_fields: []`) to opt out, or request phone only. |
 | Run budget | **$0.80 × requested leads** when omitted. Reported provider charges plus estimated base LLM cost. An explicit budget, including zero, overrides this default. |
 | Time | Two hours by default. An explicit time limit overrides it; speed benchmarks do not. Resuming preserves the original clock. |
 
-Every stored email must pass ZeroBounce or its eligible BounceBan fallback,
-with matching receipts. Accepted contacts require verified LinkedIn country;
-company size uses the published LinkedIn employee range. See the
+Company size uses the published LinkedIn employee range. Contact discovery,
+email validation and contact fields are not part of this company-only model. See the
 [input and output contract](.agents/skills/lead-sourcing/references/output-contract.md)
 for exact fields and evidence rules.
 
 New runs use one **soft cost cutoff**: provider charges plus estimated
 base LLM usage. Completed ScrapingDog requests use documented endpoint tariffs;
-variable or unresolved calls retain a separate documented ceiling against the budget. Check after each response and before further paid work. Calls
-already running can take the final total above the threshold. Missing billing
-without a documented ceiling pauses new paid work; it is never treated as free.
-The report separates provider charges, tariff holds, estimated LLM cost and pending calls.
+unknown charges remain pending for reconciliation and do not consume budget
+until confirmed. Check after each response and before further paid work. Calls
+already running can take the final total above the threshold. The report
+separates provider charges, estimated LLM cost and pending calls.
 Old ledgers retain their original reservation policy. Request IDs, receipts,
 original limits and duplicate-call protection survive every continuation.
 
@@ -177,8 +169,8 @@ Each run saves its files under `reports/<run-id>/`:
 
 | File | Contents |
 | --- | --- |
-| `leads.json` | Continuously saved confirmed companies and contacts, with evidence, target, count, and update time. Available during research. |
-| `leads.xlsx` | One row per verified contact at each accepted company, with shared company details, signals and intent, plus a **Sources** worksheet. |
+| `leads.json` | Continuously saved confirmed companies, with evidence, target, count, and update time. Available during research. |
+| `leads.xlsx` | One row per accepted company, with company details, signals and intent, plus a **Sources** worksheet. |
 | `results.json` | Versioned accepted, rejected, and unresolved records with evidence and accounting. |
 | `report.md` | Human-readable findings, shortfalls, decisions, sources, and provider costs. |
 | `run-costs.json` | Provider and isolated-worker model usage/cost summary, including estimates and missing usage. |

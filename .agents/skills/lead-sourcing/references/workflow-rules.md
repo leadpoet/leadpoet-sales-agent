@@ -1,9 +1,7 @@
 # Detailed Workflow Rules
 
-Use this skill for a company-first request: a target count, ICP, current buying
-signal, and one or more requested contact roles. The run produces unique,
-evidence-backed companies and, for each accepted company, one primary contact
-plus additional contacts up to the requested target. Use [tools.md](tools.md) to select a route and load
+Use this skill for a company-first request: a target count, ICP and current buying
+signal. The run produces unique, evidence-backed companies. Use [tools.md](tools.md) to select a route and load
 only that adapter's required sections. Read the exact input, output, and Excel
 contracts by the phases in [output-contract.md](output-contract.md#read-by-phase),
 not as an upfront bundle.
@@ -23,8 +21,7 @@ Command paths below are relative to the skill directory, not this reference.
 - Use one agent to check up to three independent companies concurrently via
   [bounded batches](adapter-io.md#concurrent-company-checks). Resolve and
   deduplicate canonical domains, aliases and owner groups before batching.
-  Keep each company's account, buyer and email steps in order; contact lookup
-  requires passing account evidence for that company.
+  Keep each company's identity, qualification and signal checks in order.
 - Discover live Deepline capabilities with `search`, inspect a chosen tool with
   `tyche_inspect(tool=...)` once, and reuse its saved description. Native lookup
   code checks inputs, availability and pricing before dispatch. Read omitted
@@ -38,65 +35,25 @@ Command paths below are relative to the skill directory, not this reference.
   review tool. Record observed source objects, not serialized transcripts.
   Web research still consumes model/tool usage; paid scraping is not free.
   Pilot company-discovery routes with at most 10 returned rows and one paid call.
-  Once an account passes, reuse relevant people already identified in saved sources.
-  Choose public research or structured search to fill the actual contact gap. When
-  using paid discovery, buy only the remaining requested contacts with scoped filters/limits. Do not buy a broad
-  people batch to fill a few known company gaps. Leave enough budget for
-  required email verification when choosing discovery or backup work.
   Inspect rows, evidence, duplicates, misses, provider status, and cost before
   expanding. No automatic retry; a timeout or other uncertain paid outcome is
   unresolved and needs a different route.
-- Do not begin contact lookup for a company until that company passes the
-  account evidence gate. Start contact lookup as each company passes; there is
-  no global account-count gate. For nuanced roles, prefer title-roster
-  discovery. For structured search, use function/seniority and the complete
-  user-approved title family as appropriate. A CEO is not an automatic fallback.
 - Resolve flagged exclusion-name variants before this gate. Confirmed same-company
   names belong in `company.aliases` and remain excluded. For distinct entities,
   use the gate's `Distinct from excluded company: <original name>` criterion in
   an existing required qualification check, with identity evidence. Similarity
   alone cannot reject a company; broad substring matching is not identity proof.
-- Apply separate gates: an account needs current signal evidence that identifies
-  the same company; a contact needs a current role and company identity that
-  match the accepted company/domain and the requested role family. Apply the
-  identity/current-role gate before any email or phone lookup. Paid email work
-  checks the saved Harvest profile identity, current employer and reviewed
-  requested-role match before spending. Save the selected profile with
-  `tyche_review` first; reuse its successful receipt rather than fetching it again.
-- Apply `contact_fields: ["email"]` when the input omits contact fields. An
-  explicit empty array opts out, and an explicit phone-only array overrides
-  the email default. Retrieve contact data only after the identity/current-role
-  gate. Never fabricate a value or infer a current role from model memory.
-- Before storing any email, validate the exact address through the available
-  ZeroBounce capability. Reuse its saved description and an existing successful
-  receipt for that address. Only an explicit, trimmed, case-insensitive
-  ZeroBounce status of `valid` passes this gate. Reject `invalid`,
-  `do_not_mail`, `spamtrap`, and `abuse` with `email_invalid`; retain all other
-  statuses as `email_validation_unresolved`, except catch-all/unknown or a
-  recorded [service failure](deepline-adapter.md#bounceban-fallback) may
-  receive one budgeted BounceBan check through Deepline. Inspect its description
-  on first use and reuse it; accept only API success plus result deliverable.
-  Preserve both receipts using `email_validation.fallback`. Never override a hard rejection
-  or chain fallbacks. A missing status, missing receipt,
-  `no_results`, or failed or uncertain provider call cannot pass by itself.
-  Charge each validation execution against the Deepline credit and shared dollar
-  caps; retain the execution count for audit only.
 - Keep accepted, rejected, and unresolved output states separate from provider
   statuses. Reuse the existing `stage`, `reason_code`, and
   `qualification_checks` fields. Every unresolved company must state its
   missing evidence in `reason_text`; park reviewed gaps without inventing another
-  action. A contact-stage unresolved
-  result keeps the account evidence that already passed. Provider failures are not
+  action. Every unresolved result remains at the account stage. Provider failures are not
   companies and must not be counted in reviewed or accepted company totals.
-  Keep buyer-role gaps in contact evidence and `reason_text`; do not add them
-  as failed company checks that prevent the lookup needed to resolve that buyer.
   `no_results` is valid only when the provider actually returned no results;
   an input error, response error, timeout, or uncertain response is not
   `no_results` and remains unresolved or blocked as appropriate.
 - Prefer affordable completion of already qualified candidates before new
-  discovery. `completion_candidates` shows missing profile/email work and saved
-  valid email receipts. Verify that each address belongs to the selected person;
-  a valid email alone does not prove identity. If completion is blocked by an
+  discovery. `completion_candidates` shows missing company evidence. If completion is blocked by an
   uncertain call, unavailable evidence or insufficient remaining budget, record
   that concrete reason and choose another productive route. This is research
   guidance, not a queue, a fixed company order or a new qualification gate.
@@ -111,12 +68,6 @@ Command paths below are relative to the skill directory, not this reference.
   evidence; do not turn missing evidence into acceptance or invent a provider
   outage to finish. Do not repeat full-state validation between ordinary reads
   or after an attempt helper has already returned the current stop decision.
-- If `contact_role_groups` is present, search and rank its `primary` roles
-  first. Use `secondary` roles as valid fallbacks when no primary-role contact
-  passes; a secondary-role contact may fill `primary_contact` and must not be
-  rejected only because it is secondary. Save its requested role and role match;
-  native tools derive `role_group` from the saved request. The output
-  slot name `primary_contact` is separate from this role group.
 - The lookup helper maintains the frontier for paid and no-cost public-web work. Each concrete
   route/query path is `untried`, `continuable`, `exhausted`, or `blocked`. A
   failed or uncertain provider call blocks automatic retry of that call, but it
@@ -134,10 +85,10 @@ Command paths below are relative to the skill directory, not this reference.
 - Record provider usage only from a usage or billing receipt. An unknown charge
   stays `null` and pending; do not substitute a quote or assume it was free.
 - Honor an explicitly requested `budget.max_deepline_credits_per_next_lead`.
-  For new runs, stop new calls once observed spending at the current accepted-lead
+  For new runs, stop new calls once observed spending at the current accepted-company
   count reaches that threshold. The last call or concurrent batch may exceed it.
   When absent, 5 credits is only a strategy-review warning. Record
-  `accepted_leads_before_call`; rejected candidates, failed calls and demotions
+  `accepted_companies_before_call`; rejected candidates, failed calls and demotions
   never reset spending. Historical version 1 ledgers retain their original rules.
 
 ## Inputs and workflow
@@ -154,7 +105,7 @@ The [start helper](adapter-io.md#start-or-resume) persists the original threshol
 provider limits and credit-to-USD conversions. Reported USD takes precedence
 when available; otherwise convert reported credits using the saved plan rate.
 An unused provider has a zero limit. ScrapingDog requires its plan conversion.
-No money is reserved for future research or verification. ScrapingDog dispatches
+No money is reserved for future research. ScrapingDog dispatches
 retain documented tariff ceilings until the response establishes an exact charge.
 
 Before dispatch, check the known combined total. Once it reaches the threshold,
@@ -164,7 +115,7 @@ reconciliation; never replay an uncertain paid request. Report the known subtota
 and pending charges separately. The launcher saves reviewed partial output
 without starting another finalizer when spending stops.
 
-Requested leads determine the original threshold; rejected companies, retries,
+Requested companies determine the original threshold; rejected companies, retries,
 refills and resumptions never reset or enlarge it. Arena owns model transport
 and model billing outside local receipts. Historical version 1 ledgers retain
 their original provider-only budget and reservation rules; do not migrate or
@@ -173,34 +124,14 @@ reset them implicitly.
 ### Request normalization
 
 The normalized request must state the target count, ICP and exclusions,
-geography, buying-signal kinds and freshness window, requested roles, contact
-fields, and per-provider budget caps.
+geography, buying-signal kinds and freshness window, and per-provider budget caps.
+Company geography does not restrict activity location unless requested.
 Do not add `budget.max_deepline_credits_per_next_lead` when it is omitted; carry
 it through only when the user explicitly requests a per-next-lead hard cap.
-Email is required by default; apply `["email"]` when the field is omitted, while
-preserving an explicit empty or phone-only override. Default new requests to one
-verified contact per company; preserve explicit one-to-three targets and saved
-requests on resume. It may set `signal_match_mode` (`any` or `all`, default `any`),
-per-signal `min_age_days`/`max_age_days`, run ID, and as-of date. Validate that
-each signal's lower bound is no greater than its upper bound. It may also set
-`contact_role_groups` with `primary` and `secondary` role arrays. Resolve these
-once during setup, using the existing research agent:
-
-- Prioritize explicit buyer/contact roles and equivalent responsibilities in
-  `primary`. Relevant alternatives may go in `secondary` unless the user says
-  "only", "must", or otherwise makes the role restriction mandatory.
-- If contact roles are omitted, infer functions and appropriate seniority from
-  the target business, product/service, use case and company size. Search actual
-  responsibilities, not just exact titles. A CEO is not an automatic fallback.
-- Roles inside a hiring signal describe company activity, not contact limits.
-  Do not restrict contacts to the advertised vacancies. Resolve ambiguous role
-  abbreviations in the context of this request; do not assume a sector's meaning.
-
-Keep `requested_roles` as the deduplicated union and record the brief rationale
-in the existing report. Search primary roles first; secondary roles are valid
-fallbacks. Resume the saved plan rather than infer it again. Stop contact lookup
-once the requested number of relevant verified contacts is reached. Resolve
-obvious company identity ambiguity before paid work.
+It may set `signal_match_mode` (`any` or `all`, default `any`), per-signal
+`min_age_days`/`max_age_days`, run ID, and as-of date. Validate that
+each signal's lower bound is no greater than its upper bound. Resolve obvious
+company identity ambiguity before paid work.
 Numeric employee filters use inclusive range semantics: a company passes when
 its verified count is between the requested minimum and maximum. Translate that
 range to the provider's live field semantics. For discovery, include every
@@ -217,13 +148,6 @@ copy calculated summaries by hand. Preserve historical receipts. With existing
 continuation links, close children before parents; reopen the parent before a
 child. An unrecoverable receipt stays blocked with the audit gap stated.
 
-For role groups, search and rank the primary group first, then valid secondary
-fallbacks when no primary-role contact passes. Select one output primary and
-additional contacts toward the requested target. A valid secondary contact can be the output primary; record
-`role_group: "secondary"` when known. One qualified contact is sufficient unless
-the user explicitly requires more. Record any backup shortfall. Every stored
-backup email must pass the same validation gate as the primary email.
-
 Use the [stopping contract](output-contract.md#stopping-check) for final delivery.
 Keep unfinished routes open when an actual budget/time limit ends work. A
 reviewed company can remain parked while fresh discovery continues; do not
@@ -231,7 +155,7 @@ invent another action to satisfy a checklist. Missing evidence never proves
 failed fit. New runs have no research deadline unless the user specifies one;
 there is no minimum-spend target and no reason to make wasteful calls.
 
-Use `tyche_finish` to write version `1.2` results, the workbook and report through
+Use `tyche_finish` to write version `2.0` results, the workbook and report through
 the [existing exporter](output-contract.md#leadsxlsx-contract). It runs full strict
 validation and saved-file checks. Inspect the preview and require explicit
 `delivery_allowed: true`; do not assemble reports, rerun export, or copy costs by hand.
@@ -240,7 +164,7 @@ validation and saved-file checks. Inspect the preview and require explicit
 
 Keep one qualification policy and the existing outcomes; research models supply
 evidence, not a separate acceptance standard. Do not add lead scores or gates.
-Work small batches through company, buyer and contact checks before broadening
+Work small batches through company checks before broadening
 discovery. After a blocked or unproductive stage, record its recovery action and
 change source for that gap; do not leave promising qualified accounts untouched
 while repeatedly starting new country searches.
@@ -254,7 +178,7 @@ while repeatedly starting new country searches.
   and its basis in existing evidence/prose; never imply observed pain, intent,
   incumbent tools or manual processes. Likely handling agreements does not
   establish paper signing. A specifically required workflow needs evidence.
-  Before buyer lookup, review required web claims against the relevant source
+  Before acceptance, review required web claims against the relevant source
   body, reusing a saved read when available. Check its actual date and activity
   status against the request; a search summary may omit a qualification or
   future completion date. If the body is inaccessible, use another credible
@@ -265,16 +189,15 @@ while repeatedly starting new country searches.
   web evidence must reference that saved passage. Reuse it; put interpretation
   in `claim` rather than rewriting the source text.
 - One credible source can suffice. Use the same standard for every candidate;
-  match current responsibilities and seniority, not literal titles. Resolve
-  material contradictions, not merely overlapping headcount ranges.
+  Resolve material contradictions, not merely overlapping headcount ranges.
   A requested funding stage describes current status: check for a later round,
   acquisition or IPO before treating a historical financing as a stage match.
   Compare announcement dates, not array order or the highest stage label. If
   stage labels and dates conflict, corroborate the chronology; the conflict
   alone does not establish a later financing round.
-  Resolve these checks before contact spend and save the result once in the
+  Resolve these checks before acceptance and save the result once in the
   existing qualification evidence; conflicting must-haves stay unresolved or
-  receive an evidenced rejection. Do not enrich contacts to rescue a failed account.
+  receive an evidenced rejection.
 - Corroborate facts across credible sources for the same identified project.
   A recent announcement or substantive progress update can establish activity
   within the requested window; drawings, specifications or another project
@@ -287,21 +210,19 @@ while repeatedly starting new country searches.
   any explicit request for future demand or a new award.
 - Accept supported must-haves, even without optional intent. Keep missing
   must-haves unresolved; reject evidenced mismatches. Recover the specific gap
-  through another source, signal or buyer within existing limits. A bad signal
-  or buyer does not reject the company. Do not count unresolved rows as qualified.
+  through another source or signal within existing limits. A bad signal
+  does not reject the company. Do not count unresolved rows as qualified.
 
 ## Gates, statuses, and artifacts
 
 `results.json.request` is the authoritative normalized ICP. Check decisions
 against it, not an earlier candidate's band or a rewritten interpretation.
 Do not turn a service area into an office requirement or a preferred signal
-into a requirement. Company geography does not restrict contact location unless
-the user requests it. Use the HarvestAPI LinkedIn `employee_range` for company-size
+into a requirement. Use the HarvestAPI LinkedIn `employee_range` for company-size
 decisions, retaining field evidence. Full containment in `request.icp.company_size`
 passes; no overlap fails; partial overlap stays unknown. Member counts and other
-providers' estimates do not override LinkedIn's range. Require a HarvestAPI-sourced
-country for each accepted contact and populate supported city/state fields from
-that person's location. Follow the [field contract](output-contract.md#linkedin-location-and-company-size).
+providers' estimates do not override LinkedIn's range. Follow the
+[field contract](output-contract.md#linkedin-company-size).
 Missing intent remains unknown even when size passes.
 
 The account gate requires canonical `company` and `domain`, an evidenced
@@ -321,53 +242,23 @@ as unresolved so missing evidence does not become a silent false negative.
 Save resolved criteria as evidence arrives; do not collapse several known facts
 and one missing field into a single unknown `complete_account_fit` check.
 
-The contact gate requires `full_name`, current title, requested-role match,
-company/domain match, a person-identifying URL, and evidence URL/date/text that
-show the role is current at that company. The person-identifying URL is the
-public profile URL the saved profile getter returned; a search result's
-`linkedin.com/in/ACoAA…` member id is the getter's input and is never saved as
-the link or delivered. Run this gate before email/phone lookup. Only `ok` or `partial` provider responses can supply candidates; all
-provider statuses and stable reasons belong in the receipts, while output
-`accepted`, `rejected`, and `unresolved` remain separate states.
-
-The email gate follows the contact gate. Before validation, the exact address
-must appear in returned email fields or a captured page body; search echoes,
-diagnostics and name/domain patterns are not discovery, and neither is a reply
-to a lookup or page request that was itself given the address. Saved discovery is reused.
-Check that the source actually supplies this buyer's address; occurrence alone is not identity proof.
-Acceptance requires the email, a matching
-ZeroBounce status, and a source receipt linked to its
-Deepline `email_validation` route. The receipt records `provider: "deepline"`,
-`validator: "zerobounce"`, `operation: "execute"`, the dynamically discovered
-tool, and route ID. ZeroBounce valid passes after trimming/case normalization.
-Catch-all/unknown or an eligible recorded service failure may instead pass with one successful BounceBan
-result deliverable receipt nested in `email_validation.fallback`. Preserve
-both receipts for the same address and distinct ordered validation routes.
-For service failures keep `status: null` and the matching `provider_status` on
-the ZeroBounce receipt, linked to its failed paid route. Preserve both costs.
-API success alone is not a deliverability verdict. Never override invalid,
-do_not_mail, spamtrap or abuse; do not chain fallbacks.
-A missing status or a failed, blocked, timed-out, or otherwise uncertain call
-cannot pass by itself. Preserve rejected and unresolved outcomes and continue with
-another discovered address or requested-role buyer within the budget.
-
 Write `reports/<run-id>/report.md`, `reports/<run-id>/results.json`, and
 `reports/<run-id>/leads.xlsx`. The report must contain the request, assumptions,
 hypotheses, route and evidence receipts, pilot observations, route cost bases,
-confirmed and maximum credits, Deepline dollars and cost per accepted lead,
-statuses, accepted rows, rejected rows, unresolved rows, contact selection, and stop
+confirmed and maximum credits, Deepline dollars and cost per accepted company,
+statuses, accepted rows, rejected rows, unresolved rows, and stop
 reason. For a target shortfall it must also show the full route frontier,
 continuation decisions, remaining call capacity, reviewed-company counts, and
 the reason each remaining route is exhausted or blocked. Record timing and
-accepted-lead provenance as specified in the output contract's
+accepted-company provenance as specified in the output contract's
 [`report.md` and final response section](output-contract.md#reportmd-and-final-response).
 Maintain these as work proceeds; do not reconstruct discovery attribution from
-the final evidence URL or treat a validator as the email finder. Do not store
+the final evidence URL. Do not store
 credentials or raw secrets.
 
 Use the output contract's [client workbook format](output-contract.md#leadsxlsx-contract)
-for contact rows, headers and evidence display. Unverified optional fields stay
-blank. Keep full evidence, run status, pending contacts and rejection details in
+for company rows, headers and evidence display. Unverified optional fields stay
+blank. Keep full evidence, run status and rejection details in
 `results.json` and the report.
 
 This is a small direct-wrapper workflow. It has no `Sourcing_model` or `pp`
@@ -391,11 +282,11 @@ LLM source review, not a separate rule engine:
 
 - **Specific activity:** a link to a collection or a general category description
   does not establish a matching current activity. Use a matching item or an
-  explicit statement of that activity, preserving the requested role and location
+  explicit statement of that activity, preserving the requested actor and location
   relationship. Inspect linked details only when the current source leaves that
   fact unresolved; do not require a particular source format or add a recency window.
 - **Hiring:** a generic careers page, job categories or an empty listings shell
-  does not establish a current vacancy. Before contact enrichment, open the
+  does not establish a current vacancy. Before acceptance, open the
   matching listing or use explicit current hiring evidence for the requested roles.
   One current vacancy supports a single observed
   opening. It does not establish rapid hiring or a surge. If rapid hiring is
@@ -408,8 +299,7 @@ LLM source review, not a separate rule engine:
   revenue do not establish the target company's own revenue without evidence of
   the requested scope. Keep a missing company-specific number unknown, not below
   threshold. Apply this review to required company attributes as well as signals
-  before buyer enrichment; preserve verified contacts if a later correction holds
-  the account. Optional numbers need no extra qualification check.
+  before acceptance. Optional numbers need no extra qualification check.
 - **Repeated hiring:** one posting copied by several aggregators is one
   observation. Repeated-vacancy claims need distinct, dated observations.
 - **Geography:** an ambiguous aggregator location does not establish a company
@@ -419,12 +309,9 @@ LLM source review, not a separate rule engine:
   and completed launch are different claims. Preserve the source's status.
 
 Before delivery, follow the final packet from `tyche_finish`: compare required
-company fit, the selected buyer's function/seniority, and material output claims
-with the saved sources. Current profile responsibilities resolve ambiguous titles;
-a clear matching title needs no additional description. Preserve supported broader
-roles and reasonable qualified analysis. Correct optional factual errors without
-rejecting a qualifying company; keep buyer gaps at the contact stage.
-Use `tyche_review` for changed fields, then review the fresh packet. Preserve
+company fit and material output claims with the saved sources. Preserve reasonable
+qualified analysis. Correct optional factual errors without rejecting a qualifying
+company. Use `tyche_review` for changed fields, then review the fresh packet. Preserve
 unchanged records, receipts and budget. Return its `review_ref` with source-based
 `review_findings` only after resolving the affected requirements and claims.
 Strict validation and review hashes verify structure and version, not source meaning.
@@ -435,11 +322,10 @@ Strict validation and review hashes verify structure and version, not source mea
 File-backed launcher runs default to two parallel researchers using this same
 loop. In a parallel worker, claim the real website domain with `tyche_claim`,
 including its verified LinkedIn `company_url` when known, before company-specific research. If another worker owns it,
-skip it. Use the returned target throughout qualification and contact enrichment.
-Work **one company at a time**: find → claim → qualify → complete and confirm its
-contact → next company. Resume `parallel.current_company` first after a restart.
-Before another claim or broad discovery, confirm the completed lead, reject an
-evidenced mismatch, or save `hold_account`/`hold_contact` with the specific missing
+skip it. Use the returned target throughout qualification.
+Work **one company at a time**: find → claim → qualify → confirm, reject, or hold → next company. Resume `parallel.current_company` first after a restart.
+Before another claim or broad discovery, confirm the completed company, reject an
+evidenced mismatch, or save `hold_account` with the specific missing
 evidence and why available routes cannot resolve it. Do not hold just to open
 more candidates. A hold retains ownership and evidence for later follow-up;
 missing evidence is not rejection. Company-scoped searches can resolve gaps.

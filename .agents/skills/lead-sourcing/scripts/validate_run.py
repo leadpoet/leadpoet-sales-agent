@@ -24,7 +24,13 @@ from source_receipts import funding_record, web_passage
 ACTIONABLE_FRONTIER_STATES = {"untried", "continuable"}
 FINAL_FRONTIER_STATES = {"exhausted", "blocked"}
 PAID_PROVIDERS = {"deepline", "scrapingdog"}
-SUPPORTED_RESULT_SCHEMA_VERSIONS = {"1.0", "1.1", "1.2"}
+COMPANY_RESULT_SCHEMA_VERSION = "2.0"
+SUPPORTED_RESULT_SCHEMA_VERSIONS = {"1.0", "1.1", "1.2", COMPANY_RESULT_SCHEMA_VERSION}
+CLIENT_RESULT_SCHEMA_VERSIONS = {"1.2", COMPANY_RESULT_SCHEMA_VERSION}
+COSTED_RESULT_SCHEMA_VERSIONS = {"1.1", "1.2", COMPANY_RESULT_SCHEMA_VERSION}
+def company_stage(document: Any) -> bool:
+    """Version 2.0 stores reviewed companies without contacts."""
+    return isinstance(document, dict) and document.get("schema_version") == COMPANY_RESULT_SCHEMA_VERSION
 DETERMINATE_PROVIDER_STATUSES = {"ok", "partial", "no_results"}
 BLOCKING_PROVIDER_STATUSES = {
     "rate_limited",
@@ -50,17 +56,6 @@ NEXT_LEAD_REVIEW_CREDITS = Decimal("5")
 
 def contact_limits(request: dict) -> tuple[int, int]:
     """One contact by default; the legacy field remains a target alias."""
-    contacts_required = request.get("contacts_required", True)
-    if type(contacts_required) is not bool:
-        raise ValueError("contacts_required must be true or false")
-    if not contacts_required:
-        conflicting = {
-            "requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
-            "min_contacts_per_company", "target_contacts_per_company",
-        } & request.keys()
-        if conflicting:
-            raise ValueError("contacts_required=false cannot include contact roles, fields or counts")
-        return 0, 0
     minimum = request.get("min_contacts_per_company", 1)
     target = request.get("target_contacts_per_company", request.get("contacts_per_company", minimum))
     if "contacts_per_company" in request and (type(request["contacts_per_company"]) is not int or request["contacts_per_company"] < 1):
@@ -95,11 +90,12 @@ def contact_count(row: dict, request=None) -> int:
 
 
 def explicit_contact_policy(request: dict) -> bool:
-    return ("contacts_required" in request
-            or any(key in request for key in ("min_contacts_per_company", "target_contacts_per_company")))
+    return any(key in request for key in ("min_contacts_per_company", "target_contacts_per_company"))
 
 
-def contact_coverage(document: dict) -> dict:
+def contact_coverage(document: dict) -> Optional[dict]:
+    if company_stage(document):
+        return None
     request = document.get("request", {})
     minimum, target = contact_limits(request)
     accepted = document.get("accepted", [])
@@ -112,6 +108,8 @@ def contact_coverage(document: dict) -> dict:
 
 def sourcing_target_met(document: dict) -> bool:
     request, accepted = document["request"], document.get("accepted", [])
+    if company_stage(document):
+        return len(accepted) >= request["target_count"]
     _, target = contact_limits(request)
     # Old saved runs used a best-effort backup count, not a completion gate.
     return len(accepted) >= request["target_count"] and (not explicit_contact_policy(request)
@@ -424,7 +422,7 @@ def signal_age_errors(request: dict, row: dict, path: str) -> list[str]:
         if last > latest or cutoff is not None and first < cutoff:
             errors.append(f"{label}: event_date {event_date} is not wholly within the requested window "
                           f"{cutoff.date() if cutoff else 'unbounded'} through {latest.date()}; "
-                          "narrow its date from evidence or keep the signal unknown before contact work/delivery.")
+                          "narrow its date from evidence or keep the signal unknown before acceptance or delivery.")
     return errors
 
 
@@ -433,6 +431,7 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
         return errors
     errors = []
     owners = set()
+    company_only = company_stage(document)
     for state in ("accepted", "rejected", "unresolved"):
         for index, row in enumerate(document.get(state, [])):
             if not isinstance(row, dict):
@@ -442,6 +441,8 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
             if not isinstance(checks, list):
                 errors.append(f"{path}.qualification_checks must be an array")
                 continue
+            if company_only and row.get("stage") == "contact":
+                errors.append(f"{path}: company sourcing has no contact stage")
             required = [c for c in checks if isinstance(c, dict) and c.get("importance") == "required"]
             # Compare structured facts to the saved ICP, never to a new band
             # improvised in a row's prose (e.g. rejecting 3 against 1-200).
@@ -451,12 +452,12 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
             company = row.get("company", row.get("candidate", {}))
             employee_range = company.get("employee_range") if isinstance(company, dict) else None
             bounds = employee_range_bounds(employee_range)
-            if band and bounds is None and (state == "accepted" or state == "unresolved" and row.get("stage") == "contact"):
-                errors.append(f"{path}: requested company_size needs a saved LinkedIn employee_range before contact work; select company.ref from its matched Harvest getter")
+            if band and bounds is None and state == "accepted":
+                errors.append(f"{path}: requested company_size needs a saved LinkedIn employee_range before acceptance; select company.ref from its matched Harvest getter")
             elif band and run_file is not None and state == "unresolved" and row.get("stage") == "contact":
                 # Use the delivery receipt check before paid contact work too.
-                company_only = {**document, "accepted": [{"company": company}]}
-                errors.extend(e.replace("accepted[0]", path) for e in linkedin_receipt_errors(company_only, run_file))
+                scoped_company = {**document, "accepted": [{"company": company}]}
+                errors.extend(e.replace("accepted[0]", path) for e in linkedin_receipt_errors(scoped_company, run_file))
             if employee_range is not None and bounds is None:
                 errors.append(f"{path}: employee_range must be a LinkedIn range")
             elif bounds is not None and isinstance(band, dict) and band:
@@ -468,7 +469,7 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
                     size_checks = [c for c in required if _identity(c.get("criterion")) in {"companysize", "employeecount", "employeerange"}]
                     if any(c.get("status") == "pass" and not fits or c.get("status") == "fail" and not outside for c in size_checks):
                         errors.append(f"{path}: company_size decision contradicts request.icp.company_size")
-                    if not fits and (state == "accepted" or (state == "unresolved" and row.get("stage") == "contact")):
+                    if not fits and state == "accepted":
                         errors.append(f"{path}: employee_range is outside or only partly inside request.icp.company_size")
             signal_requirements = request.get("buying_signals", [])
             ordinary_required = [c for c in required if not signal_requirements or not c.get("signal")]
@@ -477,7 +478,7 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
                 errors.extend(required_attribute_errors(request, row, path))
                 errors.extend(signal_coverage_errors(request, row, path))
                 errors.extend(signal_age_errors(request, row, path))
-                if document.get("schema_version") == "1.2":
+                if document.get("schema_version") in CLIENT_RESULT_SCHEMA_VERSIONS:
                     for check in required:
                         for item in (check.get("evidence") if isinstance(check.get("evidence"), list) else []):
                             if error := qualification_evidence_error(item, path + ".qualification_checks." + str(check.get("criterion")),
@@ -975,7 +976,8 @@ def calculate_cost_summary(document: dict[str, Any]) -> dict[str, Any]:
         return {"status": "incomplete" if any(p["pending_calls"] or p.get("held_credits") for p in providers.values()) else "calculated", **providers}
 
     summary = document.get("summary", {})
-    accepted_contacts = summary.get("accepted_contacts") if isinstance(summary, dict) else None
+    counted = "accepted_companies" if company_stage(document) else "accepted_contacts"
+    accepted_contacts = summary.get(counted) if isinstance(summary, dict) else None
     if (
         not isinstance(accepted_contacts, int)
         or isinstance(accepted_contacts, bool)
@@ -1086,21 +1088,22 @@ def calculate_cost_summary(document: dict[str, Any]) -> dict[str, Any]:
 def _validate_cost_accounting(document: dict[str, Any], errors: list[str]) -> None:
     """Enforce the route-cost contract introduced in version 1.1."""
 
-    if document.get("schema_version") not in {"1.1", "1.2"}:
+    if document.get("schema_version") not in COSTED_RESULT_SCHEMA_VERSIONS:
         return
 
     summary = document.get("summary", {})
-    accepted_contacts = summary.get("accepted_contacts") if isinstance(summary, dict) else None
+    counted = "accepted_companies" if company_stage(document) else "accepted_contacts"
+    accepted_contacts = summary.get(counted) if isinstance(summary, dict) else None
     if (
         not isinstance(accepted_contacts, int)
         or isinstance(accepted_contacts, bool)
         or accepted_contacts < 0
     ):
-        errors.append("summary.accepted_contacts must be a non-negative integer for cost accounting")
+        errors.append(f"summary.{counted} must be a non-negative integer for cost accounting")
     else:
         accepted = document.get("accepted", [])
         if isinstance(accepted, list) and accepted_contacts != len(accepted):
-            errors.append("summary.accepted_contacts must equal len(accepted) for cost accounting")
+            errors.append(f"summary.{counted} must equal len(accepted) for cost accounting")
 
     routes = document.get("routes", [])
     if not isinstance(routes, list):
@@ -1720,7 +1723,7 @@ def supporting_finding_errors(findings, path, *, document=None, run_file=None):
 def source_evidence_errors(document, *, run_file=None):
     """The evidence shape consumed by the client workbook and source review."""
     errors = []
-    if document.get("schema_version") != "1.2":
+    if document.get("schema_version") not in CLIENT_RESULT_SCHEMA_VERSIONS:
         return errors
     if document.get("accepted"):
         try:
@@ -1729,6 +1732,7 @@ def source_evidence_errors(document, *, run_file=None):
                 raise ValueError
         except ValueError:
             errors.append("retrieved_at requires an observation date")
+    company_only = company_stage(document)
     for index, row in enumerate(document.get("accepted", [])):
         if not isinstance(row, dict):
             continue
@@ -1741,12 +1745,13 @@ def source_evidence_errors(document, *, run_file=None):
         evidence = [("account_fit", row.get("account_fit"))]
         if signal or not signals_optional(document.get("request", {})):
             evidence.append(("signal_evidence", signal))
-        evidence += [("company.employee_range_evidence", company.get("employee_range_evidence"))]
-        if document.get("request", {}).get("contacts_required", True):
-            evidence += [("primary_contact", contact),
-                         ("primary_contact.location_evidence", contact.get("location_evidence"))]
-        if (document.get("request", {}).get("contacts_required", True)
-                and explicit_contact_policy(document.get("request", {}))):
+        if company_only:
+            if "employee_range_evidence" in company:
+                evidence.append(("company.employee_range_evidence", company.get("employee_range_evidence")))
+        else:
+            evidence += [("primary_contact", contact), ("primary_contact.location_evidence", contact.get("location_evidence")),
+                         ("company.employee_range_evidence", company.get("employee_range_evidence"))]
+        if not company_only and explicit_contact_policy(document.get("request", {})):
             for offset, backup in enumerate(row.get("backup_contacts", [])):
                 if isinstance(backup, dict):
                     evidence += [(f"backup_contacts[{offset}]", backup),
@@ -1769,13 +1774,45 @@ def source_evidence_errors(document, *, run_file=None):
     return errors
 
 
+def company_row_errors(document: dict) -> list[str]:
+    """Validate the company-only accepted contract."""
+    errors = []
+    request, accepted = document.get("request", {}), document.get("accepted", [])
+    contact_fields = ("requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
+                      "min_contacts_per_company", "target_contacts_per_company")
+    if any(key in request for key in contact_fields):
+        errors.append("company sourcing request cannot carry contact fields")
+    for index, row in enumerate(accepted):
+        if not isinstance(row, dict):
+            errors.append(f"accepted[{index}] must be an object")
+            continue
+        for field in ("primary_contact", "backup_contacts", "contact_candidate_count", "backup_shortfall"):
+            if field in row:
+                errors.append(f"accepted[{index}].{field}: company results carry no contacts")
+        company = row.get("company")
+        if not isinstance(company, dict):
+            errors.append(f"accepted[{index}] requires a company object")
+        elif not _nonempty_text(company.get("canonical_name")):
+            errors.append(f"accepted[{index}].company.canonical_name is required")
+        try:
+            company_website(company if isinstance(company, dict) else {})
+        except (ValueError, TypeError) as exc:
+            errors.append(f"accepted[{index}].company.website: {exc}")
+    _validate_client_output(accepted, errors)
+    return errors
+
+
 def accepted_errors(document: dict, *, run_file=None, fill_missing=False) -> list[str]:
     """Shared accepted-lead contract for saving a review and final delivery."""
-    errors = (linkedin_receipt_errors(document, run_file, fill_missing=fill_missing)
-              + email_receipt_errors(document, run_file, fill_missing=fill_missing)) if run_file is not None else []
+    errors = linkedin_receipt_errors(document, run_file, fill_missing=fill_missing) if run_file is not None else []
+    if run_file is not None and not company_stage(document):
+        errors.extend(email_receipt_errors(document, run_file, fill_missing=fill_missing))
     errors.extend(linkedin_field_errors(document))
     errors.extend(source_evidence_errors(document, run_file=run_file))
     request, accepted = document.get("request", {}), document.get("accepted", [])
+    if company_stage(document):
+        errors.extend(company_row_errors(document))
+        return errors
     try:
         minimum, _ = contact_limits(request)
     except ValueError as exc:
@@ -1790,7 +1827,6 @@ def accepted_errors(document: dict, *, run_file=None, fill_missing=False) -> lis
             errors.append(f"accepted[{index}].company.website: {exc}")
     if document.get("schema_version") == "1.2":
         _validate_client_output(accepted, errors)
-    contacts_required = request.get("contacts_required", True)
     grouped_roles = request.get("contact_role_groups")
     normalized_groups: dict[str, set[str]] = {}
     if grouped_roles is not None:
@@ -1868,11 +1904,6 @@ def accepted_errors(document: dict, *, run_file=None, fill_missing=False) -> lis
             accepted_domains.append(
                 canonical[4:] if canonical.startswith("www.") else canonical
             )
-
-        if not contacts_required:
-            if isinstance(row.get("primary_contact"), dict) or row.get("backup_contacts"):
-                errors.append(f"accepted[{index}] cannot include contacts when contacts_required=false")
-            continue
 
         primary = row.get("primary_contact")
         if not isinstance(primary, dict):
@@ -2639,7 +2670,6 @@ def main() -> int:
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             errors = [str(exc)]
         print(json.dumps({**partial, "valid": not errors, "delivery_allowed": False, "errors": errors,
-                          "contact_indexes": [ready_contact_indexes(row, document.get("request", {})) for row in document["accepted"]] if not errors else [],
                           "websites": [company_website(row["company"]) for row in document["accepted"]] if not errors else []}))
         return 2 if errors else 0
 

@@ -481,7 +481,7 @@ def instructions():
     return runner.ISOLATION_INSTRUCTIONS + "\n\n" + skill + "\n\n" + (
         "Arena execution context: The authoritative ICP, start time and budget are initialized. "
         "Begin with tyche_inspect. The host owns credentials, provider billing, quotas and the hard deadline. "
-        "Native tools adapt the shared sourcing workflow to this contract. Approved leads are "
+        "Native tools adapt the shared company-sourcing workflow to this contract. Approved companies are "
         "checkpointed automatically; tyche_finish writes reviewed /output/companies.json in place "
         "of local workbook/preview artifacts. Final prose is not company output. "
         "Use the shared research and review rules; preserve all saved state on interruption."
@@ -895,8 +895,9 @@ def run(icp):
             checkpoint_rows = read_output(os.environ["LAB_ARENA_OUTPUT_PATH"])["companies"]
         except (OSError, TypeError, ValueError):
             checkpoint_rows = None
+        company_icp = json.loads(request["original_text"])
         rows = checkpointed_companies(
-            run_file, icp, os.environ["LAB_ARENA_OUTPUT_PATH"], checkpoint=checkpoint.write)
+            run_file, company_icp, os.environ["LAB_ARENA_OUTPUT_PATH"], checkpoint=checkpoint.write)
         transition = checkpoint_transition(run_file, checkpoint_rows, rows)
         logged = _logged_checkpoint_transition(run_dir, rows)
         if transition is None:

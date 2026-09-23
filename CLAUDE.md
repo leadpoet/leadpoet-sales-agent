@@ -4,7 +4,7 @@ Use the user's intent to choose the execution path for this repository.
 
 ## Sourcing requests
 
-Requests to source leads, find matching companies and buyers, build an ICP
+Requests to source leads, find matching companies, build an ICP
 account list, or run a real sourcing test use the isolated TYCHE launcher by
 default. Ordinary wording such as "source 10 leads for this ICP" is sufficient.
 Do not perform the sourcing in the outer conversation or use global sourcing
@@ -23,7 +23,7 @@ python3 -c 'import os; print(os.environ.get("TYCHE_ISOLATED_RUN", "0"))'
 - Otherwise, create a unique run directory under `reports/` and write a UTF-8
   `request.txt` containing the user's sourcing request, relevant user-provided
   constraints and authorization from this conversation, and the run directory
-  for saved artifacts. Preserve the requested ICP, target, roles, fields,
+  for saved artifacts. Preserve the requested ICP, target, company fields,
   exclusions, budget and explicit time limit. When omitted, leave defaults to
   the local sourcing skill. Do not copy global instructions, skill contents,
   credentials, or the entire conversation into the request.

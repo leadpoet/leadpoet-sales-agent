@@ -3,10 +3,7 @@
 Normal sourcing uses [native tools](adapter-io.md#native-tools), which supply
 envelopes, descriptions, receipts and accounting. These wrapper contracts are
 diagnostics, not setup work for every lookup. Read [Capability discovery](#capability-discovery)
-for search ideas and the [ZeroBounce gate](#deepline-zerobounce-email-gate)
-before validating email; read [BounceBan fallback](#bounceban-fallback) only
-when catch-all/unknown or a ZeroBounce service failure requires it.
-No other validator replaces these gates.
+for search ideas.
 
 ## Deepline wrapper
 
@@ -20,7 +17,7 @@ uncertain executions. A completed upstream error with explicit billing can
 settle even when the provider operation timed out; a local timeout stays pending.
 A missing charge stays unresolved until an authoritative receipt is available; a validation
 error alone does not prove a zero charge. A catalog
-hit is not company or contact evidence. A disconnected tool is not an empty
+hit is not company evidence. A disconnected tool is not an empty
 result.
 
 The isolated supervisor waits up to 120 seconds for delayed, attributable bills,
@@ -71,9 +68,6 @@ search seeds, not fixed IDs; use only the tool ID returned by the current search
 - `companies with recent patents, facilities, openings, or expansion`
 - `companies with official video or event activity`
 - `company firmographic search by industry geography and size`
-- `people by company domain and requested job title`
-- `current title roster or leadership team by company domain`
-- `ZeroBounce validate one known email address`
 
 Use the [evidence-gap map](tools.md#choose-by-evidence-gap) and its linked
 capability reference for broader seeds. Search by provider plus the missing capability. Do not restrict discovery
@@ -84,10 +78,7 @@ and side effects; neither category grants execution permission.
 Learn each selected tool once with `tyche_inspect(tool=...)`. Native tools save
 and reuse its description, then check its inputs, connection and price before
 dispatch. Refresh only after evidence that the saved contract or access changed.
-Prefer a title-roster tool for nuanced roles. If that is unavailable, use broad function and seniority with
-the full user-approved title family. Ignore non-callable or monitor-only search
-hits for this one-shot workflow; do not deploy monitors. Do not use a CEO as an
-automatic fallback.
+Ignore non-callable or monitor-only search hits for this one-shot workflow; do not deploy monitors.
 
 ```bash
 python3 .agents/skills/lead-sourcing/scripts/deepline.py --input '{"operation":"search","query":"companies with current hiring or job postings"}'
@@ -98,7 +89,6 @@ python3 .agents/skills/lead-sourcing/scripts/deepline.py --input-file 'reports/<
 The execute request file includes `operation`, `tool`, `payload`, and the
 required [spend context](adapter-io.md#paid-call-budget). `execute` is paid.
 A company-discovery pilot has one paid call and at most 10 returned rows;
-contact lookups request only the remaining relevant people needed for that company's minimum/target.
 All returned execute rows are retained. Native lookup/inspect displays ten rows
 at a time; use its `next_offset` to inspect the rest without another paid call.
 The wrapper `limit` does not limit provider billing; set provider-native result/count and page or cursor fields from the live schema,
@@ -134,23 +124,16 @@ result lists. Qualification checks use the captured URL, body and date metadata
 regardless of the crawler's name; failed or empty HTTP captures cannot qualify.
 HTML remains HTML: inspect
 its actual fields before writing plain-language qualification evidence. A page
-is not a qualified company or buyer. Recover response-shape errors from saved
+is not a qualified company. Recover response-shape errors from saved
 raw responses without another provider call; preserve the original receipt and
 record any local normalization continuation with zero new calls and no duplicate
 charge.
-FullEnrich people-search responses expose `toolResponse.rawV2.people` as discovery
-records and retain `metadata.search_after` as the pagination cursor. Current
-employment and profile URLs are preserved; these results do not replace buyer
-identity, current-profile or email verification.
-
-For required [LinkedIn location and company size](output-contract.md#linkedin-location-and-company-size),
-use the matched URL with the live HarvestAPI company/profile getters. The adapter
-preserves the raw response and exposes `employee_range` from `employeeCountRange`,
-and `country`, `state`, `city`, `location_text` from the person's own `location`.
-It does not derive a range from `employeeCount` or a city from a broad region.
-Save field evidence with the exact getter's tool/route ID before accepting a lead.
-Reference response shapes: [company](https://elrix.mintlify.app/linkedin-api-reference/company/get)
-and [person](https://elrix.mintlify.app/linkedin-api-reference/profile/get).
+For required [LinkedIn company size](output-contract.md#linkedin-company-size),
+use the matched URL with the live HarvestAPI company getter. The adapter preserves
+raw response data and exposes `employee_range` from `employeeCountRange`. It does
+not derive a range from `employeeCount`. Save field evidence with the exact
+getter's tool and route ID before accepting a company. Reference response shape:
+[company](https://elrix.mintlify.app/linkedin-api-reference/company/get).
 
 For recognized event and post envelopes, the wrapper retains optional
 top-level `pagination`, `meta`, and `links` metadata with secrets redacted.
@@ -161,10 +144,9 @@ automatic. Review the complete saved page with inspect before purchasing another
 Older preview-only receipts can also be inspected in full without redispatch.
 
 HarvestAPI post rows retain the post URL, content, `postedAt`, and author.
-Verify the author, company, and original versus reposted source; the author is
-not automatically a current employee or buyer. A person-authored post does
-not establish the author's employer, and a company-authored post does not
-establish its canonical domain.
+Verify the author, company, and original versus reposted source. A post by an
+individual does not establish that individual's employer, and a company-authored
+post does not establish its canonical domain.
 
 For JSON:API event responses, relationship names such as `company1` and
 `company2` are retained in `related_companies`. Related companies are
@@ -182,94 +164,3 @@ or `config_error`. Only `ok` and `partial` can supply candidates. `no_results`
 does not prove absence. Other statuses are unresolved provider outcomes; stop or
 change route and retain `status`, `error` when present, `provider`, `operation`,
 `tool`, and normalized `results` in the report.
-
-## Email validation
-
-### BounceBan fallback
-
-After ZeroBounce returns `catch-all`/`unknown`, or its execution returns
-`provider_error` (including `NETWORK_ERROR`), `timeout`, `rate_limited`,
-`auth_failed`, or `quota_exceeded` without a usable verdict, search the live
-catalog for `BounceBan verify single email` and describe the returned tool. Execute once
-with the exact email and `entity_type: email_validation`, reserving the current
-price against the existing dollar and provider credit caps, plus any explicitly
-requested per-next-lead cap. Do not
-pin the tool ID or price. Keep catch-all verification enabled. Default to
-regular mode: deepverify assumes the email domain matches the current company
-website, which is not safe for all verified brand/alias domains. No webhook
-or outreach is needed.
-
-Read raw `result`, not API `status`. Acceptance requires API `success` and
-`result: deliverable`; risky/unknown is unresolved, undeliverable is rejected.
-The adapter exposes the verdict as `email_status` while retaining raw fields.
-Store status/result, optional score/time and the Deepline source in the
-original receipt's `fallback` object. Never overwrite the ZeroBounce receipt.
-For a service failure, store ZeroBounce `status: null` and `provider_status`
-matching its failed execution route; do not invent `unknown` as an email verdict.
-Preserve the failed route's reservation as well as the fallback's charge. A
-schema/input error, local permission/budget refusal, or missing attempt receipt
-does not qualify. The fallback is a separate paid call, not a ZeroBounce retry.
-If BounceBan also fails, keep the address unresolved and continue other useful
-work. A local network error alone does not prove a downstream provider outage.
-Do not override invalid, do_not_mail, spamtrap or abuse. An unsuccessful or
-uncertain call stays unresolved; do not retry it automatically or chain
-validators. Choose another address or requested buyer instead.
-
-An asynchronous `queue`/`verifying` response is `partial` with empty results
-and `pending_verification` containing the existing job ID. It is not an empty
-search or a deliverability verdict. Preserve this receipt. The model may
-discover and describe the single-status retrieval tool and, only after
-confirming it is free, retrieve that same job ID. Match the returned ID and
-email before using a successful final verdict; save the completion receipt
-separately with its zero cost bound and guarded dispatch count. Use the
-`status_read` action flag from [shared I/O](adapter-io.md#one-attempt); every
-`execute` is counted by the guard even when priced free. The fallback
-source references the completed status receipt; retain the original submission
-and its automatically recorded continuation link.
-Respect `try_again_at`, allow at most three status reads with at least 30
-seconds between reads, and leave a still-pending job unresolved. Never create
-another paid verification to recover a pending job. The adapter itself does
-not poll or retry.
-
-Finalization allows a catalog-confirmed free status getter for a pending
-verification submitted in this run, including after the research deadline.
-The getter must match the saved job, provider and company; it cannot submit
-another verification or extend the clock. An unused pending address remains
-unfinished in the audit with its cost reservation preserved. It does not block
-export of other addresses with completed, matching verification receipts.
-
-An outer transport/auth/provider failure must not be promoted by a nested
-positive validator row. Only the explicitly recognized default send-policy
-rejection may retain a non-positive ZeroBounce verdict for the normal gate.
-
-### Deepline ZeroBounce email gate
-
-When the effective contact fields include email, first find and verify the
-person and current role. Use the saved ZeroBounce single-address validation
-capability prepared at startup. Inspect its inputs once if needed; reuse its
-description and successful same-address receipts. Search the live catalog only
-if that capability is unavailable or has changed. Native tools check the saved
-contract and price before dispatch; the catalog tool ID remains runtime data.
-
-```bash
-python3 .agents/skills/lead-sourcing/scripts/deepline.py --input '{"operation":"search","query":"ZeroBounce validate one known email address"}'
-python3 .agents/skills/lead-sourcing/scripts/deepline.py --input '{"operation":"describe","tool":"<current ZeroBounce validation tool from search>"}'
-python3 .agents/skills/lead-sourcing/scripts/deepline.py --input '{"operation":"execute","tool":"<same described tool>","entity_type":"email_validation","payload":{"email":"person@example.com"},"limit":1}'
-```
-
-Use the exact payload names returned by the live description; the example
-shows the current scalar shape but does not override the live schema. The
-adapter preserves the provider row and exposes `email`, `email_status`, and
-`email_sub_status` for a recognized scalar validation result. Link the final
-receipt to a unique `email_validation` route and record actual usage.
-
-Apply TYCHE's current gate to the explicit ZeroBounce status after trimming and
-case normalization. `valid` passes directly. Reject `invalid`, `do_not_mail`,
-`spamtrap`, and `abuse` without fallback. `catch-all`/`unknown` and the recorded
-service failures above may receive one BounceBan check. Unfamiliar verdicts stay unresolved.
-Continue with another discovered address or requested buyer.
-A missing status, `no_results`, provider error, timeout, or other uncertain
-call cannot pass by itself; the eligible service failures may use BounceBan.
-Do not retry an
-uncertain paid validation call automatically. Deepline owns the provider
-credential; do not require or read a direct ZeroBounce key.

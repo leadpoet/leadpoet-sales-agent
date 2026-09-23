@@ -1,4 +1,5 @@
 """Request-specific evidence gates, exercised without provider calls."""
+import copy
 import json
 from pathlib import Path
 import sys
@@ -10,13 +11,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import budget_guard
 import research_input
 from research_tools import ResearchTools
+from test_client_output import client_document
 from test_research_tools import FixtureProvider, captured_page
 import validate_run
 
 
 def request(mode="all"):
     return {"target_count": 1, "icp": {"exclusions": ["excluded.test"]},
-            "requested_roles": ["Operations leader"], "contact_fields": [],
             "buying_signals": [
                 {"kind": "Expansion", "importance": "required", "min_age_days": 30, "max_age_days": 90},
                 {"kind": "Partnership", "importance": "required", "max_age_days": 180},
@@ -34,13 +35,51 @@ def check(kind="Expansion", status="pass", importance="required", date="2026-08-
 def document(req, checks, state="accepted"):
     row = {"company": {"canonical_name": "Example", "domain": "example.test"}, "qualification_checks": checks}
     if state == "unresolved":
-        row["stage"] = "contact"
+        row["stage"] = "account"
     if state == "rejected":
         row["reason_code"] = "not_icp_fit"
     return {"request": req, state: [row]}
 
 
+def company_client_document():
+    saved = client_document()
+    saved["schema_version"] = validate_run.COMPANY_RESULT_SCHEMA_VERSION
+    for key in ("requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
+                "min_contacts_per_company", "target_contacts_per_company"):
+        saved["request"].pop(key, None)
+    for row in saved["accepted"]:
+        for key in ("primary_contact", "backup_contacts", "contact_candidate_count", "backup_shortfall"):
+            row.pop(key, None)
+    for key in ("accepted_contacts", "backup_contacts", "contact_coverage"):
+        saved["summary"].pop(key, None)
+    saved["summary"]["accepted_companies"] = len(saved["accepted"])
+    saved["cost_summary"] = validate_run.calculate_cost_summary(saved)
+    return saved
+
+
 class SignalRequirementsTests(unittest.TestCase):
+    def test_company_only_result_completes_without_contact_fields(self):
+        saved = company_client_document()
+        self.assertEqual(validate_run.accepted_errors(saved), [])
+        self.assertEqual(validate_run.validate_run(saved), [])
+        self.assertTrue(validate_run.sourcing_target_met(saved))
+
+    def test_held_company_recovers_to_the_same_accepted_company_row(self):
+        saved = company_client_document()
+        accepted = copy.deepcopy(saved["accepted"][0])
+        scope = accepted["company"]["domain"]
+        saved["accepted"] = []
+        saved["unresolved"] = [{"stage": "account", "candidate": {"domain": scope},
+                                "reason_code": "missing_account_evidence",
+                                "reason_text": "Awaiting saved evidence", "qualification_checks": []}]
+        update = {"scope": scope, "state": "accepted", **accepted}
+        result = research_input.company_update(saved, update)
+        saved["unresolved"] = []
+        saved["accepted"] = [result["row"]]
+        self.assertEqual(result["row"]["company"], accepted["company"])
+        self.assertNotIn("stage", result["row"])
+        self.assertEqual(validate_run.accepted_errors(saved), [])
+
     def test_calendar_months_keep_the_original_boundary_and_precision(self):
         req = request('any')
         req['time_window'] = {'as_of_date': '2026-09-17', 'max_age_months': 6}
@@ -77,7 +116,7 @@ class SignalRequirementsTests(unittest.TestCase):
                 req['buying_signals'] = [{'kind': 'Expansion', **(invalid if scope == 'signal' else {})}]
                 with self.subTest(invalid=invalid, scope=scope), self.assertRaises(ValueError):
                     research_input.normalize_request(req, Path('run/results.json'))
-    def test_legacy_label_can_be_explicitly_mapped_without_changing_request_or_evidence(self):
+    def test_saved_label_can_be_explicitly_mapped_without_changing_request_or_evidence(self):
         req = request("any")
         for signal in req["buying_signals"]:
             signal.pop("importance")
@@ -85,7 +124,7 @@ class SignalRequirementsTests(unittest.TestCase):
         old.update(criterion="legacy event", signal="New location")
         doc = document(req, [old], "unresolved")
         before = json.dumps(doc, sort_keys=True)
-        self.assertIn("explicit requirement_ref", " ".join(validate_run.qualification_errors(doc)))
+        self.assertEqual(validate_run.qualification_errors(doc), [])
         patch = {"scope": "example.test", "reason_text": "Explicitly mapped saved evidence to its requested kind", "qualification_checks": [
             {k: v for k, v in dict(old, requirement_ref="signal:0").items() if k != "signal"}]}
         result = research_input.company_update(doc, patch)["row"]
@@ -138,9 +177,9 @@ class SignalRequirementsTests(unittest.TestCase):
         req["buying_signals"] = [req["buying_signals"][2]]
         self.assertEqual(validate_run.qualification_errors(document(req, [])), [])
 
-    def test_cannot_downgrade_a_required_signal_or_omit_it_before_contacts(self):
+    def test_cannot_downgrade_required_signal_but_may_hold_missing_evidence(self):
         self.assertTrue(validate_run.qualification_errors(document(request("any"), [check(importance="preferred")])))
-        self.assertTrue(validate_run.qualification_errors(document(request(), [], "unresolved")))
+        self.assertEqual(validate_run.qualification_errors(document(request(), [], "unresolved")), [])
 
     def test_failed_alternative_is_not_an_automatic_company_rejection(self):
         checks = [check(status="fail"), check("Partnership", "unknown")]
@@ -256,14 +295,8 @@ class RequestNormalizationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             research_input.normalize_request(req, Path("run/results.json"))
 
-    def test_sector_abbreviations_are_not_invented(self):
-        self.assertEqual(research_input.canonical_requested_role("Chief Nursing Officer", ["CNO"]), "Chief Nursing Officer")
-        self.assertEqual(research_input.canonical_requested_role("cno", ["CNO"]), "CNO")
-        self.assertEqual(research_input.canonical_requested_role("CEO", ["Chief Executive Officer"]), "Chief Executive Officer")
-
-
 class NativeRequirementJourneyTests(unittest.TestCase):
-    def test_exclusion_variant_is_held_then_resolved_without_contact_spending(self):
+    def test_exclusion_variant_is_held_then_resolved_without_extra_spending(self):
         with tempfile.TemporaryDirectory() as directory:
             provider = FixtureProvider()
             tools = ResearchTools(Path(directory) / 'results.json', execute=provider)
@@ -271,7 +304,7 @@ class NativeRequirementJourneyTests(unittest.TestCase):
             req['icp']['exclusions'] = ['Pen Underwriting', 'Ancells Farm Dental Clinic']
             tools.start(req, max_usd=1)
             ref = captured_page(tools, provider, text='Pen Underwriting UK is the Pen Underwriting business.', date='2026-08-01')
-            finding = {'target': 'example.test', 'decision': 'qualify_account', 'reason': 'Checking identity',
+            finding = {'target': 'example.test', 'decision': 'accept', 'reason': 'Checking identity',
                 'company': {'canonical_name': 'Pen Underwriting UK'}, 'account_fit': {'ref': ref},
                 'qualification_checks': [dict(check(), evidence=[{'ref': ref, 'event_date': '2026-08-01'}])]}
             before = len(provider.requests), budget_guard.ledger_path(tools.path).read_bytes()
@@ -301,7 +334,7 @@ class NativeRequirementJourneyTests(unittest.TestCase):
         row['company']['aliases'] = ['Pen Underwriting']
         self.assertTrue(validate_run.excluded_company(req, row))  # A distinctness claim never overrides an exact alias.
 
-    def test_review_copies_importance_and_blocks_contact_work_until_all_pass(self):
+    def test_review_copies_importance_and_allows_company_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run/results.json"
             provider = FixtureProvider()
@@ -317,12 +350,14 @@ class NativeRequirementJourneyTests(unittest.TestCase):
             self.assertEqual(saved["unresolved"][0]["qualification_checks"][0]["importance"], "required")
             before, ledger = path.read_bytes(), budget_guard.ledger_path(path).read_bytes()
             with self.assertRaisesRegex(ValueError, "coverage"):
-                tools.review(companies=[{"target": "example.test", "decision": "qualify_account", "reason": "Missing partnership"}])
+                tools.review(companies=[{"target": "example.test", "decision": "accept", "reason": "Missing partnership"}])
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(budget_guard.ledger_path(path).read_bytes(), ledger)
-            tools.review(companies=[{"target": "example.test", "decision": "qualify_account", "reason": "Both signals reviewed",
+            tools.review(companies=[{"target": "example.test", "decision": "hold_account", "reason": "Both signals reviewed",
                                      "qualification_checks": [dict(check("Partnership"), evidence=evidence)]}])
-            self.assertEqual(json.loads(path.read_text())["unresolved"][0]["stage"], "contact")
+            saved = json.loads(path.read_text())
+            self.assertEqual(len(saved["unresolved"]), 1)
+            self.assertEqual(len(saved["unresolved"][0]["qualification_checks"]), 2)
             self.assertEqual([r["tool"] for r in provider.requests if r["operation"] == "execute"], ["firecrawl_scrape"])
 
 

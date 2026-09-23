@@ -1,4 +1,4 @@
-"""Map reviewed TYCHE records to Arena's current intent-details/contact schema."""
+"""Map reviewed TYCHE records to Arena's company-only intent schema."""
 
 import hashlib
 import json
@@ -13,27 +13,16 @@ from urllib.parse import urlsplit
 
 import budget_guard
 import confirmed_leads
-import email_receipts
-import linkedin_receipts
 import run_attempt
 import run_coordination as coordination
 from validate_run import _identity, accepted_errors, qualification_errors
-from .constraints import check_contact
-from .input import company_stage_matches, required_company_stage
+from .input import company_only_icp, company_stage_matches, required_company_stage
 
 
 CHECKPOINT_TRANSITION_REASONS = {
     "unchanged", "rejected", "unresolved", "changed_accepted",
     "missing_accepted", "mixed",
 }
-
-ARENA_EMAIL_FINDERS = {
-    "datagma_find_email": "datagma",
-    "hunter_email_finder": "hunter",
-    "leadmagic_email_finder": "leadmagic",
-    "limadata_find_work_email": "limadata",
-}
-
 
 def canonical_output_sha256(rows):
     """Hash the canonical ASCII JSON envelope without retaining its payload."""
@@ -150,10 +139,9 @@ def projected_payload(rows, targets=()):
     document = {"companies": rows}
     fields = {"companies", "company_name", "company_website", "company_linkedin", "industry",
               "employee_count", "company_stage", "country", "state", "intent_details",
-              "intent_signals", "company_stage_evidence", "quote", "required_attribute", "contact", "matched_icp_signal",
+              "intent_signals", "company_stage_evidence", "quote", "required_attribute", "matched_icp_signal",
               "description", "date", "url", "text", "passed", "evidence_url", "evidence_quote",
-              "explanation", "full_name", "role", "linkedin_url", "email", "location", "region",
-              "city", "email_source", "provider", "tool", "broker_call_id", "record_id"}
+              "explanation"}
 
     def fail(path, reason):
         match = re.search(r"^\$\.companies\[(\d+)\]", path)
@@ -227,7 +215,7 @@ def evidence_value(evidence, key):
 
 
 def signal_date(evidence):
-    """Project reviewed activity timing into Arena V5 without inventing precision."""
+    """Project reviewed activity timing without inventing precision."""
     value = evidence.get("event_date")
     if value is None and evidence_value(evidence, "date_basis") == "observed_current":
         value = evidence_value(evidence, "date")
@@ -356,73 +344,8 @@ def accepted_preflight(run_file, document):
             + accepted_errors(completed, run_file=run_file))
 
 
-def _project_contact(run_file, document, company, person):
-    """Project the frozen V5 contact only for contact-required requests."""
-    check_contact(person, json.loads(document["request"]["original_text"]))
-    if "email_source" in person:
-        email_attribution = person["email_source"]
-        if (not isinstance(email_attribution, Mapping)
-                or not isinstance(email_attribution.get("source"), Mapping)):
-            raise ValueError("Arena email has an invalid explicit saved discovery source")
-        source = email_attribution["source"]
-    else:
-        source = (person.get("location_evidence") or person)["source"]
-    receipt = run_attempt.read_receipt(run_file, source["route_id"])["result"]
-    tool = receipt.get("tool")
-    if tool == "harvestapi_get_profile":
-        profile = linkedin_receipts._saved_profile(
-            run_file, source, person["linkedin_url"], "in",
-            document["routes"], company.get("linkedin_url"),
-        )
-        if receipt["attempt"]["request"].get("payload", {}).get("findEmail") != "true":
-            raise ValueError("Arena email must come from HarvestAPI get_profile with findEmail=true")
-        emails = profile.get("emails", [])
-        observed = {str(e.get("email") if isinstance(e, dict) else e).strip().casefold()
-                    for e in emails}
-        if profile.get("email"):
-            observed.add(str(profile["email"]).strip().casefold())
-        if person["email"].strip().casefold() not in observed:
-            raise ValueError("Arena email is absent from the selected provider profile")
-        record_id = text(
-            profile.get("recordId") or profile.get("record_id") or profile.get("id"),
-            "HarvestAPI record ID",
-        )
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/~-]{0,199}", record_id):
-            raise ValueError("HarvestAPI record ID violates Arena's source contract")
-        arena_source = {"provider": "harvestapi", "tool": tool, "record_id": record_id}
-    elif tool in ARENA_EMAIL_FINDERS:
-        discovered = email_receipts.discovery_source(
-            run_file, document["routes"], person["email"], preferred=source["route_id"],
-        )
-        if not discovered or discovered["source"].get("route_id") != source["route_id"]:
-            raise ValueError("Arena email is absent from the selected provider finder")
-        provider_response = receipt.get("provider_response")
-        arena_metadata = (provider_response.get("arena")
-                          if isinstance(provider_response, Mapping) else None)
-        broker_call_id = (arena_metadata.get("call_identity")
-                          if isinstance(arena_metadata, Mapping) else None)
-        if (not isinstance(broker_call_id, str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", broker_call_id) is None):
-            raise ValueError("Arena email finder lacks its trusted broker call identity")
-        arena_source = {
-            "provider": ARENA_EMAIL_FINDERS[tool], "tool": tool,
-            "broker_call_id": broker_call_id,
-        }
-    else:
-        raise ValueError("Arena email has an unsupported saved discovery source")
-    return {
-        "full_name": person["full_name"], "role": person["current_title"],
-        "linkedin_url": person["linkedin_url"], "email": person["email"],
-        "location": {
-            "country": person["country"],
-            **({"region": person["state"]} if person.get("state") else {}),
-            **({"city": person["city"]} if person.get("city") else {}),
-        },
-        "email_source": arena_source,
-    }
-
-
 def _project_companies(run_file, document, icp, *, require_review):
+    icp = company_only_icp(icp)
     if json.loads(document["request"]["original_text"]) != icp:
         raise ValueError("Arena delivery ICP differs from the saved request")
     final_approved = (document.get("final_review", {}).get("review_ref")
@@ -434,7 +357,6 @@ def _project_companies(run_file, document, icp, *, require_review):
     if errors := accepted_preflight(run_file, document):
         raise ValueError("; ".join(errors))
     output = []
-    contacts_required = document["request"].get("contacts_required", True)
     kinds = {_identity(signal["kind"]): index for index, signal in enumerate(document["request"]["buying_signals"])}
     for row in document["accepted"]:
         company = row["company"]
@@ -481,19 +403,14 @@ def _project_companies(run_file, document, icp, *, require_review):
         if (len(paragraph) > 2000 or re.search(r"\n\s*\n|(?:^|\n)\s*(?:#{1,6}\s|[-*•]\s|\d+[.)]\s|>)", paragraph)
                 or "```" in paragraph or any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} and c not in "\r\n\t" for c in paragraph)):
             raise ValueError("Arena intent_details requires one plain paragraph of at most 2000 characters")
-        projected = {"company_name": company["canonical_name"],
+        output.append({"company_name": company["canonical_name"],
             "company_website": public_url(company.get("website") or "https://" + company["domain"]),
             "company_linkedin": company["linkedin_url"], "industry": company["industry"],
             "employee_count": company["employee_range"], "company_stage": stage,
             "country": text(company.get("hq_country"), "company country"), "state": company.get("hq_state", ""),
             "intent_details": " ".join(paragraph.split()), "intent_signals": signals,
             **({"company_stage_evidence": stage_evidence} if stage_evidence else {}),
-            "required_attribute": attribute}
-        if contacts_required:
-            projected["contact"] = _project_contact(
-                run_file, document, company, row["primary_contact"],
-            )
-        output.append(projected)
+            "required_attribute": attribute})
     if len(output) > min(5, document["request"]["target_count"]):
         raise ValueError("Arena company limit exceeded")
     projected_payload(output, [row["company"]["domain"] for row in document["accepted"]])

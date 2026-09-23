@@ -40,10 +40,8 @@ URL = "http://public.example/page"
 
 def catalog_provider(request, _capture):
     tool = request.get("tool")
-    key = "email" if tool == "zerobounce_validate" else "url"
+    key = "url"
     properties = {key: {"type": "string"}}
-    if tool == "harvestapi_get_profile":
-        properties["findEmail"] = {"type": "string"}
     return {"provider": "deepline", "operation": "describe", "status": "ok", "results": [{
         "toolId": tool, "callable": True, "connected": True,
         "inputSchema": {
@@ -129,7 +127,7 @@ def test_host_capture_qualification_and_legacy_observation_rejection(tmp_path, m
         saved["results"][0]["content_kind"] = "captured_page"  # A marker cannot promote a note.
         Path(receipt["receipt_file"]).write_text(json.dumps(saved))
     arguments = [{
-            "target": "example.com", "decision": "qualify_account", "reason": "Check industry",
+            "target": "example.com", "decision": "hold_account", "reason": "Check industry",
             "qualification_checks": [{
                 "requirement_ref": "icp:industries", "status": "pass",
                 "claim": "Manufactures products", "evidence": [{"ref": page["ref"]}],
@@ -145,7 +143,11 @@ def test_host_capture_qualification_and_legacy_observation_rejection(tmp_path, m
     before = tools.path.read_bytes()
     if legacy:
         with pytest.raises(ValueError, match="tool-captured page, not an agent-recorded passage"):
-            tools.review(companies=arguments)
+            web_passage(
+                tools.path,
+                tools._document(),
+                tools._evidence({"ref": page["ref"]}),
+            )
         assert tools.path.read_bytes() == before
     else:
         tools.review(companies=arguments)

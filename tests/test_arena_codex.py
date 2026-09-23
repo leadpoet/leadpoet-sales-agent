@@ -30,7 +30,7 @@ from tyche_arena import host as runtime
 from tyche_arena import output as arena_output
 from tyche_arena.broker import (Broker, BrokerError, BrokerRefusal, DEEPLINE_WAIT_SECONDS,
                                 SCRAPINGDOG_RUNTIME_HANDLE)
-from tyche_arena.input import request_for
+from tyche_arena.input import company_only_icp, request_for
 from tyche_arena.mcp import (LAB_TOOLS, LabTools, broker_resume_state,
                              evidence_review_page, model_result)
 from tyche_arena.mcp import EVIDENCE_REVIEW_PAGE_CHARACTERS, MODEL_RESULT_MAX_CHARACTERS
@@ -39,8 +39,6 @@ from research_tools import ResearchTools, TOOLS
 import budget_guard
 import confirmed_leads
 import deepline
-import email_receipts
-import linkedin_receipts
 import run_attempt
 import scrapingdog
 from validate_run import research_closes, run_deadline
@@ -261,10 +259,7 @@ ICP = {"intent_details_policy": "intent_details_v1", "contact_policy": "contacts
        "target_roles": ["Director of Supply Chain"], "target_seniority": "Director+",
        "contact_geography": {"countries": ["US"], "regions": ["OH"], "cities": ["Columbus"]},
        "excluded_companies": ["excluded.example.com"]}
-COMPANY_ONLY_ICP = {key: copy.deepcopy(value) for key, value in ICP.items()
-                    if key not in {"contact_policy", "target_roles", "target_seniority", "contact_geography"}}
 COMPANY_URL = "https://www.linkedin.com/company/example-products"
-PERSON_URL = "https://www.linkedin.com/in/ada-example"
 PARAGRAPH = ("Example Products connected its acquired warehouse to a shared WMS on August 12, 2026. "
              "The project covers inventory visibility and fulfillment across the combined operation. "
              "This recent integration may increase its need to coordinate stock and orders between warehouses.")
@@ -304,13 +299,13 @@ def review_findings(packet, tools=None):
     } for company in packet["companies"]]
 
 
-def scenario(finish_tool="tyche_finish", *, separate_email_source=False, finder_tool=None):
+def scenario(finish_tool="tyche_finish"):
     company = yield "tyche_lookup", lookup(
         "harvestapi_get_company", {"url": COMPANY_URL}, "account_discovery")
     company_ref = company["lookups"][0]["results"][0]["ref"]
     pages = yield "tyche_lookup", lookup("generic_http_request", {"url": "https://example.com/news", "method": "GET"})
     refs = [row["ref"] for row in pages["lookups"][0]["results"]]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "qualify_account", "reason": "Company and signal verified",
+    accepted = yield "tyche_review", {"companies": [{"target": "example.com", "decision": "accept", "reason": "Company and signal verified",
         "company": {"ref": company_ref, "discovery_source": {"ref": company_ref},
             "industry": "Manufacturing", "sub_industry": "Textiles",
             "description": "Example Products manufactures packaged goods, tools, and accessories. It supplies retailers with consumer products.",
@@ -322,37 +317,6 @@ def scenario(finish_tool="tyche_finish", *, separate_email_source=False, finder_
             {"requirement_ref": "signal:0", "status": "pass", "claim": "Connected an acquired warehouse to a shared WMS", "evidence": [{"ref": refs[1], "event_date": "2026-08-12"}]}],
         "intent_details": PARAGRAPH}],
         "sources": [{"ref": pages["lookups"][0]["route"], "state": "exhausted", "reason": "Both fixture sources reviewed"}]}
-    profile = yield "tyche_lookup", lookup("harvestapi_get_profile", {"url": PERSON_URL, "main": "true"}, "contact_verification")
-    profile_ref = profile["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Verify selected email",
-        "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
-    finder_inputs = {
-        "hunter_email_finder": {"first_name": "Ada", "last_name": "Example", "domain": "example.com"},
-        "limadata_find_work_email": {"full_name": "Ada Example", "company_domain": "example.com"},
-        "datagma_find_email": {"fullName": "Ada Example", "companyDomain": "example.com"},
-        "leadmagic_email_finder": {"first_name": "Ada", "last_name": "Example", "domain": "example.com"},
-    }
-    if finder_tool:
-        yield "tyche_inspect", {"tool": finder_tool}
-        enriched = yield "tyche_lookup", lookup(
-            finder_tool, finder_inputs[finder_tool], "contact_discovery",
-            contact_ref=profile_ref,
-        )
-    else:
-        enriched = yield "tyche_lookup", lookup("harvestapi_get_profile", {"findEmail": "true"}, "contact_discovery", contact_ref=profile_ref)
-    email_profile_ref = enriched["lookups"][0]["results"][0]["ref"]
-    if not separate_email_source and not finder_tool:
-        profile_ref = email_profile_ref
-        yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Select enriched profile",
-            "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
-    email = yield "tyche_lookup", lookup("zerobounce_validate", {"email": "ada@example.com"}, "email_validation", contact_ref=profile_ref)
-    email_ref = email["lookups"][0]["results"][0]["ref"]
-    accept_request = {"companies": [{"target": "example.com", "decision": "accept", "reason": "Verified company and current buyer",
-        "primary_contact": {"email_ref": email_ref, "email_source": {"ref": email_profile_ref}}}]}
-    if separate_email_source or finder_tool:
-        accept_request["sources"] = [{"ref": enriched["lookups"][0]["route"], "state": "exhausted",
-            "reason": "Selected email profile reviewed"}]
-    accepted = yield "tyche_review", accept_request
     if finish_tool is None:
         return
     packet = accepted if finish_tool == "tyche_checkpoint" else (yield finish_tool, {})
@@ -367,61 +331,6 @@ def scenario(finish_tool="tyche_finish", *, separate_email_source=False, finder_
     }
     assert final["checkpoint_saved"], final
     assert final["delivery_allowed"] == (finish_tool == "tyche_finish"), final
-
-
-def company_only_scenario(finish_tool="tyche_finish"):
-    """Accept and checkpoint one company without person discovery or contact tools."""
-    company = yield "tyche_lookup", lookup(
-        "harvestapi_get_company", {"url": COMPANY_URL}, "account_discovery")
-    company_ref = company["lookups"][0]["results"][0]["ref"]
-    pages = yield "tyche_lookup", lookup(
-        "generic_http_request", {"url": "https://example.com/news", "method": "GET"})
-    refs = [row["ref"] for row in pages["lookups"][0]["results"]]
-    accepted = yield "tyche_review", {"companies": [{
-        "target": "example.com", "decision": "accept",
-        "reason": "Company fit and current intent are verified",
-        "company": {"ref": company_ref, "discovery_source": {"ref": company_ref},
-            "industry": "Manufacturing", "sub_industry": "Textiles",
-            "description": "Example Products manufactures packaged goods, tools, and accessories. It supplies retailers with consumer products.",
-            "classification_note": "Canonical taxonomy classification"},
-        "account_fit": {"ref": refs[0], "fit_claim": "Manufacturing account"},
-        "qualification_checks": [
-            {"requirement_ref": "icp:industries", "status": "pass",
-             "claim": "Manufactures consumer products", "evidence": [{"ref": refs[0]}]},
-            {"requirement_ref": "attribute:0", "status": "pass",
-             "claim": "Manufactures consumer products for retailers", "evidence": [{"ref": refs[0]}]},
-            {"requirement_ref": "signal:0", "status": "pass",
-             "claim": "Connected an acquired warehouse to a shared WMS",
-             "evidence": [{"ref": refs[1], "event_date": "2026-08-12"}]},
-        ],
-        "intent_details": PARAGRAPH,
-    }], "sources": [{"ref": pages["lookups"][0]["route"], "state": "exhausted",
-                       "reason": "Both fixture sources reviewed"}]}
-    assert accepted["status"] == "review_required", accepted
-    if finish_tool == "tyche_checkpoint":
-        checkpointed = yield "tyche_checkpoint", {
-            "review_ref": accepted["review_ref"],
-            "review_findings": review_findings(accepted),
-        }
-        assert checkpointed["checkpoint_saved"], checkpointed
-        assert checkpointed["delivery_allowed"] is False
-        return
-    confirmed = yield "tyche_review", {
-        "review_ref": accepted["review_ref"],
-        "review_findings": review_findings(accepted),
-    }
-    assert confirmed["checkpoint_saved"], confirmed
-    if finish_tool is None:
-        return
-    packet = yield finish_tool, {}
-    assert packet["status"] == "review_required", packet
-    assert "primary_contact" not in packet["companies"][0]
-    assert "company-only request" in packet["instructions"]
-    final = yield finish_tool, {
-        "review_ref": packet["review_ref"],
-        "review_findings": review_findings(packet),
-    }
-    assert final["checkpoint_saved"] and final["delivery_allowed"], final
 
 
 def capture_accepted_review(captured):
@@ -471,8 +380,7 @@ def supporting_finding_review(captured):
             return
 
 
-def reviewed_company(target, company_url, person_url, email, page_url, event_date,
-                     paragraph, *, approve=True):
+def reviewed_company(target, company_url, page_url, event_date, paragraph, *, approve=True):
     company = yield "tyche_lookup", lookup(
         "harvestapi_get_company", {"url": company_url})
     company_ref = company["lookups"][0]["results"][0]["ref"]
@@ -481,8 +389,8 @@ def reviewed_company(target, company_url, person_url, email, page_url, event_dat
                     "phase": "account_verification", "tool": "generic_http_request",
                     "inputs": {"url": page_url, "method": "GET"}}]}
     refs = [row["ref"] for row in pages["lookups"][0]["results"]]
-    yield "tyche_review", {"companies": [{
-        "target": target, "decision": "qualify_account",
+    packet = yield "tyche_review", {"companies": [{
+        "target": target, "decision": "accept",
         "reason": "Company and signal verified",
         "company": {"ref": company_ref, "industry": "Manufacturing",
                     "sub_industry": "Textiles",
@@ -501,32 +409,6 @@ def reviewed_company(target, company_url, person_url, email, page_url, event_dat
         "intent_details": paragraph,
     }], "sources": [{"ref": pages["lookups"][0]["route"], "state": "exhausted",
                       "reason": "Both fixture sources reviewed"}]}
-    profile = yield "tyche_lookup", {
-        "checks": [{"target": target, "purpose": "Verify fixture contact",
-                    "phase": "contact_verification", "tool": "harvestapi_get_profile",
-                    "inputs": {"url": person_url, "main": "true"}}]}
-    profile_ref = profile["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{
-        "target": target, "decision": "hold_contact", "reason": "Verify selected email",
-        "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain",
-                            "role_match": "exact"}}]}
-    enriched = yield "tyche_lookup", {
-        "checks": [{"target": target, "purpose": "Find fixture email",
-                    "phase": "contact_discovery", "tool": "harvestapi_get_profile",
-                    "inputs": {"findEmail": "true"}, "contact_ref": profile_ref}]}
-    profile_ref = enriched["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{
-        "target": target, "decision": "hold_contact", "reason": "Select enriched profile",
-        "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain",
-                            "role_match": "exact"}}]}
-    validation = yield "tyche_lookup", {
-        "checks": [{"target": target, "purpose": "Verify fixture email",
-                    "phase": "email_validation", "tool": "zerobounce_validate",
-                    "inputs": {"email": email}, "contact_ref": profile_ref}]}
-    email_ref = validation["lookups"][0]["results"][0]["ref"]
-    packet = yield "tyche_review", {"companies": [{
-        "target": target, "decision": "accept", "reason": "Verified company and current buyer",
-        "primary_contact": {"email_ref": email_ref}}]}
     assert packet["status"] == "review_required"
     if approve:
         saved = yield "tyche_review", {
@@ -538,8 +420,7 @@ def reviewed_company(target, company_url, person_url, email, page_url, event_dat
 
 def two_company_checkpoint_scenario():
     yield from reviewed_company(
-        "example.com", COMPANY_URL, PERSON_URL, "ada@example.com",
-        "https://example.com/news", "2026-08-12", PARAGRAPH)
+        "example.com", COMPANY_URL, "https://example.com/news", "2026-08-12", PARAGRAPH)
     second_paragraph = (
         "Second Products connected its acquired warehouse to a shared WMS on August 13, 2026. "
         "The project covers inventory visibility and fulfillment across the combined operation. "
@@ -547,14 +428,12 @@ def two_company_checkpoint_scenario():
     )
     yield from reviewed_company(
         "second.example", "https://www.linkedin.com/company/second-example",
-        "https://www.linkedin.com/in/bob-second", "bob@second.example",
         "https://second.example/news", "2026-08-13", second_paragraph)
 
 
 def incremental_checkpoint_scenario(*, approve_count=2):
     yield from reviewed_company(
-        "example.com", COMPANY_URL, PERSON_URL, "ada@example.com",
-        "https://example.com/news", "2026-08-12", PARAGRAPH)
+        "example.com", COMPANY_URL, "https://example.com/news", "2026-08-12", PARAGRAPH)
     second_paragraph = (
         "Second Products connected its acquired warehouse to a shared WMS on August 13, 2026. "
         "The project covers inventory visibility and fulfillment across the combined operation. "
@@ -562,7 +441,6 @@ def incremental_checkpoint_scenario(*, approve_count=2):
     )
     yield from reviewed_company(
         "second.example", "https://www.linkedin.com/company/second-example",
-        "https://www.linkedin.com/in/bob-second", "bob@second.example",
         "https://second.example/news", "2026-08-13", second_paragraph,
         approve=approve_count >= 2)
 
@@ -583,7 +461,7 @@ def raw_response_scenario(include_geography=False, page_capture=False):
         assert answer_rows[0]["facts"]["provider_answer"] == "Generated summary; review its citations."
         assert answer_rows[0]["facts"]["evidence_text"] != answer_rows[0]["facts"]["provider_answer"]
     signal_ref = answer_rows[0]["ref"]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "qualify_account", "reason": "Company and signal verified",
+    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "accept", "reason": "Company and signal verified",
         "company": {"ref": company_ref, "discovery_source": {"ref": company_ref},
             "industry": "Manufacturing", "sub_industry": "Textiles",
             "description": "Example Products manufactures packaged goods, tools, and accessories. It supplies retailers with consumer products.",
@@ -597,18 +475,6 @@ def raw_response_scenario(include_geography=False, page_capture=False):
         "intent_details": PARAGRAPH}],
         "sources": [{"ref": page["lookups"][0]["route"], "state": "exhausted", "reason": "Account page reviewed"},
                     {"ref": answer["lookups"][0]["route"], "state": "exhausted", "reason": "Answer citations reviewed"}]}
-    profile = yield "tyche_lookup", lookup("harvestapi_get_profile", {"url": PERSON_URL, "main": "true"}, "contact_verification")
-    profile_ref = profile["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Verify selected email",
-        "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
-    enriched = yield "tyche_lookup", lookup("harvestapi_get_profile", {"findEmail": "true"}, "contact_discovery", contact_ref=profile_ref)
-    profile_ref = enriched["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "hold_contact", "reason": "Select enriched profile",
-        "primary_contact": {"ref": profile_ref, "requested_role": "Director of Supply Chain", "role_match": "exact"}}]}
-    email = yield "tyche_lookup", lookup("zerobounce_validate", {"email": "ada@example.com"}, "email_validation", contact_ref=profile_ref)
-    email_ref = email["lookups"][0]["results"][0]["ref"]
-    yield "tyche_review", {"companies": [{"target": "example.com", "decision": "accept", "reason": "Verified company and current buyer",
-        "primary_contact": {"email_ref": email_ref, "email_source": {"ref": profile_ref}}}]}
     evidence_review = yield "tyche_inspect", {"target": "example.com", "field": "evidence_review"}
     assert evidence_review["sources"][page_ref]["text"].startswith("Example Products manufactures")
     assert evidence_review["sources"][signal_ref]["text"].startswith("On August 12")
@@ -637,36 +503,12 @@ class ProviderFixture:
         company_name = "Second Products" if second else "Example Products"
         company_url = ("https://www.linkedin.com/company/second-example"
                        if second else COMPANY_URL)
-        person_url = ("https://www.linkedin.com/in/bob-second"
-                      if second else PERSON_URL)
         website = "https://second.example" if second else "https://example.com"
-        email = "bob@second.example" if second else "ada@example.com"
-        first_name = "Bob" if second else "Ada"
-        last_name = "Second" if second else "Example"
         data = {
             "harvestapi_get_company": {"status": "ok", "element": {"name": company_name,
                 "website": website, "linkedinUrl": company_url,
                 "employeeCountRange": {"start": 201, "end": 500},
                 "locations": [{"headquarter": True, "country": "United States", "geographicArea": "Ohio"}]}},
-            "harvestapi_get_profile": {"status": "ok", "element": {"id": "profile-456" if second else "profile-123", "linkedinUrl": person_url,
-                "firstName": "Bob" if second else "Ada", "lastName": "Second" if second else "Example", "emails": [{"email": email, "status": "valid"}],
-                "currentPosition": [{"companyName": company_name, "title": "Director of Supply Chain", "companyLinkedinUrl": company_url}],
-                "location": {"parsed": {"countryFull": "United States", "state": "Ohio", "city": "Columbus"}}}},
-            "zerobounce_validate": {"status": "ok", "data": {"address": email, "status": "valid", "sub_status": ""}},
-            "hunter_email_finder": {"status": "completed", "toolResponse": {"rawV2": {"data": {
-                "email": email, "first_name": first_name, "last_name": last_name,
-                "domain": website.removeprefix("https://"),
-            }}}},
-            "limadata_find_work_email": {"status": "completed", "toolResponse": {"rawV2": {
-                "email": email,
-            }}},
-            "datagma_find_email": {"status": "completed", "toolResponse": {"rawV2": {
-                "email": email, "status": "Valid",
-            }}},
-            "leadmagic_email_finder": {"status": "completed", "toolResponse": {"rawV2": {
-                "email": email, "status": "valid", "first_name": first_name,
-                "last_name": last_name, "domain": website.removeprefix("https://"),
-            }}},
             "exa_answer": {"answer": "Generated summary; review its citations.", "citations": [
                 {"id": "citation-1", "url": "https://example.com/news/wms-project", "title": "Warehouse project",
                  "text": "On August 12, 2026, Example Products connected its acquired warehouse to one WMS.",
@@ -686,13 +528,8 @@ class ProviderFixture:
                 {"markdown": "On August 13, 2026, Second Products connected an acquired warehouse to one WMS. The project covers inventory visibility and fulfillment.",
                  "metadata": {"statusCode": 200, "sourceUrl": "https://second.example/news/wms-project", "publishedTime": "2026-08-21"}},
             ]}
-        rate = {"harvestapi_get_company": .03, "harvestapi_get_profile": .14, "zerobounce_validate": .28,
-                "hunter_email_finder": .3, "limadata_find_work_email": .28,
-                "datagma_find_email": .14, "leadmagic_email_finder": .34,
-                "exa_answer": .07, "generic_http_request": 0, "firecrawl_scrape": .02}[tool]
-        if tool == "harvestapi_get_profile" and parameters["payload"].get("main") == "true":
-            rate = .03
-            data[tool]["element"].pop("emails")
+        rate = {"harvestapi_get_company": .03, "exa_answer": .07,
+                "generic_http_request": 0, "firecrawl_scrape": .02}[tool]
         billing = {"credits_charged": rate, "cost_usd": round(rate * .1, 8), "pricing_status": "final", "settlement_status": "queued"}
         body = {**data[tool], "billing": billing, "request_id": "fixture-request-" + str(len(self.frames))}
         if self.raw_envelopes and tool in {"exa_answer", "firecrawl_scrape", "harvestapi_get_company"}:
@@ -870,13 +707,12 @@ def test_trigger_returns_reviewed_checkpoint_with_codex_configuration(lab, monke
     assert len(shared_calls) == 1 and isinstance(shared_calls[0], runtime.ArenaHost)
     assert json.loads(lab.output.read_text()) == {"companies": rows}
     assert len(rows) == 1
-    assert rows[0]["contact"]["email_source"] == {
-        "provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": "profile-123"}
+    assert "contact" not in rows[0]
     assert rows[0]["intent_signals"][0]["matched_icp_signal"] == 0
     assert rows[0]["intent_signals"][0]["date"] == "2026-08-12"
     assert len(lab.sessions) == 1
     assert {key: lab.sessions[0][key] for key in ("model", "reasoning_effort", "web_search")} == {
-        "model": "openai/gpt-5.6-luna", "reasoning_effort": "high", "web_search": "live"}
+        "model": "openai/gpt-6-luna", "reasoning_effort": "high", "web_search": "live"}
     assert lab.sessions[0]["response_deadline"] > time.monotonic()
     assert "service_tier" not in lab.config
     assert lab.config["mcp_servers"]["tyche"]["required"]
@@ -905,170 +741,6 @@ def test_trigger_returns_reviewed_checkpoint_with_codex_configuration(lab, monke
         lab.research[0].call("tyche_review", {})
     with pytest.raises(ValueError, match="initialized"):
         lab.research[0].call("tyche_start", {})
-
-
-def test_company_only_harness_run_reviews_and_checkpoints_without_contact_research(lab):
-    from harness import run_icp
-
-    lab.program = company_only_scenario
-    rows = run_icp(COMPANY_ONLY_ICP)
-
-    assert len(rows) == 1
-    assert "contact" not in rows[0]
-    assert rows[0]["intent_details"] == PARAGRAPH
-    assert rows[0]["intent_signals"][0]["matched_icp_signal"] == 0
-    assert [frame["tool"] for frame in lab.frames] == [
-        "harvestapi_get_company", "generic_http_request",
-    ]
-    document = json.loads(lab.research[0].research.path.read_text())
-    request = document["request"]
-    assert request["contacts_required"] is False
-    assert "requested_roles" not in request and "contact_fields" not in request
-    assert "primary_contact" not in document["accepted"][0]
-    review_tool = lab.research[0].tools["tyche_review"]
-    review_company = review_tool[1]["properties"]["companies"]["items"]
-    assert review_company["properties"]["decision"]["enum"] == [
-        "hold_account", "reject", "accept",
-    ]
-    assert "primary_contact" not in review_company["properties"]
-    assert "backup_contacts" not in review_company["properties"]
-    assert "do not research people or contacts" in review_tool[0]
-    checkpoint = json.loads(lab.output.read_text())
-    assert checkpoint == {"companies": rows}
-    assert lab.checkpoints and all("contact" not in row for row in lab.checkpoints[-1])
-
-
-def test_company_only_input_is_explicit_and_contact_v5_request_stays_frozen():
-    company_request = request_for(COMPANY_ONLY_ICP, 2, 2640)
-    assert company_request["contacts_required"] is False
-    assert "requested_roles" not in company_request
-    assert "contact_fields" not in company_request
-
-    contact_request = request_for(ICP, 2, 2640)
-    assert "contacts_required" not in contact_request
-    assert contact_request["requested_roles"] == ICP["target_roles"]
-    assert contact_request["contact_fields"] == ["email"]
-
-    with pytest.raises(ValueError, match="must omit contact targeting fields: target_roles"):
-        request_for({**COMPANY_ONLY_ICP, "target_roles": ["Operations leader"]}, 1, 30)
-
-
-def test_projection_uses_explicit_email_source_separate_from_location_profile(lab):
-    lab.program = lambda: scenario(separate_email_source=True)
-
-    rows = runtime.run(ICP)
-
-    document = json.loads(lab.research[0].research.path.read_text())
-    person = document["accepted"][0]["primary_contact"]
-    assert person["location_evidence"]["source"]["route_id"] != person["email_source"]["source"]["route_id"]
-    assert rows[0]["contact"]["email_source"] == {
-        "provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": "profile-123"}
-
-
-@pytest.mark.parametrize(("tool", "provider"), [
-    ("hunter_email_finder", "hunter"),
-    ("limadata_find_work_email", "limadata"),
-    ("datagma_find_email", "datagma"),
-    ("leadmagic_email_finder", "leadmagic"),
-])
-def test_projection_accepts_trusted_native_email_finder(lab, tool, provider):
-    lab.program = lambda: scenario(finder_tool=tool)
-
-    rows = runtime.run(ICP)
-
-    source = rows[0]["contact"]["email_source"]
-    assert source["provider"] == provider
-    assert source["tool"] == tool
-    assert re.fullmatch(r"sha256:[0-9a-f]{64}", source["broker_call_id"])
-    assert "record_id" not in source
-    assert [frame["tool"] for frame in lab.frames][-3:] == [
-        "harvestapi_get_profile", tool, "zerobounce_validate",
-    ]
-
-
-@pytest.mark.parametrize("failure", ["missing", "fabricated"])
-def test_projection_rejects_untrusted_native_email_finder_call_identity(lab, monkeypatch, failure):
-    tool = "hunter_email_finder"
-    lab.program = lambda: scenario(finder_tool=tool)
-    runtime.run(ICP)
-    run_file = lab.research[0].research.path
-    document = json.loads(run_file.read_text())
-    source = document["accepted"][0]["primary_contact"]["email_source"]["source"]
-    receipt_path = run_file.parent / "receipts" / (source["route_id"] + ".json")
-    receipt = json.loads(receipt_path.read_text())
-    if failure == "missing":
-        receipt["provider_response"]["arena"].pop("call_identity")
-    else:
-        receipt["provider_response"]["arena"]["call_identity"] = "model-authored-call-id"
-    receipt_path.write_text(json.dumps(receipt))
-    monkeypatch.setattr(arena_output, "accepted_preflight", lambda *_args, **_kwargs: [])
-
-    with pytest.raises(ValueError, match="trusted broker call identity"):
-        arena_output._project_companies(run_file, document, ICP, require_review=False)
-
-
-@pytest.mark.parametrize(("failure", "message"), [
-    ("malformed", "invalid explicit saved discovery source"),
-    ("unsupported", "completed successful HarvestAPI response"),
-    ("wrong_person", "exactly one matching LinkedIn entity"),
-    ("email_absent", "email is absent from the selected provider profile"),
-])
-def test_projection_rejects_invalid_explicit_email_source(lab, monkeypatch, failure, message):
-    lab.program = lambda: scenario(separate_email_source=True)
-    runtime.run(ICP)
-    run_file = lab.research[0].research.path
-    document = json.loads(run_file.read_text())
-    person = document["accepted"][0]["primary_contact"]
-    email_route = person["email_source"]["source"]["route_id"]
-    monkeypatch.setattr(arena_output, "accepted_preflight", lambda *_args, **_kwargs: [])
-
-    if failure == "malformed":
-        person["email_source"] = {}
-    elif failure == "unsupported":
-        person["email_source"]["source"]["tool"] = "zerobounce_validate"
-    elif failure == "wrong_person":
-        receipt_path = run_file.parent / "receipts" / (email_route + ".json")
-        receipt = json.loads(receipt_path.read_text())
-
-        def replace_profile_url(value):
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    if key == "linkedinUrl" and isinstance(child, str) and "/in/" in child:
-                        value[key] = "https://www.linkedin.com/in/wrong-person"
-                    else:
-                        replace_profile_url(child)
-            elif isinstance(value, list):
-                for child in value:
-                    replace_profile_url(child)
-
-        replace_profile_url(receipt["provider_response"])
-        receipt_path.write_text(json.dumps(receipt))
-    else:
-        original = linkedin_receipts._saved_profile
-
-        def without_email(*args, **kwargs):
-            profile = original(*args, **kwargs)
-            if args[1].get("route_id") == email_route:
-                profile.pop("email", None)
-                profile["emails"] = []
-            return profile
-
-        monkeypatch.setattr(linkedin_receipts, "_saved_profile", without_email)
-
-    with pytest.raises(ValueError, match=message):
-        arena_output._project_companies(run_file, document, ICP, require_review=False)
-
-
-def test_projection_preserves_legacy_same_receipt_without_explicit_email_source(lab):
-    runtime.run(ICP)
-    run_file = lab.research[0].research.path
-    document = json.loads(run_file.read_text())
-    document["accepted"][0]["primary_contact"].pop("email_source")
-
-    rows = arena_output._project_companies(run_file, document, ICP, require_review=False)
-
-    assert rows[0]["contact"]["email_source"] == {
-        "provider": "harvestapi", "tool": "harvestapi_get_profile", "record_id": "profile-123"}
 
 
 @pytest.mark.parametrize(("remaining", "expected"), [
@@ -1146,7 +818,7 @@ def test_full_delivery_rejects_current_request_drift_after_validation(lab):
 
     document = json.loads(run_file.read_text())
     request = json.loads(document["request"]["original_text"])
-    request["target_roles"] = ["Chief Financial Officer"]
+    request["industry"] = "Financial Services"
     document["request"]["original_text"] = json.dumps(request, sort_keys=True)
     run_file.write_text(json.dumps(document, indent=2) + "\n")
 
@@ -1610,154 +1282,8 @@ def test_headroom_boundary_finalizes_native_checkpoint_to_atomic_output(
     assert lab.openrouter_used == openrouter_limit - 39
     assert lab.request_guard.research_denial == "finalization_headroom"
     assert [frame["tool"] for frame in lab.frames] == [
-        "harvestapi_get_company", "generic_http_request", "harvestapi_get_profile",
-        "harvestapi_get_profile", "zerobounce_validate",
+        "harvestapi_get_company", "generic_http_request",
     ]
-
-
-def completion_review_tools(
-    tmp_path, stop="time_limit_reached", *, ready=True, has_candidate=True,
-):
-    """Small finalization boundary fixture with no provider or filesystem writes."""
-    row = {
-        "candidate": {"domain": "ready.example"},
-        "stage": "contact",
-        "reason_text": "Saved buyer awaits a final model decision",
-        "primary_contact": {"email": "buyer@ready.example"},
-    }
-    document = {
-        "request": {"target_count": 2},
-        "accepted": [],
-        "unresolved": [row] if has_candidate else [],
-    }
-    candidate = {
-        "target": "ready.example",
-        "profile_verified": ready,
-        "email_usable": ready,
-        "missing": [] if ready else ["Current profile evidence is missing"],
-        "saved_valid_emails": [],
-        "recent_email_decisions": [],
-        "blocked_actions": {},
-        "next": "Review saved evidence.",
-    }
-
-    class Research:
-        environment = {"TYCHE_FINALIZATION_ONLY": "1"}
-        review_delivery = None
-        path = tmp_path / "results.json"
-
-        def __init__(self):
-            self.calls = []
-
-        def _document(self):
-            return document
-
-        def _overview(self):
-            return {"stop": stop, "blocked_actions": {},
-                    "completion_candidates": [candidate] if has_candidate else []}
-
-        def _completion_candidates(self, scoped, _decision):
-            if not scoped.get("unresolved") or not has_candidate:
-                return []
-            target = run_attempt._company_key(scoped["unresolved"][0])
-            return [{**candidate, "target": target}]
-
-        def call(self, name, arguments):
-            self.calls.append((name, copy.deepcopy(arguments)))
-            if name == "tyche_review":
-                decision = arguments["companies"][0]
-                row["reason_text"] = decision["reason"]
-                if decision["decision"] in {"accept", "reject"}:
-                    document["unresolved"].clear()
-                if decision["decision"] == "accept":
-                    accepted = copy.deepcopy(row)
-                    accepted["company"] = accepted.pop("candidate")
-                    document["accepted"].append(accepted)
-                return {"status": "confirmed_leads_saved", "delivery_allowed": False}
-            assert name == "tyche_finish"
-            if stop not in run_attempt.DELIVERY_STOPS:
-                return {"status": "needs_research", "delivery_allowed": False}
-            review = self.review_delivery(document)
-            if review is not None:
-                return review
-            return {"status": "delivered", "delivery_allowed": True,
-                    "checkpoint_saved": bool(document["accepted"])}
-
-    tools = LabTools.__new__(LabTools)
-    tools.research = Research()
-    tools._native_review_delivery = None
-    tools._completion_assessments = set()
-    tools.lock = threading.Lock()
-    tools.delivered = False
-    tools.broker = SimpleNamespace(local_dispatch_budget=lambda: {"providers": {}})
-    tools._publish_confirmed = lambda: ({
-        "checkpoint_saved": True, "confirmed_count": len(document["accepted"]),
-    } if document["accepted"] else None)
-    tools._review_delivery = lambda _document, *_args: tools._completion_review_gate()
-    return tools, document
-
-
-@pytest.mark.parametrize("stop", ["time_limit_reached", "budget_exhausted"])
-def test_finish_requires_explicit_review_of_ready_contact_at_delivery_stop(
-    tmp_path, stop,
-):
-    tools, document = completion_review_tools(tmp_path, stop)
-
-    blocked = tools.call("tyche_finish", {})
-
-    assert blocked["status"] == "completion_review_required"
-    assert blocked["delivery_allowed"] is False
-    assert blocked["completion_candidates"][0]["target"] == "ready.example"
-    assert blocked["completion_candidates"][0]["saved_hold_reason"] == document["unresolved"][0]["reason_text"]
-    assert blocked["completion_candidates"][0]["assessment_ref"].startswith("ready-contact:")
-    assert set(blocked["completion_candidates"][0]) == {
-        "target", "assessment_ref", "saved_hold_reason", "profile_verified", "email_usable", "missing",
-    }
-    assert tools.research.calls == [("tyche_finish", {})]
-
-
-def test_finish_reviews_every_ready_contact_beyond_native_advice_preview(tmp_path):
-    tools, document = completion_review_tools(tmp_path)
-    original = document["unresolved"][0]
-    for index in range(2, 6):
-        row = copy.deepcopy(original)
-        row["candidate"]["domain"] = f"ready-{index}.example"
-        row["reason_text"] = f"Saved hold reason {index}"
-        document["unresolved"].append(row)
-
-    blocked = tools.call("tyche_finish", {})
-
-    assert [item["target"] for item in blocked["completion_candidates"]] == [
-        "ready.example", "ready-2.example", "ready-3.example", "ready-4.example", "ready-5.example",
-    ]
-
-
-def test_failed_hold_publication_does_not_release_ready_contact_gate(tmp_path):
-    tools, _document = completion_review_tools(tmp_path)
-    tools._publish_confirmed = lambda: (_ for _ in ()).throw(RuntimeError("checkpoint failed"))
-
-    with pytest.raises(RuntimeError, match="checkpoint failed"):
-        tools.call("tyche_review", {"companies": [{
-            "target": "ready.example", "decision": "hold_contact",
-            "reason": "Keep this candidate held after reviewing the saved evidence",
-        }]})
-
-    assert not tools._completion_assessments
-    assert tools.call("tyche_finish", {})["status"] == "completion_review_required"
-
-
-@pytest.mark.parametrize("ready,has_candidate", [(False, True), (True, False)])
-def test_finish_keeps_missing_evidence_and_empty_shortfalls_unchanged(
-    tmp_path, ready, has_candidate,
-):
-    tools, _document = completion_review_tools(
-        tmp_path, ready=ready, has_candidate=has_candidate,
-    )
-
-    result = tools.call("tyche_finish", {})
-
-    assert result["status"] == "delivered"
-    assert [name for name, _arguments in tools.research.calls] == ["tyche_finish"]
 
 
 def test_review_demotion_resumes_same_run_before_research_deadline(tmp_path, monkeypatch):
@@ -2176,7 +1702,6 @@ def test_real_provider_child_captures_after_research_cutoff_then_recovers_once(
     run_dir.mkdir()
     run_file = run_dir / "results.json"
     document = stop_document([], target_count=25)
-    document["request"]["contact_fields"] = []
     document["stop_audit"] = {"route_frontier": []}
     run_file.write_text(json.dumps(document))
     budget_guard.initialize(run_file, max_usd=2, scrapingdog_usd_per_credit=.1)
@@ -2699,31 +2224,6 @@ def test_catalog_schemas_remain_valid_after_receipt_redaction():
             validator_for(schema).check_schema(schema)
 
 
-def test_bounceban_catalog_matches_host_and_rejects_webhook_before_dispatch(arena_operations):
-    import research_input
-
-    contract = json.loads((ROOT / "tyche_arena/catalog.json").read_text())["tools"]["bounceban_verify_single"]
-    allowed = {"email", "mode", "disable_catchall_verify"}
-    assert {field["name"] for field in contract["inputSchema"]["fields"]} == allowed
-    assert set(contract["inputSchema"]["jsonSchema"]["properties"]) == allowed
-    dispatched = []
-
-    def prepare(payload):
-        request = {"operation": "execute", "tool": "bounceban_verify_single", "payload": payload}
-        research_input.check_tool_contract({"results": [contract]}, request)
-        frame = {"tool": request["tool"], "payload": payload}
-        dispatched.append(frame)
-        return arena_operations.validate_operation_request("deepline.execute", frame)
-
-    with pytest.raises(ValueError, match="Additional properties are not allowed.*url"):
-        prepare({"email": "buyer@example.com", "url": "https://example.org/hook"})
-    assert dispatched == []
-
-    payload = {"email": "buyer@example.com", "mode": "deepverify", "disable_catchall_verify": "1"}
-    assert prepare(payload) == {"tool": "bounceban_verify_single", "payload": payload}
-    assert dispatched == [{"tool": "bounceban_verify_single", "payload": payload}]
-
-
 def test_contextdev_catalog_is_free_and_matches_the_host_route(arena_operations):
     import research_input
 
@@ -3146,7 +2646,7 @@ def test_arena_completed_unknown_cost_allows_distinct_work_review_and_json(lab):
 
     rows = runtime.run(ICP)
 
-    assert rows[0]["contact"]["email"] == "ada@example.com"
+    assert "contact" not in rows[0]
     run_file = lab.research[0].research.path
     ledger = budget_guard.load_ledger(run_file)
     first_route = next(iter(ledger["calls"]))
@@ -3436,10 +2936,10 @@ def test_raw_deepline_results_survive_lookup_review_receipts_and_output_mapping(
     assert "industries: manufacturing" in filters
     assert ("geographies: united states" in filters) == include_geography
     assert accepted["company"]["discovery_source"]["source"]["tool"] == "harvestapi_get_company"
-    assert accepted["primary_contact"]["email_source"]["source"]["tool"] == "harvestapi_get_profile"
+    assert "primary_contact" not in accepted and "backup_contacts" not in accepted
     ledger = budget_guard.load_ledger(run_file)
     actual = sorted(float(call["actual_credits"]) for call in ledger["calls"].values())
-    assert actual == [.02, .03, .03, .07, .14, .28]
+    assert actual == [.02, .03, .07]
 
 
 def test_arena_signal_date_preserves_reviewed_precision_without_using_publication_date():
@@ -3518,7 +3018,7 @@ def projection_field_scenario(*, stage=None, competing_quote=..., forged_native_
     while True:
         if command[0] == "tyche_review":
             for company in command[1].get("companies", []):
-                if company["decision"] == "qualify_account":
+                if company["decision"] == "accept":
                     if stage is not None:
                         company["company"]["company_stage"] = stage
                     if competing_quote is not ...:
@@ -3540,7 +3040,7 @@ def test_arena_approved_optional_stage_is_text(lab, stage, arena_operations):
     assert rows[0]["company_stage"] == (stage or "")
     output = importlib.import_module("lab_arena.output")
     validated = output.output_document_from_bytes(json.dumps({"companies": rows}).encode(),
-        expected_schema_version="leadpoet.lab_arena.output.v5")
+        expected_schema_version="leadpoet.lab_arena.output.v6")
     assert len(validated["companies"]) == 1
 
 
@@ -3576,7 +3076,7 @@ def observed_stage_scenario(captured, *, label=None, two_companies=False,
     command = next(program)
     while True:
         for company in command[1].get("companies", []):
-            if company["decision"] == "qualify_account":
+            if company["decision"] == "accept":
                 proof = copy.deepcopy(company["qualification_checks"][1]["evidence"])
                 company["qualification_checks"].append({"requirement_ref": "attribute:1",
                     "status": "pass", "claim": STAGE_CLAIM, "evidence": proof})
@@ -3628,7 +3128,7 @@ def test_observed_stage_native_review_atomic_checkpoint_and_frozen_scorer(
 from types import SimpleNamespace
 from qualification.scoring.lead_scorer import _submitted_stage_decision, _combine_submitted_and_observed
 from lab_arena.output import output_document_from_bytes
-rows=output_document_from_bytes(open(sys.argv[1],'rb').read(),expected_schema_version='leadpoet.lab_arena.output.v5')['companies']
+rows=output_document_from_bytes(open(sys.argv[1],'rb').read(),expected_schema_version='leadpoet.lab_arena.output.v6')['companies']
 decision=_submitted_stage_decision(SimpleNamespace(company_stage=rows[0]['company_stage']),SimpleNamespace(company_stage='Series B'))
 print(json.dumps([decision,_combine_submitted_and_observed(decision,'match'),_combine_submitted_and_observed(decision,'unavailable')]))
 """
@@ -3805,23 +3305,13 @@ def test_arena_stage_schema_is_explicit_without_native_mutation():
     assert "reject the company and continue research" in json.dumps(LAB_TOOLS["tyche_review"][1])
 
 
-def test_arena_email_ref_description_does_not_mutate_shared_reference_schemas():
-    native_review = TOOLS["tyche_review"][1]
-    native_contact = native_review["properties"]["companies"]["items"]["properties"]["primary_contact"]
+def test_arena_review_schema_is_company_only_without_mutating_shared_schema():
     arena_review = LAB_TOOLS["tyche_review"][1]
-
-    arena_companies = arena_review["properties"]["companies"]
-    arena_company_review = arena_companies["items"]
-    arena_contacts = (
-        arena_company_review["properties"]["primary_contact"],
-        arena_company_review["properties"]["backup_contacts"]["items"],
-    )
-    for arena_contact in arena_contacts:
-        assert arena_contact["properties"]["email_ref"]["description"].startswith(
-            "A saved same-address ZeroBounce")
-        for field in ("ref", "profile_ref"):
-            assert (arena_contact["properties"][field]["description"]
-                    == native_contact["properties"][field]["description"])
+    company_review = arena_review["properties"]["companies"]["items"]
+    assert not {"primary_contact", "backup_contacts"} & set(company_review["properties"])
+    assert set(company_review["properties"]["decision"]["enum"]) == {
+        "hold_account", "reject", "accept",
+    }
 
     arena_inspect = LAB_TOOLS["tyche_inspect"][1]
     native_inspect = TOOLS["tyche_inspect"][1]
@@ -3846,10 +3336,9 @@ def test_arena_approved_attribute_uses_native_verified_quote(lab, arena_operatio
         "Example Products manufactures packaged goods, tools and accessories for retailers.")
     output = importlib.import_module("lab_arena.output")
     assert len(output.output_document_from_bytes(json.dumps({"companies": rows}).encode(),
-        expected_schema_version="leadpoet.lab_arena.output.v5")["companies"]) == 1
+        expected_schema_version="leadpoet.lab_arena.output.v6")["companies"]) == 1
     assert [frame["tool"] for frame in lab.frames] == [
-        "harvestapi_get_company", "generic_http_request", "harvestapi_get_profile",
-        "harvestapi_get_profile", "zerobounce_validate"]
+        "harvestapi_get_company", "generic_http_request"]
 
 
 def test_arena_native_quote_override_must_match_captured_source(lab):
@@ -3870,22 +3359,9 @@ def test_failed_or_fabricated_completion_never_returns_leads(lab, mode, error):
     assert (lab.processes[0].run_dir / "failure.json").exists()
 
 
-def test_stale_evidence_and_wrong_profile_email_block_delivery(lab, monkeypatch):
+def test_changed_company_evidence_blocks_delivery(lab):
     runtime.run(ICP)
     run_file = lab.research[0].research.path
-    import linkedin_receipts
-    original = linkedin_receipts._saved_profile
-
-    def altered(*args, **kwargs):
-        profile = original(*args, **kwargs)
-        if args[3] == "in":
-            profile["emails"] = [{"email": "someone-else@example.com"}]
-        return profile
-
-    with monkeypatch.context() as patch:
-        patch.setattr(linkedin_receipts, "_saved_profile", altered)
-        with pytest.raises(ValueError, match="absent from the selected"):
-            companies(run_file, ICP)
     document = json.loads(run_file.read_text())
     document["accepted"][0]["intent_details"] += " Changed after approval."
     run_file.write_text(json.dumps(document))
@@ -3912,7 +3388,7 @@ def test_generated_primary_bonus_order_and_age_limits(tmp_path):
     assert [s["importance"] for s in request["buying_signals"]] == ["required", "preferred", "preferred"]
     assert [s["max_age_days"] for s in request["buying_signals"]] == [365, 90, 30]
     assert [s["kind"] for s in request["buying_signals"]] == ["arena_signal_0", "arena_signal_1", "arena_signal_2"]
-    assert json.loads(request["original_text"]) == icp
+    assert json.loads(request["original_text"]) == company_only_icp(icp)
     assert "custom_criteria" not in request["icp"]
     assert icp["prompt"] not in request["icp"].get("required_attributes", [])
     assert research_input.normalize_request(request, tmp_path / "results.json")
@@ -3972,14 +3448,13 @@ def _oversized_native_review_case():
     template = client_document()
     row = template["accepted"][0]
     company = row["company"]
-    person = row["primary_contact"]
     case.request = request_for(ICP, 1, runtime.RESEARCH_SECONDS)
     case.request["icp"]["required_attributes"] = [
         ICP["required_attribute"],
         *(f"Verified operating attribute {index:02d}" for index in range(1, 45)),
     ]
     original = case.path.parent.parent / "request.txt"
-    original.write_text(json.dumps(ICP), encoding="utf-8")
+    original.write_text(case.request["original_text"], encoding="utf-8")
     case.tools.environment["TYCHE_REQUEST_FILE"] = str(original)
     case.start()
 
@@ -4020,7 +3495,7 @@ def _oversized_native_review_case():
     case.tools.call("tyche_review", {
         "companies": [{
             "target": "example.com",
-            "decision": "qualify_account",
+            "decision": "accept",
             "reason": "All synthetic criteria reviewed",
             "company": {"ref": selected, **{key: company[key] for key in (
                 "industry", "sub_industry", "description", "classification_note",
@@ -4032,73 +3507,6 @@ def _oversized_native_review_case():
         "sources": [{"ref": ref.rsplit(":", 1)[0], "state": "exhausted",
                      "reason": "Fixture captured page reviewed"} for ref in page_refs],
     })
-
-    case.provider.raw = {
-        "status": "ok",
-        "element": {
-            "linkedinUrl": person["linkedin_url"],
-            "firstName": "Ada",
-            "lastName": "Example",
-            "currentPosition": [{
-                "companyName": company["canonical_name"],
-                "title": person["current_title"],
-                "companyLinkedinUrl": company["linkedin_url"],
-            }],
-            "location": {"linkedinText": "Columbus, Ohio, United States", "parsed": {
-                "city": "Columbus", "state": "Ohio", "countryFull": "United States",
-            }},
-        },
-    }
-    profile = case.lookup(check(
-        "example.com", phase="contact_verification", tool="harvestapi_get_profile",
-        inputs={"url": person["linkedin_url"]},
-    ))["lookups"][0]["results"][0]["ref"]
-    case.tools.review(companies=[{
-        "target": "example.com", "decision": "hold_contact", "reason": "Selected buyer",
-        "primary_contact": {"ref": profile, "requested_role": person["requested_role"], "role_match": "exact"},
-    }])
-    case.provider.raw = {
-        "status": "ok",
-        "element": {
-            "id": "profile-123",
-            "linkedinUrl": person["linkedin_url"],
-            "firstName": "Ada",
-            "lastName": "Example",
-            "emails": [{"email": person["email"], "status": "valid"}],
-            "currentPosition": [{
-                "companyName": company["canonical_name"],
-                "title": person["current_title"],
-                "companyLinkedinUrl": company["linkedin_url"],
-            }],
-            "location": {"parsed": {
-                "city": "Columbus", "state": "Ohio", "countryFull": "United States",
-            }},
-        },
-    }
-    profile = case.lookup(check(
-        "example.com", phase="contact_discovery", tool="harvestapi_get_profile",
-        inputs={"findEmail": "true"}, contact_ref=profile,
-    ))["lookups"][0]["results"][0]["ref"]
-    case.tools.review(companies=[{
-        "target": "example.com", "decision": "hold_contact", "reason": "Selected enriched buyer",
-        "primary_contact": {"ref": profile, "requested_role": person["requested_role"], "role_match": "exact"},
-    }])
-    case.provider.raw = {"status": "ok", "data": {
-        "address": person["email"], "status": "valid", "sub_status": "", "domain_is_catch_all": True,
-    }}
-    verifier = case.lookup(check(
-        "example.com", phase="email_validation", tool="zerobounce_validate",
-        inputs={"email": person["email"]},
-    ))["lookups"][0]["results"][0]["ref"]
-    case.tools.review(
-        companies=[{
-            "target": "example.com", "decision": "accept", "reason": "Complete synthetic record",
-            "primary_contact": {"email_ref": verifier},
-        }],
-        sources=[{
-            "ref": ref, "state": "exhausted", "reason": "Selected fixture evidence reviewed",
-        } for ref in (selected, profile, verifier)],
-    )
     return case
 
 
@@ -4352,99 +3760,6 @@ def test_provider_deadlines_and_no_model_fallback(tmp_path):
     assert all(call["actual_credits"] is None for call in budget_guard.load_ledger(tools.path)["calls"].values())
     with pytest.raises(BrokerRefusal, match="blocked_after_uncertain"):
         broker.request("deepline.execute", args)
-
-
-def test_native_free_status_recovery_crosses_arena_research_deadline(
-        tmp_path, arena_operations):
-    response = json.dumps({
-        "status": "success", "result": "deliverable",
-        "email": "buyer@target.example",
-        "billing": {"credits_charged": 0, "cost_usd": 0, "pricing_status": "final", "settlement_status": "queued"},
-    }).encode()
-    socket_path = Path("/tmp") / (
-        "tyche-status-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16] + ".sock"
-    )
-    with native_finalization_recovery_fixture() as (fixture, getter, pending), \
-            FramedArenaWorker(socket_path, arena_operations,
-                              [(200, {"content-type": "application/json"}, response)]) as worker:
-        session = LabTools.__new__(LabTools)
-        session.broker = Broker(
-            socket_path, time.monotonic() - 1,
-            response_deadline=time.monotonic() + 30,
-        )
-        session.research = ResearchTools(
-            fixture.path, execute=session._execute,
-            environment={"TYCHE_FINALIZATION_ONLY": "1"},
-        )
-
-        result = run_attempt.run_attempt(
-            fixture.path, getter, execute=session._execute
-        )
-
-        document = json.loads(fixture.path.read_text())
-        assert result["provider_status"] == "ok"
-        assert session.broker.calls == 1
-        assert len(worker.frames) == 1
-        assert worker.frames[0]["operation_id"] == "deepline.execute"
-        assert worker.frames[0]["parameters"] == {
-            "tool": "bounceban_get_single_status", "payload": {"id": "saved-job"}}
-        assert email_receipts.verification_finished(
-            fixture.path, document, "bounceban-first", pending
-        )
-        call = budget_guard.load_ledger(fixture.path)["calls"]["saved-status"]
-        assert call["actual_credits"] == "0"
-
-
-@pytest.mark.parametrize("invalid", ["malformed", "cross_run", "resubmission"])
-def test_arena_finalization_recovery_rejects_untrusted_attempts(tmp_path, invalid):
-    socket_path = tmp_path / "must-not-connect.sock"
-    with native_finalization_recovery_fixture() as (fixture, getter, _pending):
-        session = LabTools.__new__(LabTools)
-        session.broker = Broker(
-            socket_path, time.monotonic() - 1,
-            response_deadline=time.monotonic() + 30,
-        )
-        session.research = ResearchTools(
-            fixture.path, execute=session._execute,
-            environment={"TYCHE_FINALIZATION_ONLY": "1"},
-        )
-        before = fixture.path.read_bytes()
-        ledger_before = budget_guard.ledger_path(fixture.path).read_bytes()
-
-        if invalid == "malformed":
-            captured = []
-            body, code = session._execute(getter["request"], captured.append)
-            # Deepline's native normalizer historically returns zero for this
-            # structured pre-dispatch refusal; the status and dispatch bit are
-            # the authoritative outcome.
-            assert code == 0
-            assert body["request_sent"] is False
-            assert body["status"] == "config_error"
-            assert captured[0]["arena"]["error"] == "deadline_reached"
-        else:
-            if invalid == "cross_run":
-                receipt = fixture.path.parent / "receipts/bounceban-first.json"
-                damaged = json.loads(receipt.read_text())
-                damaged["run_fingerprint"] = "another-run"
-                receipt.write_text(json.dumps(damaged))
-                before = fixture.path.read_bytes()
-                ledger_before = budget_guard.ledger_path(fixture.path).read_bytes()
-            else:
-                getter["action"].pop("status_read")
-                getter["action"]["cost_upper_bound_credits"] = .06
-                getter["request"].update(
-                    tool="bounceban_verify_single",
-                    payload={"email": "buyer@target.example"},
-                )
-            with pytest.raises(ValueError, match=(
-                    "Research is closed|action not eligible|already attempted|saved pending job")):
-                run_attempt.run_attempt(
-                    fixture.path, getter, execute=session._execute
-                )
-
-        assert session.broker.calls == 0
-        assert fixture.path.read_bytes() == before
-        assert budget_guard.ledger_path(fixture.path).read_bytes() == ledger_before
 
 
 @pytest.mark.parametrize("reason", ["deadline", "stopped"])
@@ -4732,53 +4047,6 @@ def test_waiting_paid_dispatch_refuses_before_admission_and_active_call_finishes
     assert first_code == 0 and first_body["status"] == "no_results"
 
 
-def test_zero_cost_finalization_getter_bypasses_paid_dispatch_gate(
-        monkeypatch, tmp_path):
-    broker = Broker(
-        tmp_path / "worker.sock",
-        time.monotonic() - 1,
-        response_deadline=time.monotonic() + 1,
-    )
-    request = {
-        "operation": "execute",
-        "tool": "bounceban_get_single_status",
-        "payload": {"id": "saved-job"},
-        "limit": 10,
-        "timeout_seconds": 30.0,
-        "spend": {"max_cost_credits": 0},
-    }
-    monkeypatch.setattr(
-        budget_guard,
-        "guarded_call",
-        lambda _request, _provider, dispatch, *, tariff=None: dispatch(),
-    )
-    monkeypatch.setattr(broker, "request", lambda *_args, **_kwargs: (
-        200,
-        {},
-        {"status": "success", "result": "deliverable",
-         "email": "buyer@target.example",
-         "billing": {"credits_charged": 0, "cost_usd": 0, "pricing_status": "final", "settlement_status": "queued"}},
-    ))
-    assert broker._requires_paid_dispatch(request, "deepline") is False
-    assert broker._requires_paid_dispatch({
-        **request,
-        "tool": "harvestapi_get_company",
-        "payload": {"url": COMPANY_URL},
-    }, "deepline") is True
-    broker._paid_dispatch_lock.acquire()
-    try:
-        body, code = broker.execute(
-            request,
-            lambda _raw: None,
-            allow_after_deadline=True,
-        )
-    finally:
-        broker._paid_dispatch_lock.release()
-
-    assert code == 0 and body["status"] == "ok"
-    assert broker.provider_calls("deepline") == 1
-
-
 def test_unknown_worker_502_still_retains_the_model_reservation(
         tmp_path, arena_worker_runtime):
     host = arena_worker_runtime
@@ -4892,8 +4160,6 @@ def test_scrapingdog_html_uses_native_visible_text_normalization(monkeypatch, tm
     [
         ({"operation": "linkedin_company", "id": "acme"}, "scrapingdog.profile",
          {"type": "company", "id": "acme"}),
-        ({"operation": "linkedin_person", "id": "ada"}, "scrapingdog.profile",
-         {"type": "profile", "id": "ada"}),
         ({"operation": "linkedin_job", "job_id": "123"}, "scrapingdog.jobs", {"job_id": "123"}),
         ({"operation": "google_jobs", "query": "Acme engineer", "country": "us"},
          "scrapingdog.google_jobs", {"query": "Acme engineer", "country": "us"}),
@@ -4963,7 +4229,6 @@ def test_scrapingdog_rate_and_mapped_costs_are_coupled_to_authoritative_arena_pr
         ("scrapingdog.google", {"query": "Acme"}),
         ("scrapingdog.scrape", {"url": "https://acme.test"}),
         ("scrapingdog.profile", {"type": "company", "id": "acme"}),
-        ("scrapingdog.profile", {"type": "profile", "id": "ada"}),
         ("scrapingdog.jobs", {"job_id": "123"}),
         ("scrapingdog.google_jobs", {"query": "Acme"}),
         ("scrapingdog.google_news", {"query": "Acme"}),
@@ -4988,7 +4253,6 @@ def test_scrapingdog_rate_and_mapped_costs_are_coupled_to_authoritative_arena_pr
     [
         ({"operation": "google_search", "query": "Acme"}, 4, 5),
         ({"operation": "linkedin_company", "id": "acme"}, 9, 10),
-        ({"operation": "linkedin_person", "id": "ada"}, 99, 100),
     ],
 )
 def test_scrapingdog_underestimated_host_cost_fails_before_admission_or_reservation(
@@ -5857,8 +5121,6 @@ def test_local_telemetry_does_not_duplicate_legacy_or_current_host_limit():
 @pytest.mark.parametrize("tool,inputs,phase", [
     ("harvestapi_get_company",
      {"url": "https://www.linkedin.com/company/late-example"}, "account_verification"),
-    ("harvestapi_get_profile",
-     {"url": "https://www.linkedin.com/in/late-example", "main": "true"}, "contact_verification"),
 ])
 def test_no_send_refusal_preserves_native_finish_semantics(
         lab, monkeypatch, reason, tool, inputs, phase):
@@ -6206,20 +5468,13 @@ def test_final_review_has_time_for_two_brokered_model_responses():
     assert runtime.RUN_SECONDS - runtime.RESEARCH_SECONDS >= 2 * 185 + 30
 
 
-@pytest.mark.parametrize("company_only", [False, True], ids=["contact-v5", "company-v6"])
 @pytest.mark.parametrize("mode", ["partial_timeout", "partial_error", "deliver"])
-def test_partial_checkpoint_survives_unfinished_research(
-        lab, monkeypatch, mode, company_only):
+def test_partial_checkpoint_survives_unfinished_research(lab, monkeypatch, mode):
     from harness import run_icp
 
     monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
-    lab.program = (lambda: company_only_scenario("tyche_checkpoint")) if company_only else (
-        lambda: scenario("tyche_checkpoint")
-    )
+    lab.program = lambda: scenario("tyche_checkpoint")
     lab.mode = mode
-    reference = os.environ.get("LAB_ARENA_REFERENCE_SOURCE")
-    if reference:
-        install_actual_checkpoint_writer(lab, monkeypatch)
 
     def continue_research(tools):
         assert not tools.delivered
@@ -6237,22 +5492,9 @@ def test_partial_checkpoint_survives_unfinished_research(
             ledger["blocked"] = "Later call billing is uncertain; do not retry"
 
     lab.after_program = continue_research
-    rows = run_icp(COMPANY_ONLY_ICP if company_only else ICP)
+    rows = run_icp(ICP)
     assert len(rows) == 1
-    assert ("contact" not in rows[0]) is company_only
     assert json.loads(lab.output.read_text()) == {"companies": rows}
-    if reference:
-        monkeypatch.syspath_prepend(reference)
-        output = importlib.import_module("lab_arena.output")
-        expected = ("leadpoet.lab_arena.output.v6" if company_only
-                    else "leadpoet.lab_arena.output.v5")
-        validated = output.output_document_from_bytes(
-            lab.output.read_bytes(), expected_schema_version=expected,
-        )
-        assert validated["schema_version"] == expected
-        assert len(validated["companies"]) == 1
-        assert validated["companies"][0]["company_name"] == rows[0]["company_name"]
-        assert ("contact" not in validated["companies"][0]) is company_only
     assert json.loads(lab.research[0].research.path.read_text())["request"]["target_count"] == 5
     # A partial checkpoint is not full delivery, so the supervisor continues;
     # this fixture's later workers fail and the outer run records that failure.
@@ -6369,7 +5611,7 @@ def test_arena_supporting_finding_review_is_atomic_and_projection_stays_scoped(
         finding = packet["companies"][0]["supporting_findings"][0]
         assert finding["label"] == "Retail manufacturing footprint"
         assert supporting_ref in packet["companies"][0]["sources"]
-        assert packet["companies"][0]["backup_contacts"] == []
+        assert not {"primary_contact", "backup_contacts"} & set(packet["companies"][0])
         assert "supporting_findings" in json.dumps(LAB_TOOLS["tyche_review"][1])
 
         # Pending review can reopen only an exact saved source URL. Neither
@@ -6408,14 +5650,14 @@ def test_arena_supporting_finding_review_is_atomic_and_projection_stays_scoped(
         assert not lab.output.exists() and len(lab.frames) == frames
 
         # Approval writes one host row without a provider dispatch. Arena keeps
-        # only requested qualification signals and the primary contact.
+        # only requested qualification signals and company fields.
         approved = tools.call("tyche_review", {
             "review_ref": packet["review_ref"],
             "review_findings": review_findings(packet),
         })
         assert approved["checkpoint_saved"] and len(lab.frames) == frames
         host_row = json.loads(lab.output.read_text())["companies"][0]
-        assert host_row["contact"]["email"] == "ada@example.com"
+        assert "contact" not in host_row
         assert len(host_row["intent_signals"]) == 1
         assert host_row["intent_signals"][0]["description"] == (
             "Connected an acquired warehouse to a shared WMS")
@@ -6472,38 +5714,11 @@ def test_one_then_two_receipt_backed_leads_are_reviewed_and_checkpointed(lab, mo
     assert len(rows) == 2
     assert {row["company_website"] for row in rows} == {
         "https://example.com", "https://second.example"}
-    assert {row["contact"]["email"] for row in rows} == {
-        "ada@example.com", "bob@second.example"}
+    assert all("contact" not in row for row in rows)
     assert json.loads(lab.output.read_text()) == {"companies": rows}
     snapshot = json.loads(
         lab.research[0].research.path.with_name("checkpoint-results.json").read_text())
     assert len(snapshot["accepted"]) == 2
-
-
-def test_invalid_optional_backup_blocks_approval_and_retains_unchanged_host_row(
-        lab, monkeypatch):
-    monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
-    lab.program = two_company_checkpoint_scenario
-    lab.mode = "partial_timeout"
-
-    def invalidate_one_backup(tools):
-        document = json.loads(tools.research.path.read_text())
-        document["accepted"][0]["backup_contacts"] = [{}]
-        tools.research.path.write_text(json.dumps(document))
-        frames = len(lab.frames)
-
-        blocked = tools.call("tyche_checkpoint", {})
-
-        assert blocked["status"] == "needs_repair"
-        assert blocked["checkpoint_saved"] is False
-        assert any("backup_contacts[0]" in error for error in blocked["errors"])
-        assert len(lab.frames) == frames
-        retained = json.loads(lab.output.read_text())["companies"]
-        assert [row["company_name"] for row in retained] == ["Second Products"]
-
-    lab.after_program = invalidate_one_backup
-    rows = runtime.run(ICP)
-    assert [row["company_name"] for row in rows] == ["Second Products"]
 
 
 @pytest.mark.parametrize("failed_file", [
@@ -6604,8 +5819,8 @@ def test_recovery_removes_withdrawn_lead_and_keeps_other_confirmed_lead(
             monkeypatch.setattr(confirmed_leads, "write_snapshot", fail_native)
         with pytest.raises(OSError, match="withdrawal save failed"):
             tools.call("tyche_review", {"companies": [{
-                "target": "example.com", "decision": "hold_contact",
-                "reason": "New evidence invalidates this buyer; another review is needed",
+                "target": "example.com", "decision": "hold_account",
+                "reason": "New evidence invalidates this company; another review is needed",
             }]})
         assert len(json.loads(tools.research.path.read_text())["accepted"]) == 1
         assert len(json.loads(lab.output.read_text())["companies"]) == 2
@@ -6632,8 +5847,8 @@ def test_recovery_fails_closed_when_host_cannot_remove_withdrawn_lead(
         monkeypatch.setattr(sys.modules["lab_arena_checkpoint"], "write", fail)
         with pytest.raises(OSError, match="host remains unavailable"):
             tools.call("tyche_review", {"companies": [{
-                "target": "example.com", "decision": "hold_contact",
-                "reason": "Buyer needs new evidence",
+                "target": "example.com", "decision": "hold_account",
+                "reason": "Company needs new evidence",
             }]})
         lab.calls_before_recovery = len(lab.frames)
 
@@ -6769,144 +5984,7 @@ def expire_native_research_clock(tools, monkeypatch):
     monkeypatch.setattr(validate_run, "datetime", FinishedClock)
 
 
-def test_real_ready_contact_gate_accepts_and_delivers_nonempty_checkpoint(
-        lab, monkeypatch, arena_operations):
-    install_actual_checkpoint_writer(lab, monkeypatch)
-    lab.program = lambda: scenario("tyche_checkpoint")
-    completed = []
-
-    def finalize_ready_contact(tools):
-        assert len(json.loads(lab.output.read_text())["companies"]) == 1
-        demoted = tools.call("tyche_review", {"companies": [{
-            "target": "example.com", "decision": "hold_contact",
-            "reason": "Run a bounded final review of the completed buyer",
-        }]})
-        assert demoted["status"] == "confirmed_leads_saved"
-        assert json.loads(lab.output.read_text())["companies"] == []
-        tools.research.environment["TYCHE_FINALIZATION_ONLY"] = "1"
-        expire_native_research_clock(tools, monkeypatch)
-
-        blocked = tools.call("tyche_finish", {})
-        assert blocked["status"] == "completion_review_required"
-        assert blocked["completion_candidates"][0]["target"] == "example.com"
-        accepted = tools.call("tyche_review", {"companies": [{
-            "target": "example.com", "decision": "accept",
-            "reason": "Saved company, buyer, and email evidence satisfy the request",
-        }]})
-        assert accepted["status"] == "review_required"
-        checkpointed = tools.call("tyche_review", {
-            "review_ref": accepted["review_ref"],
-            "review_findings": review_findings(accepted, tools),
-        })
-        assert checkpointed["checkpoint_saved"]
-        assert len(json.loads(lab.output.read_text())["companies"]) == 1
-        packet = tools.call("tyche_finish", {})
-        delivered = tools.call("tyche_finish", {
-            "review_ref": packet["review_ref"],
-            "review_findings": review_findings(packet, tools),
-        })
-        assert delivered["delivery_allowed"] and delivered["checkpoint_saved"]
-        completed.append(True)
-
-    lab.after_program = finalize_ready_contact
-    rows = runtime.run(ICP)
-    assert len(rows) == 1 and completed == [True]
-    assert len(json.loads(lab.output.read_text())["companies"]) == 1
-
-
-def test_real_ready_contact_explicit_hold_allows_reviewed_empty_finish(
-        lab, monkeypatch, arena_operations):
-    install_actual_checkpoint_writer(lab, monkeypatch)
-    lab.program = lambda: scenario("tyche_checkpoint")
-    completed = []
-
-    def hold_ready_contact(tools):
-        tools.call("tyche_review", {"companies": [{
-            "target": "example.com", "decision": "hold_contact",
-            "reason": "Run a bounded final review of the completed buyer",
-        }]})
-        tools.research.environment["TYCHE_FINALIZATION_ONLY"] = "1"
-        expire_native_research_clock(tools, monkeypatch)
-        assert tools.call("tyche_finish", {})["status"] == "completion_review_required"
-
-        held = tools.call("tyche_review", {"companies": [{
-            "target": "example.com", "decision": "hold_contact",
-            "reason": "Keep the buyer held because its function does not satisfy the requested role",
-        }]})
-        assert held["status"] == "confirmed_leads_saved"
-        packet = tools.call("tyche_finish", {})
-        assert packet["status"] == "review_required" and packet["companies"] == []
-        delivered = tools.call("tyche_finish", {
-            "review_ref": packet["review_ref"], "review_findings": [],
-        })
-        assert delivered["delivery_allowed"] and delivered["checkpoint_saved"]
-        completed.append(True)
-
-    lab.after_program = hold_ready_contact
-    assert runtime.run(ICP) == []
-    assert completed == [True]
-    assert json.loads(lab.output.read_text())["companies"] == []
-
-
-def test_ready_contact_change_and_restart_regate_without_losing_checkpoint(
-        lab, monkeypatch, arena_operations):
-    install_actual_checkpoint_writer(lab, monkeypatch)
-    monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
-    lab.program = lambda: incremental_checkpoint_scenario(approve_count=1)
-    completed = []
-
-    def mutate_and_restart(tools):
-        assert len(json.loads(lab.output.read_text())["companies"]) == 1
-        tools.call("tyche_review", {"companies": [{
-            "target": "second.example", "decision": "hold_contact",
-            "reason": "Review the second completed buyer before final delivery",
-        }]})
-        tools.research.environment["TYCHE_FINALIZATION_ONLY"] = "1"
-        expire_native_research_clock(tools, monkeypatch)
-        first = tools.call("tyche_finish", {})
-        assert first["status"] == "completion_review_required"
-        tools.call("tyche_review", {"companies": [{
-            "target": "second.example", "decision": "hold_contact",
-            "reason": "The second buyer remains legitimately held after review",
-        }]})
-        assert tools.call("tyche_finish", {})["status"] == "review_required"
-
-        run_attempt.save_review(tools.research.path, {"companies": [{
-            "scope": "second.example", "state": "unresolved", "stage": "contact",
-            "reason_text": "Persisted candidate evidence needs a new bounded review",
-        }]})
-        changed = tools.call("tyche_finish", {})
-        assert changed["status"] == "completion_review_required"
-        assert changed["completion_candidates"][0]["assessment_ref"] != first["completion_candidates"][0]["assessment_ref"]
-        assert len(json.loads(lab.output.read_text())["companies"]) == 1
-
-        fresh = LabTools(
-            tools.research.path, tools.broker.deadline, tools.broker.response_deadline)
-        fresh.research.environment["TYCHE_FINALIZATION_ONLY"] = "1"
-        restarted = fresh.call("tyche_finish", {})
-        assert restarted["status"] == "completion_review_required"
-        assert restarted["completion_candidates"][0]["assessment_ref"] == changed["completion_candidates"][0]["assessment_ref"]
-        assert len(json.loads(lab.output.read_text())["companies"]) == 1
-        fresh.call("tyche_review", {"companies": [{
-            "target": "second.example", "decision": "hold_contact",
-            "reason": "Fresh finalizer reviewed and retained the legitimate hold",
-        }]})
-        packet = fresh.call("tyche_finish", {})
-        delivered = fresh.call("tyche_finish", {
-            "review_ref": packet["review_ref"],
-            "review_findings": review_findings(packet, fresh),
-        })
-        assert delivered["delivery_allowed"] and delivered["checkpoint_saved"]
-        completed.append(True)
-
-    lab.after_program = mutate_and_restart
-    rows = runtime.run(ICP)
-    assert len(rows) == 1 and rows[0]["company_name"] == "Example Products"
-    assert completed == [True]
-    assert len(json.loads(lab.output.read_text())["companies"]) == 1
-
-
-def test_reviewed_checkpoint_uses_real_arena_atomic_writer_and_v5_validation(
+def test_reviewed_checkpoint_uses_real_arena_atomic_writer_and_v6_validation(
         lab, monkeypatch, arena_operations):
     reference = Path(os.environ["LAB_ARENA_REFERENCE_SOURCE"])
     checkpoint = install_actual_checkpoint_writer(lab, monkeypatch)
@@ -6929,7 +6007,7 @@ def test_reviewed_checkpoint_uses_real_arena_atomic_writer_and_v5_validation(
             "import json,sys; from pathlib import Path; "
             "from lab_arena.output import output_document_from_bytes; "
             "doc=output_document_from_bytes(Path(sys.argv[1]).read_bytes(), "
-            "expected_schema_version='leadpoet.lab_arena.output.v5'); "
+            "expected_schema_version='leadpoet.lab_arena.output.v6'); "
             "print(json.dumps({'count':len(doc['companies']),'schema':doc['schema_version']}))"
         )
         environment = dict(os.environ)
@@ -6940,7 +6018,7 @@ def test_reviewed_checkpoint_uses_real_arena_atomic_writer_and_v5_validation(
         )
         assert validated.returncode == 0, validated.stderr
         assert json.loads(validated.stdout) == {
-            "count": 1, "schema": "leadpoet.lab_arena.output.v5"}
+            "count": 1, "schema": "leadpoet.lab_arena.output.v6"}
 
         fresh = tools.call("tyche_review", {"companies": [{
             "target": "example.com", "decision": "accept",
@@ -7077,50 +6155,6 @@ def test_finalization_projects_before_review_then_accepts_provider_backed_repair
 
     lab.after_program = repair_missing_hq
     assert runtime.run(ICP)[0]["country"] == "United States"
-
-
-@pytest.mark.parametrize("finish_tool", ["tyche_checkpoint", "tyche_finish"])
-def test_finalization_rejects_contact_geography_before_review_approval(lab, monkeypatch, finish_tool):
-    lab.program = lambda: scenario(None)
-    icp = copy.deepcopy(ICP)
-    icp["contact_geography"] = {"countries": ["CA"]}
-
-    def reject_out_of_scope_contact(tools):
-        blocked = tools.call(finish_tool, {})
-        assert blocked["status"] == "needs_repair"
-        assert any("contact_geography mismatch: country" in error for error in blocked["errors"])
-        assert "final_review" not in json.loads(tools.research.path.read_text())
-        assert not lab.output.exists()
-
-    lab.after_program = reject_out_of_scope_contact
-    with pytest.raises(RuntimeError, match="repeated_worker_failure"):
-        runtime.run(icp)
-
-
-@pytest.mark.parametrize("corruption", ["contact", "evidence", "provenance"])
-def test_partial_checkpoint_preserves_qualification_and_contact_gates(lab, monkeypatch, corruption):
-    monkeypatch.setenv("LAB_ARENA_COMPANY_LIMIT", "5")
-    lab.program = lambda: scenario(None)
-
-    def corrupt(tools):
-        path = tools.research.path
-        saved = json.loads(path.read_text())
-        row = saved["accepted"][0]
-        if corruption == "contact":
-            row["primary_contact"].pop("email")
-        elif corruption == "evidence":
-            row["qualification_checks"][0]["status"] = "unknown"
-        else:
-            row["primary_contact"]["email"] = "someone-else@example.com"
-        path.write_text(json.dumps(saved))
-        result = tools.call("tyche_checkpoint", {})
-        assert result["status"] == "needs_repair", result
-        assert not result["checkpoint_saved"]
-        assert not lab.output.exists()
-
-    lab.after_program = corrupt
-    with pytest.raises(RuntimeError, match="repeated_worker_failure"):
-        runtime.run(ICP)
 
 
 def test_failed_changed_checkpoint_is_revoked_during_host_recovery(lab, monkeypatch):
@@ -7273,8 +6307,8 @@ def test_paid_and_free_captured_pages_keep_native_approval_atomic_checkpoint_and
     assert len(rows) == 1
     for payload in (lab.output.read_bytes(), json.dumps({"companies": rows}).encode()):
         parsed = output_document_from_bytes(
-            payload, expected_schema_version="leadpoet.lab_arena.output.v5")
-        assert parsed["schema_version"] == "leadpoet.lab_arena.output.v5"
+            payload, expected_schema_version="leadpoet.lab_arena.output.v6")
+        assert parsed["schema_version"] == "leadpoet.lab_arena.output.v6"
         assert len(parsed["companies"]) == 1
     assert list(lab.output.parent.glob(".arena-checkpoint-*")) == []
     assert lab.frames == lab.calls_before_recovery

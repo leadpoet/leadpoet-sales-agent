@@ -38,7 +38,6 @@ _SCRAPINGDOG_ROUTES = {
     "google_search": ("/google", "scrapingdog.google", {"query", "country", "results"}),
     "scrape": ("/scrape", "scrapingdog.scrape", {"url", "dynamic", "premium", "wait"}),
     "linkedin_company": ("/profile", "scrapingdog.profile", {"type", "id"}),
-    "linkedin_person": ("/profile", "scrapingdog.profile", {"type", "id"}),
     "linkedin_job": ("/jobs", "scrapingdog.jobs", {"job_id"}),
     "google_jobs": ("/google_jobs", "scrapingdog.google_jobs", {"query", "country"}),
     "google_news": ("/google_news", "scrapingdog.google_news", {"query", "country", "results"}),

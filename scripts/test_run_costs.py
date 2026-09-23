@@ -318,7 +318,7 @@ class RunCostsTests(unittest.TestCase):
         result_path = self.root / 'results.json'
         result_path.write_text(json.dumps(results))
         (self.root / 'validation.json').write_text(json.dumps({'completed_at':'2026-09-13T00:25:30Z'}))
-        (self.root / 'research-commentary.md').write_text('Reviewed signals and contact selection. Fixture only.')
+        (self.root / 'research-commentary.md').write_text('Reviewed company fit and signals. Fixture only.')
         before = result_path.read_bytes()
         save_report(self.root)
         first = (self.root / 'report.md').read_text()
@@ -327,7 +327,7 @@ class RunCostsTests(unittest.TestCase):
         self.completed()
         save_report(self.root)
         final = (self.root / 'report.md').read_text()
-        self.assertIn('Reviewed signals and contact selection. Fixture only.', final)
+        self.assertIn('Reviewed company fit and signals. Fixture only.', final)
         self.assertNotIn('Sourcing model usage was not captured', final)
         self.assertIn('$0.8312', final)
         self.assertEqual(result_path.read_bytes(), before)

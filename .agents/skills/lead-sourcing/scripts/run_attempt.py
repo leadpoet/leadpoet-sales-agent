@@ -14,19 +14,48 @@ import sys
 import budget_guard
 import confirmed_leads
 import research_input
-from email_receipts import check_fallback, validator_for_tool, verification_finished
-from email_receipts import discovery_source, email_work, saved_result, verification_status_parent
-from linkedin_receipts import contact_verification_errors, email_identity_fields
 from provider_output import ResponseFile, load_json
 from source_receipts import read_receipt, request_fingerprint as _fingerprint
 from record_route import AUDIT_IDENTITY, IDENTITY, mutate, record
 from validate_run import (BLOCKING_PROVIDER_STATUSES, DETERMINATE_PROVIDER_STATUSES, _company_key,
-                          contact_count, contact_limits, contact_coverage, sourcing_target_met,
-                          calculate_cost_summary, calculate_review_counts, evaluate_stop, excluded_company,
+                          sourcing_target_met,
+                          calculate_cost_summary, calculate_review_counts, evaluate_stop,
                           progress_snapshot, qualification_errors, _reviewed_company_scopes, accepted_errors,
-                          validate_run, stalled_approaches, _research_key, DELIVERY_STOPS)
+                          validate_run, stalled_approaches, _research_key, DELIVERY_STOPS,
+                          COSTED_RESULT_SCHEMA_VERSIONS)
 
 ATTEMPT_STATUSES = DETERMINATE_PROVIDER_STATUSES | BLOCKING_PROVIDER_STATUSES
+CONTACT_ONLY_TOOL_IDS = {
+    "bounceban_get_single_status",
+    "bounceban_verify_single",
+    "datagma_find_email",
+    "exa_people_search",
+    "harvestapi_get_profile",
+    "harvestapi_search_leads",
+    "hunter_email_finder",
+    "leadmagic_email_finder",
+    "limadata_find_work_email",
+    "zerobounce_validate",
+}
+
+
+def company_stage_refusal(document, *, phase=None, tool=None, contact_ref=None, provider=None, operation=None,
+                          payload=None, contract=None):
+    """Refuse the retired contact operations before dispatch."""
+    if provider == "deepline" and operation in {"search", "describe"}:
+        return None
+    tool = tool or ""
+    reasons = []
+    if phase not in {"account_discovery", "account_verification"}:
+        reasons.append(f"phase {phase}")
+    if contact_ref:
+        reasons.append("contact_ref")
+    if tool in CONTACT_ONLY_TOOL_IDS or (provider == "scrapingdog" and tool == "linkedin_person"):
+        reasons.append(f"the retired contact tool {tool}")
+    if not reasons:
+        return None
+    return ("This company-only run sources and qualifies companies; " + ", ".join(reasons)
+            + " is outside company sourcing and is refused. No call was made.")
 
 
 def review_fingerprint(document):
@@ -87,11 +116,11 @@ def refresh(document):
     """Recompute bookkeeping only; never qualify leads or declare routes exhausted."""
     accepted = document.get("accepted", [])
     count, target = len(accepted), document["request"]["target_count"]
-    document.setdefault("summary", {}).update(
-        target_count=target, accepted_companies=count, accepted_contacts=count,
-        backup_contacts=sum(len(row.get("backup_contacts", [])) for row in accepted),
-        rejected_rows=len(document.get("rejected", [])), unresolved_rows=len(document.get("unresolved", [])))
-    document["summary"]["contact_coverage"] = contact_coverage(document)
+    summary = document.setdefault("summary", {})
+    summary.update(target_count=target, accepted_companies=count,
+                   rejected_rows=len(document.get("rejected", [])), unresolved_rows=len(document.get("unresolved", [])))
+    for key in ("accepted_contacts", "backup_contacts", "contact_coverage"):
+        summary.pop(key, None)
     routes = document.get("routes", [])
     spent = {}
     for provider in ("deepline", "scrapingdog"):
@@ -108,40 +137,9 @@ def refresh(document):
         capacity.setdefault(provider, "unknown")
         if spent[f"{provider}_credits"] is None:
             capacity[provider] = "unknown"
-    if document.get("schema_version") in {"1.1", "1.2"}:
+    if document.get("schema_version") in COSTED_RESULT_SCHEMA_VERSIONS:
         document["cost_summary"] = calculate_cost_summary(document)
     return document
-
-
-def _contact_gate(document, action, run_file=None):
-    # Catalog reads describe available tools; they do not look up contacts.
-    if action.get("provider") == "deepline" and action.get("operation") in {"search", "describe"}:
-        return
-    if action["phase"] not in {"contact_discovery", "contact_verification", "email_validation"}:
-        return
-    if not document["request"].get("contacts_required", True):
-        raise ValueError("This request is company-only; contact research is not allowed")
-    # Draft problems belong to their company. Keep the full-document gate at
-    # delivery; an unrelated candidate must not block discovery or recovery.
-    scoped = dict(document, rejected=[])
-    for state in ("accepted", "unresolved"):
-        scoped[state] = [r for r in document.get(state, [])
-                         if isinstance(r, dict) and _company_key(r) == action["scope"]]
-    problems = qualification_errors(scoped, run_file=run_file)
-    if problems:
-        raise ValueError("; ".join(problems))
-    rows = [r for r in document.get("accepted", []) + document.get("unresolved", [])
-            if isinstance(r, dict) and _company_key(r) == action["scope"]
-            and (r in document.get("accepted", []) or r.get("stage") == "contact")]
-    if not rows or any(excluded_company(document["request"], r) for r in rows):
-        raise ValueError("contact lookup requires a non-excluded, account-qualified company")
-    for row in rows:
-        checks = [c for c in row.get("qualification_checks", []) if c.get("importance") == "required"]
-        fit = row.get("account_fit", {})
-        if ((checks and all(c.get("status") == "pass" and c.get("evidence") for c in checks))
-                or (fit.get("evidence_url") and fit.get("evidence_text"))):
-            return
-    raise ValueError("contact lookup requires passing account evidence; unknown stays unresolved")
 
 
 def pending_source_reviews(document):
@@ -165,8 +163,7 @@ def strategy_reminder(document):
         return {"count": 0, "items": []}
     reviewed = {r["route_id"] for r in document.get("stop_audit", {}).get("route_frontier", [])
                 if r.get("state") == "exhausted" and r.get("reason")}
-    terminal = {_company_key(r) for state in ("accepted", "rejected") for r in document.get(state, [])
-                if state == "rejected" or contact_count(r, document["request"]) >= contact_limits(document["request"])[1]}
+    terminal = {_company_key(r) for state in ("accepted", "rejected") for r in document.get(state, [])}
     groups = {}
     for route in document.get("routes", []):
         key = _research_key(route)
@@ -180,9 +177,7 @@ def strategy_reminder(document):
         if (len(pair) != 2 or any(r["route_id"] not in reviewed for r in pair)
                 or not stalled_approaches(document, pair[-1])):
             continue
-        items.append({"target": scope, "phase": phase,
-                      "remaining_work": "verified buyer contact details" if phase == "contact_discovery"
-                          and any(f.startswith(scope + ":buyer:") for f in progress) else phase,
+        items.append({"target": scope, "phase": phase, "remaining_work": phase,
                       "sources": [r["route_id"] for r in pair],
                       "tools": list(dict.fromkeys(r.get("tool") or r.get("provider") for r in pair))})
     result = {"count": len(items), "items": items}
@@ -194,56 +189,6 @@ def strategy_reminder(document):
             "input error when useful; keyword/page changes alone may repeat the same method. "
             "This is advice, not a block or proof of exhaustion; independent verification stays eligible.")
     return result
-
-
-def _email_gate(run_file, document, action, request):
-    if not email_work(action, request):
-        return
-    _contact_gate(document, dict(action, phase="contact_discovery"), run_file)
-    rows = [r for state in ("accepted", "unresolved") for r in document.get(state, [])
-            if _company_key(r) == action["scope"]]
-    contacts = [(r.get("company", r.get("candidate", {})), c) for r in rows
-                for c in [r.get("primary_contact", {}), *r.get("backup_contacts", [])] if isinstance(c, dict)]
-    payload = request.get("payload", request)
-    name = payload.get("full_name", payload.get("fullName", payload.get("name"))) or " ".join(
-        str(payload.get(a, payload.get(b, ""))) for a, b in (("first_name", "firstName"), ("last_name", "lastName"))).strip()
-    url = payload.get("contact_linkedin", payload.get("linkedin_url", payload.get("linkedinUrl", payload.get("profile_url", payload.get("url", "")))))
-    email = payload.get("email")
-    reference = action.get("contact_ref")
-    if reference:
-        contacts = [(company, c) for company, c in contacts if c.get("profile_ref") == reference
-                    and reference.split(":")[0] == (c.get("location_evidence") or c).get("source", {}).get("route_id")]
-    elif name:
-        contacts = [(company, c) for company, c in contacts if str(c.get("full_name") or "").casefold() == name.casefold()]
-    if "linkedin.com/in/" in str(url):
-        contacts = [(company, c) for company, c in contacts
-                    if str(c.get("linkedin_url") or "").rstrip("/").casefold() == url.rstrip("/").casefold()]
-    if not reference and not name and "linkedin.com/in/" not in str(url):
-        matches = [(company, c) for company, c in contacts if isinstance(email, str)
-                   and str(c.get("email") or "").casefold() == email.casefold()]
-        # Without another selected identity, email work belongs to the saved
-        # primary contact. A verified backup cannot unlock an unverified primary.
-        contacts = matches or [(r.get("company", r.get("candidate", {})), r.get("primary_contact", {})) for r in rows]
-    errors = ["Select and review the intended contact's saved HarvestAPI profile first"]
-    if len(contacts) == 1:
-        company, contact = contacts[0]
-        errors = contact_verification_errors(document, run_file, company, contact)
-    if errors:
-        raise ValueError("Email work requires verified identity, current company and requested-role match before spending: "
-                         f"target={action['scope']!r}, contact_ref={reference!r}: " + "; ".join(errors))
-    if reference:
-        fields = email_identity_fields(document, run_file, company, contact)
-        for key in fields.keys() & payload.keys():
-            actual, expected = str(payload[key]).strip().casefold(), fields[key].strip().casefold()
-            if key in {"url", "profile_url", "linkedin_url", "linkedinUrl", "contact_linkedin"}:
-                actual, expected = actual.rstrip("/"), expected.rstrip("/")
-            if actual != expected:
-                raise ValueError(f"Email input {key} conflicts with the selected profile; omit it and use contact_ref")
-    if validator_for_tool(request.get("tool")) and not discovery_source(run_file, document.get("routes", []), email):
-        raise ValueError("Email validation requires the exact address in a saved finder/page first; "
-                         "a company email pattern is not discovery, and neither is a lookup that was given the "
-                         "address. Reuse a discovered address or find another contact.")
-    return company, contact
 
 
 def run_status(document, decision):
@@ -354,15 +299,15 @@ def save_review(run_file, review):
             state, row = item["state"], copy.deepcopy(item["row"])
             if state not in {"accepted", "unresolved", "rejected"} or not isinstance(row, dict):
                 raise ValueError("company review requires an accepted, unresolved or rejected row")
-            if state != "accepted" and row.get("stage") not in {"account", "contact"}:
-                raise ValueError("company review requires an account or contact stage")
+            if state != "accepted" and row.get("stage") != "account":
+                raise ValueError("company review requires the account stage")
             scope = _company_key(row)
             if not scope or scope in changed:
                 raise ValueError("review each canonical company once")
             changed.add(scope)
             for collection in ("accepted", "unresolved", "rejected"):
                 document[collection] = [r for r in document.get(collection, [])
-                    if not (_company_key(r) == scope and (collection == "accepted" or r.get("stage") in {"account", "contact"}))]
+                    if not (_company_key(r) == scope and (collection == "accepted" or r.get("stage") == "account"))]
             document[state].append(row)
         scoped = dict(document)
         for state in ("accepted", "unresolved", "rejected"):
@@ -381,11 +326,6 @@ def save_review(run_file, review):
             reviewed_scopes.add(entry.get("scope"))
             state = item.get("state", "exhausted")
             links = list(dict.fromkeys(entry.get("continuation_route_ids", []) + item.get("continuation_route_ids", [])))
-            if state == "exhausted" and receipt.get("provider_status") == "partial":
-                saved = budget_guard.read_object(Path(run_file).parent / "receipts" / (rid + ".json"))
-                pending = saved.get("pending_verification")
-                if pending and not verification_finished(run_file, document, rid, pending, links):
-                    raise ValueError("pending verification needs its saved job's status continuation")
             if state not in {"exhausted", "continuable", "blocked"}:
                 raise ValueError("review a completed attempt, not an untried route")
             if state == "blocked" and receipt.get("provider_status") in DETERMINATE_PROVIDER_STATUSES:
@@ -407,8 +347,7 @@ def save_review(run_file, review):
         actions = document["stop_check"]["next_actions"]
         parked = _reviewed_company_scopes(document)
         terminal = {_company_key(r) for state in ("accepted", "rejected") for r in document.get(state, [])
-                    if (state == "accepted" and contact_count(r, document["request"]) >= contact_limits(document["request"])[1])
-                    or (state == "rejected" and r.get("stage") == "account")}
+                    if state == "accepted" or (state == "rejected" and r.get("stage") == "account")}
         supplied = review.get("next_actions", [])
         supplied_ids = {a["id"] for a in supplied}
         active_ids = {rid for r in document["stop_audit"]["route_frontier"]
@@ -418,14 +357,6 @@ def save_review(run_file, review):
         # follow-ups. Explicit new actions below can reopen a concrete source.
         actions[:] = [a for a in actions if a["id"] not in closed | supplied_ids
                       and (a["id"] in active_ids or a.get("scope") not in reviewed_scopes & (parked | terminal))] + copy.deepcopy(supplied)
-        account_pending = {_company_key(row) for state in ("unresolved", "rejected")
-                           for row in document.get(state, []) if row.get("stage") == "account"} & changed
-        planned_ids = {row["route_id"] for row in document["stop_audit"]["route_frontier"]}
-        # A downgraded account needs evidence first. Preserve dispatched work
-        # for recovery; retire only speculative contact steps that cannot run.
-        actions[:] = [a for a in actions if a["id"] in planned_ids
-                      or a.get("scope") not in account_pending
-                      or a.get("phase") not in {"contact_discovery", "contact_verification", "email_validation"}]
         refresh(document)
         ledger = budget_guard.load_ledger(run_file)
         decision = evaluate_stop(document, execution_budget=ledger)
@@ -456,8 +387,10 @@ def _validate_spec(spec, label="input", *, plan_only=False):
     for field in ("scope", "description", "phase", "approach", "provider"):
         if not isinstance(action.get(field), str) or not action[field].strip():
             raise ValueError(f"{label}.action.{field} must be a non-empty string")
-    if action["phase"] not in {"account_discovery", "account_verification", "contact_discovery", "contact_verification", "email_validation"}:
-        raise ValueError(f"{label}.action.phase must be account_discovery, account_verification, contact_discovery, contact_verification, or email_validation")
+    if action["phase"] not in {"account_discovery", "account_verification"}:
+        raise ValueError(f"{label}.action.phase must be account_discovery or account_verification")
+    if action.get("contact_ref"):
+        raise ValueError(f"{label}.action.contact_ref is not supported by company sourcing")
     provider = action["provider"]
     if provider == "public_web" and not plan_only:
         raise ValueError("public web: use --plan-only, then record the observed result with --complete")
@@ -484,23 +417,12 @@ def _validate_spec(spec, label="input", *, plan_only=False):
     if action.get("status_read") and (provider != "deepline" or operation != "execute"
                                      or action.get("cost_upper_bound_credits") != 0):
         raise ValueError("status_read requires a described free Deepline job-status getter")
-    if action.get("status_read") and validator_for_tool(request.get("tool")) and not request.get("payload", {}).get("id"):
-        raise ValueError("A verification status read requires the saved pending job id and its status getter; do not resubmit the email-verification request")
-    is_verification = ("email_validation" in {request.get("entity_type"), action.get("entity_type")}
-                       or provider == "deepline" and operation == "execute"
-                       and validator_for_tool(request.get("tool")))
     if provider == "deepline" and operation in {"search", "describe"}:
         action["entity_type"] = "tool_catalog"
     elif "tool_catalog" in {request.get("entity_type"), action.get("entity_type")}:
         raise ValueError("tool_catalog is reserved for live catalog operations")
-    elif provider == "deepline" and action["phase"] == "email_validation" and not validator_for_tool(request.get("tool")):
-        raise ValueError(f"{label}: email_validation requires a supported validation operation; email finders use contact_discovery and cannot spend its protected reserve")
-    elif is_verification and action["phase"] != "email_validation":
-        raise ValueError(f"{label}.action.phase must be email_validation for an email-validation request")
     if action.get("entity_type") and action["entity_type"] != "tool_catalog":
         request["entity_type"] = action["entity_type"]
-    if action["phase"] == "email_validation" and action.get("entity_type") != "tool_catalog":
-        action["entity_type"] = request["entity_type"] = "email_validation"
     action["operation"] = operation
     if request.get("tool"):
         action["tool"] = request["tool"]
@@ -516,11 +438,24 @@ def _prepare(run_file, validated):
 
     def plan(document):
         refresh(document)
-        status_parent = verification_status_parent(run_file, document, action, request)
+        contract = None
+        if provider == "deepline" and operation == "execute":
+            described = next((r for r in reversed(document.get("routes", [])) if r.get("operation") == "describe"
+                              and r.get("tool") == request.get("tool") and r.get("provider_status") == "ok"), None)
+            if described:
+                saved = read_receipt(run_file, described["route_id"])["result"]
+                contract = next((c for c in saved.get("results", []) if isinstance(c, dict)
+                                 and request.get("tool") in {c.get("toolId"), c.get("id"), c.get("tool")}), None)
+        refusal = company_stage_refusal(document, phase=action["phase"],
+                                        tool=request.get("tool") or (operation if provider == "scrapingdog" else None),
+                                        contact_ref=action.get("contact_ref"), provider=provider,
+                                        operation=operation, payload=request.get("payload"), contract=contract)
+        if refusal:
+            raise ValueError(refusal)
         catalog_recovery = (provider == "deepline" and operation == "describe" and action["paid_calls"] == 0
                             and any(r.get("provider") == "deepline" and r.get("tool") == request.get("tool")
                                     for r in document["routes"]))
-        if finalization and not status_parent and not catalog_recovery:
+        if finalization and not catalog_recovery:
             if not (provider == "public_web" and operation == "open" and action["phase"] == "account_verification"):
                 raise ValueError("Research is closed. Only reread a saved source or use a confirmed-free status getter for this run's existing verification job.")
             row = next((r for r in document["accepted"] if _company_key(r) == action["scope"]), {})
@@ -529,18 +464,6 @@ def _prepare(run_file, validated):
             urls = {e.get("url", e.get("evidence_url")) for e in evidence} - {None, ""}
             if request.get("query", request.get("url")) not in urls:
                 raise ValueError("Research is closed. Reopen only the exact saved source URL for this accepted company.")
-        if not status_parent:
-            if action.get("status_read") and validator_for_tool(request.get("tool")):
-                raise ValueError("A verification status read must match this run's saved pending job and address")
-            _contact_gate(document, action, run_file)
-            _email_gate(run_file, document, action, request)
-        if provider == "deepline" and operation == "execute" and request.get("tool") == "harvestapi_get_profile":
-            for row in document.get("accepted", []) + document.get("unresolved", []):
-                company = row.get("company", row.get("candidate", {}))
-                if _company_key(row) == action["scope"] and isinstance(company, dict) and company.get("linkedin_url"):
-                    # Local normalization context only; never sent in the provider payload.
-                    request["target_company_linkedin_url"] = company["linkedin_url"]
-                    break
         audit = document.setdefault("stop_audit", {})
         frontier = audit.setdefault("route_frontier", [])
         # An explicit free catalog refresh may recover a schema/price change
@@ -570,8 +493,6 @@ def _prepare(run_file, validated):
                                  "Do not redispatch the same paid request.")
         if any(r["route_id"] == action["id"] for r in frontier):
             raise ValueError("route ID already planned; resume its receipt instead of redispatching")
-        if provider == "deepline" and not action.get("status_read"):
-            check_fallback(run_file, document, request)
         actions = document["stop_check"]["next_actions"]
         actions[:] = [a for a in actions if a["id"] != action["id"]] + [action]
         decision = evaluate_stop(document, execution_budget=budget_guard.load_ledger(run_file))
@@ -583,10 +504,9 @@ def _prepare(run_file, validated):
             and provider == "public_web"
             and action["phase"] == "account_verification" and action["paid_calls"] == 0
             and action["scope"] in {_company_key(row) for row in document["accepted"]})
-        status_recovery = status_parent and decision["decision"] in DELIVERY_STOPS and not decision["errors"]
         free_recovery = (catalog_recovery and not decision["errors"] and decision["decision"] in
                          DELIVERY_STOPS | {"provider_stop", "input_or_configuration_stop"})
-        if action["id"] not in decision["eligible_actions"] and not review_observation and not status_recovery and not free_recovery:
+        if action["id"] not in decision["eligible_actions"] and not review_observation and not free_recovery:
             reason = decision.get("blocked_actions", {}).get(action["id"])
             if reason:
                 # Keep the agent's concrete, unaffordable choice for the stop
@@ -603,9 +523,6 @@ def _prepare(run_file, validated):
         document = record(document, entry)
         entry.update(state="blocked", reason="Dispatch pending; recover the saved response before any retry.")
         document = record(document, entry)
-        if status_parent:
-            parent = next(r for r in document["stop_audit"]["route_frontier"] if r["route_id"] == status_parent)
-            parent["continuation_route_ids"] = list(dict.fromkeys(parent.get("continuation_route_ids", []) + [action["id"]]))
         prepared.update(action=action, frontier=entry, progress_before=progress_snapshot(document),
                         accepted_before=len(document["accepted"]))
         return document
@@ -673,29 +590,6 @@ def finish_attempt(run_file, route_id, body, *, check_stop=True):
         if status == "no_results" and not results:
             entry.update(state="exhausted", exhaustion_basis="no_results",
                          reason="This exact request returned no results; broader discovery remains open.")
-        if (status == "ok"
-                and action.get("tool") == "harvestapi_get_profile" and action.get("contact_ref")
-                and body.get("attempt", {}).get("request", {}).get("payload", {}).get("findEmail") == "true"
-                and len(results) == 1 and results[0].get("emails") == []
-                and not results[0].get("contact_email") and not results[0].get("email_candidates")
-                and not body.get("pending_verification")
-                and read_receipt(run_file, route_id)["result"].get("receipt_status") == "complete"):
-            entry.update(state="exhausted", exhaustion_basis="no_new_unique_candidates",
-                         reason="This completed profile email lookup returned no email. Reuse the verified contact with another email source, or choose another contact/company when useful. The saved profile and charges are unchanged.")
-        if (status == "ok" and action["phase"] == "email_validation"
-                and validator_for_tool(action.get("tool")) and len(results) == 1
-                and not body.get("pending_verification")):
-            email = body.get("attempt", {}).get("request", {}).get("payload", {}).get("email")
-            if isinstance(email, str) and email.strip():
-                try:
-                    source = {k: receipt[k] for k in ("provider", "operation", "tool", "route_id")}
-                    verdict = saved_result(run_file, document["routes"] + [receipt], source, email)
-                except (ValueError, OSError):
-                    pass  # Unbound or incomplete results still require inspection.
-                else:
-                    if verdict.get("status"):
-                        entry.update(state="exhausted", exhaustion_basis="no_new_unique_candidates",
-                                     reason="Single-address verification completed; reuse its saved verdict. Contact selection and eligible fallback remain separate decisions.")
         if action.get("entity_type") == "tool_catalog" and status in {"ok", "no_results"}:
             entry.update(state="exhausted", exhaustion_basis="no_new_unique_candidates",
                          reason="Catalog response saved; live capabilities are available for route choice.")
@@ -851,7 +745,7 @@ def run_batch(run_file, specs, *, execute=None, plan_only=False):
         catalog = action.get("entity_type") == "tool_catalog"
         if rid in ids or not catalog and scope in scopes:
             raise ValueError("batch actions need unique route IDs and distinct canonical company scopes")
-        if not catalog and action["phase"] not in {"account_verification", "contact_discovery", "contact_verification", "email_validation"}:
+        if not catalog and action["phase"] != "account_verification":
             raise ValueError("batch mode is for company checks; run discovery pilots separately as a single lookup object, not an array")
         ids.add(rid)
         if not catalog:
@@ -893,14 +787,11 @@ def _harvest_display(value):
     omitted = {"similarOrganizations", "logo", "logos", "backgroundCover",
                "backgroundCovers", "profilePicture", "coverPicture", "photo"}
     if isinstance(value, dict):
-        if value.get("entity_type") in {"contact", "person", "company", "account", "organization"}:
+        if value.get("entity_type") in {"company", "account", "organization"}:
             fields = {"entity_type", "provider", "tool", "company", "company_linkedin_url", "domain",
                       "name", "linkedinUrl", "employee_range", "employeeCountRange", "employeeCount",
                       "description", "tagline", "industries", "specialities", "companyType", "foundedOn",
-                      "locations", "location", "location_text", "country", "state", "city",
-                      "contact_name", "contact_url", "contact_title", "contact_email", "headline",
-                      "current_positions", "position_review", "email_candidates", "missing_fields",
-                      "role_title", "is_current", "start_date", "end_date", "organization", "current_employers",
+                      "locations", "location", "location_text", "country", "state", "city", "missing_fields",
                       "evidence_url", "evidence_date", "evidence_text", "signal"}
             projected = {key: _harvest_display(item) for key, item in value.items() if key in fields}
             projected["omitted_fields"] = sorted(set(value) - fields)

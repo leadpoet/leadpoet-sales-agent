@@ -40,7 +40,7 @@ pricing or a base-page price is not a conservative bound for an entire job.
 | Capability and observed tool | Input hints | Useful evidence and boundary |
 |---|---|---|
 | D DiscoLike `discolike_discover` | `domain`, `icp_text`/`icp_prompt`, `phrase_match`, geography, `max_records` | Website-first niche/adjacent accounts. Semantic similarity and inferred size require verification; bound usage-based pricing. |
-| D DiscoLike `discolike_bizdata` | `domain` | Firmographics, public contacts, keywords for a known site; null size remains unresolved. |
+| D DiscoLike `discolike_bizdata` | `domain` | Firmographics and keywords for a known site; null size remains unresolved. |
 | D Exa `exa_company_search` | `query`, `numResults`, content options | Concept-driven company discovery. Do not combine entity-category search with source-scoped domain/text filters; use general web search for that. |
 | D Crustdata `crustdata_v3_company_search` | `filters`, `fields`, `limit`, `sorts`, `cursor` | Indexed industry, country, size, funding, growth, investor, competitor and function-size discovery. Use catalog autocomplete for exact field values. |
 | D Prospeo `prospeo_search_company` | `company_industry`, `company_keywords`, `company_headcount_range`, location, technology, `page` | Independent structured account universe; confirm actual ICP evidence and native page size. |
@@ -108,7 +108,7 @@ complete normalized output.
 | C Other ad routes | `adyntel_facebook`, `adyntel_google`, `adyntel_linkedin`, `adyntel_tiktok_search`, `leadmagic_b2b_ads_search` | Known-account and additional-network creative research, not a compulsory network sweep. |
 | D HarvestAPI `harvestapi_search_posts` | `search`, `company`/`profile`, `postedLimit`, `sortBy`, cursor | Public launches, operational changes, explicit supplier requests, and pain language. Verify original author, company, and date. |
 | C HarvestAPI follow-up reads | `harvestapi_get_company_posts`, `harvestapi_get_post`, `harvestapi_get_post_comments`, `harvestapi_get_profile_posts` | Inspect an identified source or conversation rather than repeating broad post search. Reactions alone are weak evidence. |
-| D ScrapeCreators `scrapecreators_reddit_search` | `query`, sort/time fields, `after` | Community problem and recommendation discovery. Pseudonymous users are not company contacts. |
+| D ScrapeCreators `scrapecreators_reddit_search` | `query`, sort/time fields, `after` | Community problem and recommendation discovery. Pseudonymous posts are not company evidence. |
 | D ScrapeCreators `scrapecreators_reddit_post_comments` | Exact post `url`, optional cursor | Recover the discussion and objections; quoted/reposted claims need attribution. |
 | D ScrapeCreators `scrapecreators_instagram_profile` | `handle` | A Deepline alternative despite no local ScrapingDog Instagram operation. Profile identity does not establish a dated business event. |
 | D ScrapeCreators `scrapecreators_instagram_user_posts` | `handle`, optional `next_max_id` | Inspect posts from a resolved business profile for launches, locations or service changes. Verify content, date and the account's company relationship. |
@@ -118,32 +118,7 @@ complete normalized output.
 | D Bluesky `bluesky_search_posts` | `q`, `since`/`until`, `author`, `limit`, cursor | Another public conversation source; public mention is not automatically account intent. |
 | D OpenWebNinja `openwebninja_localbusiness_business_posts` | `business_id`, optional cursor/language | Owner updates on a Google Maps listing can reveal openings, services, and events. Resolve listing ID first. |
 | D OpenWebNinja `openwebninja_glassdoor_company_reviews` | `company_id`, query/sort/page filters | Employer pain or operating-change hypotheses, not verified claims. Resolve Glassdoor employer identity first. |
-| D Podscan `podscan_episodes_search` | `query`, language, `per_page`, `include_transcript` | Transcript-based executive statements, projects, partners, and industry language. Verify guest/speaker/current role and publication date. |
-
-## Buyers and contact data
-
-Only after the company passes. Discover the requested role before email lookup;
-limit phone/personal-contact fields to the user's requested scope. Do not infer
-private traits from social activity or turn anonymous community authors into leads.
-
-| Capability and observed tool | Input hints | Useful evidence and boundary |
-|---|---|---|
-| D HarvestAPI `harvestapi_search_leads` | `currentCompanies`, `currentJobTitles`, seniority/function, `recentlyChangedJobs`, `page` | Current employees or role-change candidates. Profile results are not total headcount; verify employment from exact profiles. |
-| D HarvestAPI `harvestapi_search_services` | `search`, location, `page` | Independent specialists and service providers missing from company databases. Resolve their actual business entity. |
-| D Crustdata `crustdata_v3_person_search` | `filters`, `fields`, `limit`, `cursor` | Indexed title/employer/skills search. Use exact-field autocomplete when needed. |
-| D Forager `forager_person_role_search` | `organization_domains`, `role_title`, `role_is_current`, role dates, `page` | Role history and current-role resolution across a different person graph. Match organization identity. |
-| D Datagma `datagma_find_people` | `domain`/`currentCompanies`, `currentJobTitle` | Up to ten matching people in a known account; respect requested title families. |
-| D Leadmagic `leadmagic_role_finder` | `job_title`, company domain/name/profile | Specific role-holder lookup when broad people search is noisy. |
-| D Aviato `aviato_get_company_founders` | Company identifier, required `page` and `perPage` | Founder discovery when founders are requested. Historical founder status does not prove current management or ownership. |
-| D Exa `exa_people_search` | `query`, `company_name`, `numResults` | Public team/profile evidence for thinly indexed companies. Search results require current-role verification. |
-| D Wiza `wiza_search_prospects` | `filters`, `size` | Masked prospect discovery before selected reveal. A masked result is not a usable email. |
-| D Datagma `datagma_job_change_detection` | Person name, previous company/title context | Freshness check for a known person; establish the new role before using contact details. |
-| D Hunter `hunter_domain_search` | `domain` or `company`, job-title/department/seniority filters, `limit` | Named addresses with source/confidence information. Generic inboxes do not satisfy a requested individual contact. |
-| D Hunter `hunter_email_finder` | `domain`/`company`, `first_name`/`last_name` or `full_name` | Exact-person work-email route; finder confidence is not final validation. |
-| D Datagma `datagma_find_email` | Person name plus domain/company, or supported LinkedIn identifier | Independent work-email lookup; retain provider receipt and validate through the existing gate. |
-| D ContactOut `contactout_linkedin_contact_info` | `profile`, `email_type`, `include_phone` | Selected LinkedIn profile reveal. Request work email only and no phone unless that extra data is in scope. |
-| C Additional contact coverage | `fullenrich_people_search`, `bettercontact_enrich`, `findymail_find_from_name`, `forager_person_contacts_lookup_work_emails`, `dropleads_search_people` | Different person graphs/waterfalls. Inspect async recovery, per-page billing, and masked/reveal behavior before use. |
-| Live validation discovery | Search `ZeroBounce single email validation`, then use `BounceBan verify single email` for any non-hard-rejection ZeroBounce issue | Follow the [Deepline email gate](deepline-adapter.md#email-validation); other catalog validators do not replace or extend it. |
+| D Podscan `podscan_episodes_search` | `query`, language, `per_page`, `include_transcript` | Transcript-based executive statements, projects, partners, and industry language. Verify the speaker, company affiliation, and publication date. |
 
 ## Registries, vertical sources, and source retrieval
 
@@ -151,7 +126,7 @@ private traits from social activity or turn anonymous community authors into lea
 |---|---|---|
 | D GovFiles `govfiles_search_companies_v2` | `q`, jurisdictions, status, `limit` | US legal-company records, filings, identifiers and parties. Confirm jurisdiction availability and exact record; it is not a global register. |
 | D OpenSOSData `opensosdata_business_lookup` | `entity_name`, `state` | US officer/registration evidence where covered. Some jurisdictions return entities but no officers; none establishes total staff. |
-| D Enformion `enformion_business_search` | `name`, optional `city_state`, `results_per_page` | Another US business/officer route for thin B2B coverage. Separately entitled despite connected metadata; do not automatically follow it into personal-address/phone lookup. |
+| D Enformion `enformion_business_search` | `name`, optional `city_state`, `results_per_page` | Another US business/officer route for thin B2B coverage. Separately entitled despite connected metadata; do not expand into unrelated records. |
 | D DataForSEO `dataforseo_serp_google_dataset_search_live_advanced` | `keyword`, format/topic/freshness fields, bounded depth | Discover exact public datasets for specialized industries. Read license, geographic scope, publisher, and actual artifact before using rows. |
 | D DataForSEO `dataforseo_app_data_apple_app_listings_search_live` | App `title`, `description`, `categories`, `limit` | Mobile-software publisher discovery. Resolve app publisher to the canonical company; ratings/download proxies are not buying intent. |
 | D Serper `serper_google_search` | `query`, `gl`, `hl`, `location`, `tbs`, `num` | Public web source discovery across industries and local languages. Read exact sources, not snippets alone. |
@@ -187,13 +162,13 @@ approved secret-binding integration or public-page evidence instead.
   technology, team, job and signal tools remain catalog-only choices here.
 - CRM/warehouse/call/support reads require relevant user-authorized data and
   scope. They are not public prospecting fallbacks. CRM writes, sends,
-  sequencing, audience uploads, contact/list creation, and monitor deployment
+  sequencing, audience uploads, list creation, and monitor deployment
   are outside this skill even when connected.
 - Monitor types such as Deepline's company-job or company-social streams are
   not callable one-shot searches. Status/result tools recover an existing job;
   they are not new discovery sources. Do not create subscriptions or new jobs
   just to replace a missing read.
-- Personality scoring, sensitive personal-data expansion, bulk exports, broad
+- Sensitive-data expansion, bulk exports, broad
   crawls, and account administration are not automatic shortfall routes.
 
 ## ScrapingDog coverage
@@ -206,7 +181,7 @@ tests; plan entitlements and response shapes still need a bounded pilot.
 | Evidence family | Implemented local operations |
 |---|---|
 | Web/company/local discovery | `google_search`, `universal_search`, `scrape`, `google_maps`, `google_maps_place`, `google_local` |
-| Company/person/post identity | `linkedin_company`, `linkedin_person`, `linkedin_post` |
+| Company/post identity | `linkedin_company`, `linkedin_post` |
 | Hiring | `linkedin_jobs`, `linkedin_job`, `google_jobs` |
 | News and answer-assisted discovery | `google_news`, `google_ai_mode` |
 | Advertising | `google_ads_transparency`, `tiktok_ads` |
@@ -230,7 +205,7 @@ omitted from input hints and must never be put in the skill's JSON payload.
 | [Shopping](https://www.scrapingdog.com/documentation/google-shopping-api/) `/google_shopping` | `query` or complete Google URL | Seller/product discovery; use BuiltWith product search or supported web discovery. |
 | [Indeed](https://www.scrapingdog.com/documentation/indeed-scraper-api/) `/indeed` | Full Indeed search URL | Additional hiring universe; use supported jobs tools or exact permitted page extraction. |
 | [Yelp](https://www.scrapingdog.com/documentation/yelp-scraper-api/) `/yelp/search` | `find_loc`, optional keyword/category | Local account discovery; use Openmart or supported Maps/Local routes. |
-| [YouTube comments](https://www.scrapingdog.com/documentation/youtube-comment-api/) `/youtube/comments` | Video ID `v` | Audience questions/objections, not verified company contacts. Existing transcript route is different evidence, not comment support. |
+| [YouTube comments](https://www.scrapingdog.com/documentation/youtube-comment-api/) `/youtube/comments` | Video ID `v` | Audience questions/objections, not verified company evidence. Existing transcript route is different evidence, not comment support. |
 | [YouTube channel](https://www.scrapingdog.com/documentation/youtube-channel-api/) `/youtube/channel` | `channel_id` | Channel identity/activity; existing video/search routes provide narrower evidence. |
 | [Facebook Ads](https://www.scrapingdog.com/documentation/facebook-ads-scraper-api/) `/facebook` | `query`, `page_id`, or Ads Library URL | Dedicated page exists but is absent from the reviewed index; not runtime-tested. Use Adyntel Meta discovery instead. |
 
@@ -269,4 +244,4 @@ Source retrieval and paid execution during sourcing still use the local wrappers
 Refresh descriptions, access, native limits and pricing when actually selecting
 a route. Record whether a claim was catalog-listed, schema-checked, or observed
 in a paid pilot. This reference does not authorize new external actions, relax
-the ICP, replace the email gate, or prove that a shortfall is unavoidable.
+the ICP, replace the qualification gate, or prove that a shortfall is unavoidable.

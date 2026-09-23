@@ -5,10 +5,10 @@ base LLM estimates form a soft cutoff. Pending charges stay unknown. ScrapingDog
 tariffs and separately reported ceiling holds; see its adapter for exceptions. Reservation fields below describe historical version 1
 ledgers, which retain their original policy. See [cost policy](provider-pricing.md).
 
-This is the normative, machine-readable contract for one lead-sourcing run.
+This is the normative, machine-readable contract for one company-sourcing run.
 The JSON Schema is draft 2020-12. A run directory is
 `reports/<run-id>/` and delivers `report.md`, `results.json`, and `leads.xlsx`.
-It also maintains `leads.json` with confirmed leads during research.
+It also maintains `leads.json` with confirmed companies during research.
 Keep provider receipts and the internal `results.json.budget.json` execution
 ledger alongside these deliverables; they do not change the result schema.
 
@@ -23,66 +23,26 @@ All applicable semantic rules still apply.
 | When | Sections |
 |---|---|
 | Before discovery | [Lifecycle invariants](#lifecycle-invariants), [Input contract](#input-contract), [Timing](#timing). |
-| Before selecting qualification evidence | [Semantic checks](#semantic-checks), [Accepted-lead sources](#accepted-lead-sources). |
-| Before accepting and describing a company | [Client writing and taxonomy](#client-writing-and-taxonomy-version-12). |
+| Before selecting qualification evidence | [Semantic checks](#semantic-checks), [Accepted-lead sources](#accepted-company-sources). |
+| Before accepting and describing a company | [Client writing and taxonomy](#client-writing-and-taxonomy-version-20). |
 | Before export and final delivery | [Workbook](#leadsxlsx-contract), [Report minimum contents](#reportmd-minimum-contents), [Final-response checklist](#final-response-checklist); finish [Timing](#timing). |
 
 ## Lifecycle invariants
 
-1. Account processing comes first. As soon as a company passes its account
-   evidence gate, a contact lookup input must contain that accepted canonical
-   `company` and `domain`. Do not search people for rejected or unresolved
-   accounts.
-2. An accepted account has `account_fit` evidence and separate `signal_evidence`
-   for verified intent, and passes every required account evidence rule. An
-   accepted contact has a
-   current-role/company claim and passes every contact evidence rule. These are
-   separate gates.
-3. Each accepted result has exactly one `primary_contact` and any additional
-   contacts in `backup_contacts`. New requests default `min_contacts_per_company`
-   to 1 and `target_contacts_per_company` to that minimum. Both are positive
-   integers, and the target must be at least the minimum. Below the minimum,
-   retain the company and its evidence in `unresolved` at the contact stage.
-   Each counted contact must be distinct and pass the requested role, evidence
-   and contact-field checks. Verified additional profiles may remain in
-   `backup_contacts` while requested fields are pending; they do not count or
-   export until complete, and do not disqualify a company already at its minimum. Fill company minimums before pursuing extra contacts.
-   Once enough companies pass, continue toward their contact targets within the
-   saved budget/deadline; report any target shortfall. A secondary-role contact
-   remains a valid fallback when included in the approved role groups.
-4. `requested_roles` is always required. When `contact_role_groups` is present,
-   it contains the deduplicated primary and secondary role lists whose union is
-   `requested_roles`. Search and rank primary roles first; secondary roles are
-   valid fallbacks and must not be rejected only because they are secondary. A
-   selected contact may therefore be the output `primary_contact` with
-   `role_group: "secondary"`.
-5. `accepted`, `rejected`, and `unresolved` are output states. They are not
+1. Account processing comes first. An accepted account has `account_fit`
+   evidence and separate `signal_evidence` for verified intent, and passes every
+   required account evidence rule.
+2. `accepted`, `rejected`, and `unresolved` are output states. They are not
    provider statuses. A `no_results` provider response is not a rejection;
    `timeout`, quota, authentication, schema, and provider errors are
    unresolved outcomes.
-6. Accepted companies are unique by lower-case canonical domain with a leading
-   `www.` removed. A contact may appear once per accepted company. A backup is
-   not a second primary.
-7. `contact_fields` defaults to `["email"]`. An explicit empty array opts out
-   of contact data, and an explicit `["phone"]` requests only a phone number.
-   Fields outside the effective request are absent from JSON contact objects.
-   The primary contact and every contact counted toward the minimum/target must contain each requested field; otherwise
-   the company remains unresolved. Every stored email must have a matching
-   Deepline ZeroBounce validation receipt. Only an explicit ZeroBounce status
-   of `valid` passes directly (trimmed, case-insensitive). For catch-all/unknown
-   or a recorded ZeroBounce service failure, one successful BounceBan deliverable fallback may pass with both
-   receipts preserved. Reject risky
-   statuses (`invalid`, `do_not_mail`, `spamtrap`, `abuse`); other statuses
-   remain unresolved. Use `email_invalid` for rejected email outcomes. A
-   missing status, missing receipt, failed call, or uncertain provider outcome
-   cannot pass by itself. In the workbook unrequested fields are blank. Do not perform
-   contact-data lookup or email validation before the identity/current-role
-   gate.
-8. `target_count` is the completion condition. After account or contact
-   attrition, source one replacement from a changed route while the accepted
-   count is short and the route frontier is actionable. Do not prefetch or
-   refill by a fixed multiplier such as 5x.
-9. The route frontier contains paid-provider and public-web paths. Each path is
+3. Accepted companies are unique by lower-case canonical domain with a leading
+   `www.` removed.
+4. `target_count` is the completion condition. After account attrition, source
+   one replacement from a changed route while the accepted count is short and
+   the route frontier is actionable. Do not prefetch or refill by a fixed
+   multiplier such as 5x.
+5. The route frontier contains paid-provider and public-web paths. Each path is
    `untried`, `continuable`, `exhausted`, or `blocked`. A final shortfall is
    invalid while any path is actionable unless the strict stop check verifies
    an explicit time limit or that no next action fits the budget. Keep unfinished
@@ -90,17 +50,17 @@ All applicable semantic rules still apply.
    call is not retried automatically, but it does not exhaust other paths. The
    frontier is append-only: paths may be added and states updated, but a planned
    or discovered path must not be removed.
-10. All dates are ISO calendar dates. A relative provider date may be resolved
+6. All dates are ISO calendar dates. A relative provider date may be resolved
    from retrieval time only when the original wording is retained in
-   `report.md`; never invent a date or a person.
-11. `signal_match_mode` defaults to `any`. For required intent, apply it
+   `report.md`; never invent a date.
+7. `signal_match_mode` defaults to `any`. For required intent, apply it
    across required entries in `buying_signals`; facts within a query stay
    conjunctive. Apply the [qualification policy](workflow-rules.md#qualification-policy).
    New requests save each signal's `importance` as `required` or `preferred`
    (default required). Keep `kind` stable within the run and use it as the
    qualification check's `signal`; wording belongs in `claim` and evidence.
    Code copies the saved importance and checks required `any`/`all` coverage
-   before contact work and export. Preferred signals never satisfy a required
+   before acceptance and export. Preferred signals never satisfy a required
    alternative. A failed alternative does not reject an `any` request when
    another passes. Existing legacy request metadata is not rewritten on resume.
    Preserve optional hypotheses in the request and mark their existing
@@ -117,7 +77,7 @@ All applicable semantic rules still apply.
    Omit unrequested age bounds; an empty `time_window` means no shared limit.
    Native start supplies that empty object when omitted. Current-state wording
    still requires current evidence; an unspecified window does not prove a claim.
-12. Each independent must-have needs its own `required_attributes` entry and
+8. Each independent must-have needs its own `required_attributes` entry and
    evidence check. Preserve OR alternatives and the scope of exceptions; do not
    merge separate exclusions into one pass. A negative exclusion needs a targeted
    public screen with its limits, not a company biography. Supplied prior contrary
@@ -128,7 +88,7 @@ All applicable semantic rules still apply.
    required check that is unknown is unresolved. Preferred checks affect
    ranking and explanation but do not reject an otherwise qualified account.
    Each entry in `request.icp.required_attributes` and each supplied company-type,
-   industry or geography filter needs a passing evidence check before contact work
+   industry or geography filter needs a passing evidence check before acceptance
    or delivery. Alternatives within one filter share one check. Native `requirement_ref`
    values select these filters, additional attributes or signals from the saved request; the helper
    expands them into the existing criterion, signal and importance fields.
@@ -138,7 +98,7 @@ All applicable semantic rules still apply.
 The normalized request must validate against this schema. Defaults are noted in
 the schema and must be applied before provider work.
 Before schema validation, apply the [default run budget](workflow-rules.md#default-run-budget)
-when the user omits a spending budget: USD 0.80 times the requested lead count,
+when the user omits a spending budget: USD 0.80 times the requested company count,
 shared across providers. Convert a conservative allocation to the existing
 credit-cap fields; record its USD basis in the report. Explicit budgets override
 this default. No new JSON fields are required.
@@ -146,11 +106,11 @@ this default. No new JSON fields are required.
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "tyche://lead-sourcing/input-contract/v1",
-  "title": "TYCHE lead-sourcing request",
+  "$id": "tyche://lead-sourcing/input-contract/v2",
+  "title": "TYCHE company-sourcing request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["target_count", "icp", "buying_signals", "requested_roles", "time_window", "budget"],
+  "required": ["target_count", "icp", "buying_signals", "time_window", "budget"],
   "properties": {
     "original_text": {"type": "string", "minLength": 1, "description": "Original sourcing request supplied by the launcher and preserved unchanged on resume."},
     "target_count": {"type": "integer", "minimum": 1},
@@ -174,22 +134,7 @@ this default. No new JSON fields are required.
       "enum": ["any", "all"],
       "default": "any"
     },
-    "requested_roles": {
-      "type": "array",
-      "minItems": 1,
-      "items": {"type": "string", "minLength": 1}
-    },
-    "contact_role_groups": {"$ref": "#/$defs/contact_role_groups"},
-    "min_contacts_per_company": {"type": "integer", "minimum": 1, "default": 1},
-    "target_contacts_per_company": {"type": "integer", "minimum": 1, "description": "Defaults to the minimum; must be at least the minimum."},
-    "contacts_per_company": {"type": "integer", "minimum": 1, "description": "Legacy target alias; must agree if both target fields are supplied."},
     "time_window": {"$ref": "#/$defs/time_window"},
-    "contact_fields": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {"enum": ["email", "phone"]},
-      "default": ["email"]
-    },
     "budget": {"$ref": "#/$defs/input_budget"},
     "run_id": {
       "type": "string",
@@ -238,24 +183,6 @@ this default. No new JSON fields are required.
         "source_preferences": {"type": "array", "items": {"type": "string", "minLength": 1}}
       }
     },
-    "contact_role_groups": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["primary", "secondary"],
-      "properties": {
-        "primary": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
-        },
-        "secondary": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
-        }
-      }
-    },
     "time_window": {
       "type": "object",
       "additionalProperties": false,
@@ -286,13 +213,6 @@ this default. No new JSON fields are required.
 }
 ```
 
-The account gate is per company: contact lookup starts as soon as that company
-has passed the account evidence gate. For “at least 3, ideally 5,” set
-`min_contacts_per_company: 3` and `target_contacts_per_company: 5`. For exactly 3,
-set both to 3. An omitted target equals the minimum. New inputs using the legacy
-`contacts_per_company` field normalize it to the target; conflicting targets fail.
-Old saved requests retain their original fields and best-effort backup stopping
-behavior, without changing their fingerprints or reopening completed runs. Resolve contact roles once using [request normalization](workflow-rules.md#request-normalization).
 Provider credit caps are separate because Deepline and
 ScrapingDog units are not interchangeable; a cap of 0 disables that provider.
 At least one provider credit cap is required. `hard_stop` is mandatory and
@@ -308,9 +228,9 @@ schema version `1.2`. Versions `1.0` and `1.1` remain valid for existing artifac
 
 ## `leads.json` confirmed leads
 
-`tyche_start` initializes an empty confirmed-lead snapshot next to `results.json`.
+`tyche_start` initializes an empty confirmed-company snapshot next to `results.json`.
 After company enrichment/writing is complete, accepting it through `tyche_review` returns the saved-source evidence packet
-for that completed lead. Review source meaning, requirements and writing before
+for that completed company. Review source meaning, requirements and writing before
 approving its current `review_ref` with company-specific `review_findings` in a
 separate `tyche_review` call. Approval
 validates receipts and qualification, then atomically replaces `leads.json`.
@@ -326,12 +246,12 @@ The file contains:
 | `run_fingerprint` | Identifies the source run path. Preserve the original run directory when resuming. |
 | `request_fingerprint` | Identifies the unchanged request. |
 | `target_count` | Original requested company count. |
-| `confirmed_count` | Number of rows in `leads`. May be below the target. |
+| `confirmed_count` | Number of confirmed company rows in `leads`. May be below the target. |
 | `updated_at` | UTC timestamp of the last snapshot change. |
-| `leads` | Reviewed rows in the native `results.json.accepted` shape: company, contacts, evidence and qualification. |
+| `leads` | Reviewed rows in the native `results.json.accepted` shape: company, evidence and qualification. |
 | `review_findings` | Source references and factual findings for the current approved rows; removed when a row changes or is withdrawn. Absent on legacy snapshots. |
 
-Only complete, reviewed leads enter this file. Unfinished candidates remain in
+Only complete, reviewed companies enter this file. Unfinished candidates remain in
 `results.json`. An accepted row changed or withdrawn through review is removed
 from the confirmed snapshot; a changed row needs fresh approval to re-enter it.
 Unchanged confirmed rows survive later provider errors and unfinished research.
@@ -339,7 +259,7 @@ A failed atomic write preserves the last complete file and reports the error;
 retry saving after resolving it. An invalid or foreign snapshot is preserved and
 reported instead of silently overwritten. Approval retries are idempotent.
 
-Consumers may read this file at any point and use `leads` as the confirmed partial
+Consumers may read this file at any point and use `leads` as the confirmed partial company
 list. It does not assert run completion, change the target or bypass final
 stopping, accounting, evidence review and workbook checks. The final review also
 saves the confirmed JSON.
@@ -368,13 +288,13 @@ top-level result list or hide rejected/unresolved rows in a count.
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "tyche://lead-sourcing/results/v1",
-  "title": "TYCHE lead-sourcing results",
+  "$id": "tyche://lead-sourcing/results/v2",
+  "title": "TYCHE company-sourcing results",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "run_id", "retrieved_at", "request", "budget", "routes", "summary", "accepted", "rejected", "unresolved", "stop_reason"],
   "properties": {
-    "schema_version": {"enum": ["1.0", "1.1", "1.2"]},
+    "schema_version": {"const": "2.0"},
     "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"},
     "retrieved_at": {"type": "string", "format": "date-time"},
     "final_review": {
@@ -441,38 +361,12 @@ top-level result list or hide rejected/unresolved rows in a count.
   },
   "allOf": [
     {
-      "if": {
-        "properties": {"schema_version": {"enum": ["1.1", "1.2"]}},
-        "required": ["schema_version"]
-      },
+      "if": {"properties": {"schema_version": {"const": "2.0"}}, "required": ["schema_version"]},
       "then": {
         "required": ["cost_summary"],
         "properties": {
-          "routes": {
-            "items": {
-              "required": ["cost_credits", "cost_upper_bound_credits", "cost_basis"]
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {"schema_version": {"const": "1.2"}},
-        "required": ["schema_version"]
-      },
-      "then": {
-        "properties": {
-          "accepted": {
-            "items": {
-              "required": ["intent_details"],
-              "properties": {
-                "company": {
-                  "required": ["description", "industry", "sub_industry"]
-                }
-              }
-            }
-          }
+          "routes": {"items": {"required": ["cost_credits", "cost_upper_bound_credits", "cost_basis"]}},
+          "accepted": {"items": {"required": ["intent_details", "qualification_checks"], "properties": {"company": {"required": ["description", "industry", "sub_industry"]}}}}
         }
       }
     }
@@ -605,103 +499,17 @@ top-level result list or hide rejected/unresolved rows in a count.
         "source": {"$ref": "#/$defs/source"}
       }
     },
-    "bounceban_validation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["email", "status", "result", "source"],
-      "properties": {
-        "email": {"type": "string", "format": "email", "minLength": 3},
-        "status": {"type": "string", "minLength": 1},
-        "result": {"type": "string", "minLength": 1},
-        "score": {"type": ["number", "null"]},
-        "processed_at": {"type": ["string", "null"]},
-        "source": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["provider", "validator", "operation", "tool", "route_id"],
-          "properties": {
-            "provider": {"const": "deepline"},
-            "validator": {"const": "bounceban"},
-            "operation": {"const": "execute"},
-            "tool": {"type": "string", "minLength": 1},
-            "route_id": {"type": "string", "minLength": 1}
-          }
-        }
-      }
-    },
-    "email_validation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["email", "status", "source"],
-      "allOf": [
-        {"if": {"properties": {"status": {"type": "null"}}, "required": ["status"]}, "then": {"required": ["provider_status"]}},
-        {"if": {"required": ["provider_status"]}, "then": {"properties": {"status": {"type": "null"}}}}
-      ],
-      "properties": {
-        "email": {"type": "string", "format": "email", "minLength": 3},
-        "status": {"type": ["string", "null"], "minLength": 1},
-        "provider_status": {"enum": ["provider_error", "timeout", "rate_limited", "auth_failed", "quota_exceeded"]},
-        "sub_status": {"type": ["string", "null"]},
-        "fallback": {"$ref": "#/$defs/bounceban_validation"},
-        "processed_at": {"type": ["string", "null"]},
-        "source": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["provider", "validator", "operation", "tool", "route_id"],
-          "properties": {
-            "provider": {"const": "deepline"},
-            "validator": {"const": "zerobounce"},
-            "operation": {"const": "execute"},
-            "tool": {"type": "string", "minLength": 1},
-            "route_id": {"type": "string", "minLength": 1}
-          }
-        }
-      }
-    },
-    "contact": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["full_name", "current_title", "requested_role", "role_match", "company", "domain", "contact_url", "country", "location_evidence", "evidence_url", "evidence_date", "evidence_date_basis", "evidence_text", "source"],
-      "properties": {
-        "profile_ref": {"type": "string", "minLength": 1},
-        "full_name": {"type": "string", "minLength": 1},
-        "current_title": {"type": "string", "minLength": 1},
-        "requested_role": {"type": "string", "minLength": 1},
-        "role_match": {"enum": ["exact", "normalized", "approved_family"]},
-        "role_group": {"enum": ["primary", "secondary"]},
-        "company": {"type": "string", "minLength": 1},
-        "domain": {"type": "string", "minLength": 1},
-        "contact_url": {"$ref": "#/$defs/url"},
-        "linkedin_url": {"$ref": "#/$defs/url"},
-        "city": {"type": "string", "minLength": 1},
-        "state": {"type": "string", "minLength": 1},
-        "country": {"type": "string", "minLength": 1},
-        "location_evidence": {"$ref": "#/$defs/linkedin_field_evidence"},
-        "evidence_url": {"$ref": "#/$defs/url"},
-        "evidence_date": {"$ref": "#/$defs/source_date"},
-        "evidence_date_basis": {"enum": ["published", "posted", "updated", "observed_current"]},
-        "evidence_text": {"type": "string", "minLength": 1},
-        "source": {"$ref": "#/$defs/source"},
-        "email": {"type": "string", "format": "email", "minLength": 3},
-        "email_validation": {"$ref": "#/$defs/email_validation"},
-        "phone": {"type": "string", "minLength": 3}
-      }
-    },
     "accepted_company": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["company", "account_fit", "primary_contact", "backup_contacts", "contact_candidate_count", "backup_shortfall"],
+      "required": ["company", "account_fit", "qualification_checks", "intent_details"],
       "properties": {
         "company": {"$ref": "#/$defs/company"},
         "account_fit": {"$ref": "#/$defs/account_fit"},
         "signal_evidence": {"$ref": "#/$defs/signal_evidence"},
         "intent_details": {"type": "string", "pattern": "\\S"},
         "qualification_checks": {"type": "array", "items": {"$ref": "#/$defs/qualification_check"}},
-        "supporting_findings": {"type": "array", "items": {"$ref": "#/$defs/supporting_finding"}},
-        "primary_contact": {"$ref": "#/$defs/contact"},
-        "backup_contacts": {"type": "array", "items": {"$ref": "#/$defs/contact"}},
-        "contact_candidate_count": {"type": "integer", "minimum": 1},
-        "backup_shortfall": {"type": "integer", "minimum": 0}
+        "supporting_findings": {"type": "array", "items": {"$ref": "#/$defs/supporting_finding"}}
       }
     },
     "candidate": {
@@ -710,11 +518,6 @@ top-level result list or hide rejected/unresolved rows in a count.
       "properties": {
         "company": {"type": ["string", "null"]},
         "domain": {"type": ["string", "null"]},
-        "requested_role": {"type": ["string", "null"]},
-        "full_name": {"type": ["string", "null"]},
-        "current_title": {"type": ["string", "null"]},
-        "email": {"type": ["string", "null"]},
-        "email_validation": {"anyOf": [{"$ref": "#/$defs/email_validation"}, {"type": "null"}]},
         "signal": {"type": ["string", "null"]},
         "evidence_url": {"anyOf": [{"$ref": "#/$defs/url"}, {"type": "null"}]},
         "provider": {"type": ["string", "null"]},
@@ -723,14 +526,14 @@ top-level result list or hide rejected/unresolved rows in a count.
       }
     },
     "reason_code": {
-      "enum": ["explicit_exclusion", "not_icp_fit", "stale_signal", "missing_account_evidence", "invalid_evidence_url", "invalid_evidence_date", "search_result_only", "profile_only", "duplicate_domain", "identity_conflict", "missing_name", "missing_current_title", "role_mismatch", "current_role_unverified", "company_mismatch", "missing_contact_evidence", "stale_contact_evidence", "duplicate_contact", "missing_email", "email_invalid", "email_validation_unresolved", "no_current_role_contact", "contact_target_shortfall", "route_not_connected", "budget_exhausted", "timeout_unknown", "provider_status", "gate_not_reached"]
+      "enum": ["explicit_exclusion", "not_icp_fit", "stale_signal", "missing_account_evidence", "invalid_evidence_url", "invalid_evidence_date", "search_result_only", "profile_only", "duplicate_domain", "identity_conflict", "company_mismatch", "route_not_connected", "budget_exhausted", "timeout_unknown", "provider_status", "gate_not_reached"]
     },
     "outcome_row": {
       "type": "object",
       "additionalProperties": false,
       "required": ["stage", "reason_code", "reason_text", "candidate"],
       "properties": {
-        "stage": {"enum": ["account", "contact", "route"]},
+        "stage": {"enum": ["account", "route"]},
         "reason_code": {"$ref": "#/$defs/reason_code"},
         "reason_text": {"type": "string", "minLength": 1},
         "candidate": {"$ref": "#/$defs/candidate"},
@@ -748,7 +551,7 @@ top-level result list or hide rejected/unresolved rows in a count.
       "required": ["route_id", "phase", "hypothesis", "provider", "operation", "request_summary", "pilot_max_rows", "paid_calls", "rows_returned", "rows_usable", "provider_status", "cost_credits"],
       "properties": {
         "route_id": {"type": "string", "minLength": 1},
-        "phase": {"enum": ["account_discovery", "account_verification", "contact_discovery", "contact_verification", "email_validation"]},
+        "phase": {"enum": ["account_discovery", "account_verification"]},
         "hypothesis": {"type": "string", "minLength": 1},
         "provider": {"enum": ["deepline", "scrapingdog", "public_web"]},
         "operation": {"type": "string", "minLength": 1},
@@ -769,7 +572,6 @@ top-level result list or hide rejected/unresolved rows in a count.
         "request_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "progress_before": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "status_read": {"type": "boolean"},
-        "contact_ref": {"type": "string", "minLength": 1},
         "entity_type": {"type": "string", "minLength": 1},
         "error": {"type": "string", "minLength": 1}
       }
@@ -791,10 +593,9 @@ top-level result list or hide rejected/unresolved rows in a count.
       "required": ["id", "scope", "description", "provider", "paid_calls", "cost_upper_bound_credits"],
       "properties": {
         "id": {"type": "string", "minLength": 1},
-        "phase": {"enum": ["account_discovery", "account_verification", "contact_discovery", "contact_verification", "email_validation"]},
+        "phase": {"enum": ["account_discovery", "account_verification"]},
         "approach": {"type": "string", "minLength": 1},
         "status_read": {"type": "boolean"},
-        "contact_ref": {"type": "string", "minLength": 1},
         "operation": {"type": "string", "minLength": 1},
         "tool": {"type": "string", "minLength": 1},
         "request_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
@@ -822,13 +623,12 @@ top-level result list or hide rejected/unresolved rows in a count.
       "required": ["route_id", "phase", "provider", "operation", "request_summary", "state", "reason"],
       "properties": {
         "status_read": {"type": "boolean"},
-        "contact_ref": {"type": "string", "minLength": 1},
         "scope": {"type": "string", "minLength": 1},
         "approach": {"type": "string", "minLength": 1},
         "request_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "entity_type": {"type": "string", "minLength": 1},
         "route_id": {"type": "string", "minLength": 1},
-        "phase": {"enum": ["account_discovery", "account_verification", "contact_discovery", "contact_verification", "email_validation"]},
+        "phase": {"enum": ["account_discovery", "account_verification"]},
         "provider": {"enum": ["deepline", "scrapingdog", "public_web"]},
         "operation": {"type": "string", "minLength": 1},
         "request_summary": {"type": "string", "minLength": 1},
@@ -906,24 +706,6 @@ top-level result list or hide rejected/unresolved rows in a count.
         "source_preferences": {"type": "array", "items": {"type": "string", "minLength": 1}}
       }
     },
-    "contact_role_groups": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["primary", "secondary"],
-      "properties": {
-        "primary": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
-        },
-        "secondary": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
-        }
-      }
-    },
     "time_window": {
       "type": "object",
       "additionalProperties": false,
@@ -953,7 +735,7 @@ top-level result list or hide rejected/unresolved rows in a count.
     "request_snapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["target_count", "icp", "buying_signals", "requested_roles", "time_window", "contact_fields", "budget"],
+      "required": ["target_count", "icp", "buying_signals", "time_window", "budget"],
       "properties": {
         "original_text": {"type": "string", "minLength": 1, "description": "Original sourcing request supplied by the launcher and preserved unchanged on resume."},
         "target_count": {"type": "integer", "minimum": 1},
@@ -970,13 +752,7 @@ top-level result list or hide rejected/unresolved rows in a count.
         },
         "buying_signals": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/signal"}},
         "signal_match_mode": {"enum": ["any", "all"], "default": "any"},
-        "requested_roles": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-        "contact_role_groups": {"$ref": "#/$defs/contact_role_groups"},
-        "min_contacts_per_company": {"type": "integer", "minimum": 1, "default": 1},
-        "target_contacts_per_company": {"type": "integer", "minimum": 1},
-        "contacts_per_company": {"type": "integer", "minimum": 1},
         "time_window": {"$ref": "#/$defs/time_window"},
-        "contact_fields": {"type": "array", "uniqueItems": true, "items": {"enum": ["email", "phone"]}, "default": ["email"]},
         "budget": {"$ref": "#/$defs/input_budget"},
         "run_id": {"type": "string"},
         "as_of_date": {"$ref": "#/$defs/date"}
@@ -1080,13 +856,10 @@ top-level result list or hide rejected/unresolved rows in a count.
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["target_count", "accepted_companies", "accepted_contacts", "backup_contacts", "rejected_rows", "unresolved_rows"],
+      "required": ["target_count", "accepted_companies", "rejected_rows", "unresolved_rows"],
       "properties": {
         "target_count": {"type": "integer", "minimum": 1},
         "accepted_companies": {"type": "integer", "minimum": 0},
-        "accepted_contacts": {"type": "integer", "minimum": 0},
-        "backup_contacts": {"type": "integer", "minimum": 0},
-        "contact_coverage": {"type": "object", "description": "Derived minimum/target per company, contact total, companies at each threshold, and contact target shortfall among accepted companies."},
         "rejected_rows": {"type": "integer", "minimum": 0},
         "unresolved_rows": {"type": "integer", "minimum": 0}
       }
@@ -1104,23 +877,20 @@ it unchanged on resume. New runs default `request.max_duration_seconds` to null 
 An explicit user limit uses a positive number of seconds; no deadline uses
 null. Older saved requests without a limit keep their original contract on resume.
 The limit includes discovery,
-retries and verification, not just paid tool execution. At expiry, stop sourcing
+retries and qualification, not just paid tool execution. At expiry, stop sourcing
 and finish the necessary persistence and delivery checks. Never promise that an
 already dispatched provider call can be cancelled; retain its reservation/result.
 
 Maintain `stop_check.next_actions` separately from historical attempt receipts.
 Each entry names a concrete, useful next test, with a unique `id`, `description`,
 `scope`, `provider`, `paid_calls` and conservative `cost_upper_bound_credits`.
-For an email-validation action, also set `entity_type: "email_validation"`,
-matching its adapter request so the protected verification balance is usable.
 Use `scope: "discovery"` for finding additional companies and the canonical
-domain for each unresolved account/contact (or its normalized `name:` key when
-no domain exists). Cover discovery and active company checks. A company can be
+domain for each unresolved account (or its normalized `name:` key when no domain
+exists). Cover discovery and active company checks. A company can be
 parked without another action when its latest substantive attempt is `ok` or
 `no_results`, its frontier entry is `exhausted` with a reason and exhaustion
 basis, and every unresolved `reason_text` for it records the remaining gaps.
-Account gaps require an account discovery/verification review; contact gaps
-require a contact discovery/verification or email-validation review. Retain all
+Account gaps require an account discovery/verification review. Retain all
 receipts and qualification checks. Parking does not qualify or reject a company,
 hide an actionable frontier entry, or establish whole-run exhaustion.
 Remove speculative follow-ups; reopen for a concrete new source, verification
@@ -1132,8 +902,8 @@ The attempt helper adds optional audit metadata without changing client output:
 milestones. Two comparable research attempts within the same scope and phase
 without new verified milestones require a different approach. A provider switch
 or version label such as `-v117` is not a strategy change. Other companies' progress
-does not reset a company's research. Distinct profile/email verification targets
-and advancement to another phase remain eligible without renaming the approach.
+does not reset a company's research. Distinct company evidence targets and advancement to another phase remain
+eligible without renaming the approach.
 Request fingerprints still protect against duplicate or uncertain paid calls;
 use saved receipts and status continuations rather than resubmitting them.
 Actionable frontier entries must retain a matching next action or continuation;
@@ -1142,8 +912,8 @@ covering only the generic discovery scope cannot hide an untried research path.
 Before a shortfall, refresh live tool discovery for both new companies and
 missing evidence. Include public/free alternatives, not only paid providers.
 Do not repeat a failed identical lookup, spend solely to consume the cap, or
-invent a blocker from a missing headcount, rejected company, or failed email.
-Try another relevant identifier, source family, buyer, or company as appropriate.
+invent a blocker from a missing headcount or rejected company.
+Try another relevant identifier, source family, or company as appropriate.
 
 An action that cannot run may carry `blocker` with `kind` (`approval_required`,
 `access_unavailable`, or `required_input`), the concrete `reason`, and an
@@ -1174,13 +944,10 @@ qualification checks marked unknown remain account-unresolved. A current
 
 Before recording `approval_required`, apply the
 [authorization rules](../SKILL.md#authorization) and check the current request,
-prior user approvals, and trusted application job context. A contact email or
-change of provider is not itself a missing approval. Cite the exact applicable
+prior user approvals, and trusted application job context. A change of provider is not itself a missing approval. Cite the exact applicable
 instruction or actual runtime denial and preserve its source in the report;
 an agent-authored blocker is not proof of a platform refusal. On resume, remove
-resolved blockers from next actions while retaining historical receipts. An
-email-validation denial does not block company discovery or other permitted
-work. The validator checks the recorded blocker structure and references; it
+resolved blockers from next actions while retaining historical receipts. A provider denial does not block other permitted company research. The validator checks the recorded blocker structure and references; it
 cannot independently verify user authorization or a runtime denial.
 
 The attempt and review helpers return the current stop decision; use that result.
@@ -1192,7 +959,7 @@ When an execution ledger is present, this uses the same shared-USD and
 verification-allowance calculation as dispatch. Eligibility is a snapshot;
 the adapter must still reserve atomically before sending the call. Decisions:
 
-- `target_met`: requested company count reached and every accepted company meets its contact target. For historical requests without minimum/target fields, retain company-count stopping.
+- `target_met`: requested company count reached.
 - `time_limit_reached`: the saved default or user-specified duration expired, or research
   has closed `stop_check.closing_seconds` before it so an open model turn can end and report
   its usage. The deadline itself does not move. Target takes precedence if already reached.
@@ -1233,10 +1000,10 @@ and run the check again. A correct explanation of a failed stopping check does
 not satisfy it. Context checkpoints preserve work so execution can resume;
 they do not create a new start time, budget, or stop reason.
 
-Dispatch validates the affected company's account gate before contact work;
+Dispatch validates the affected company's account gate before acceptance;
 an unrelated draft row must not block discovery, catalog reads or another
 qualified company. Full delivery validation still checks every row, all accepted
-lead requirements, exclusions, receipts and financial accounting. Do not remove
+company requirements, exclusions, receipts and financial accounting. Do not remove
 missing evidence merely to make a draft pass.
 
 Full validator output includes `stop_decision` (the computed decision and eligible
@@ -1260,62 +1027,26 @@ Honor explicit user cancellation and platform limits independently of sourcing.
 
 The following semantic checks supplement JSON Schema: every signal's
 `min_age_days` must be no greater than its `max_age_days` when both are
-present; every accepted contact's
-`domain` must equal its accepted company domain; `contact_candidate_count` must
-equal one plus the number of backups; `backup_shortfall` must equal
-`max(0, target_contacts_per_company - complete_contact_count)` (using the legacy alias and candidate count for old runs); each accepted
-account domain must be unique; `account_fit` must support ICP fit;
-when the request requires intent, `signal_evidence` must support a requested
-signal under `signal_match_mode` and its applicable bounds. When intent is
-optional (every saved signal explicitly preferred), missing intent does not block
-qualification or export. Leave `signal_evidence` absent when no requested signal
-is verified. `Signals` may still contain sourced supporting findings, with background
-facts labeled as context; leave it empty when neither is available. Describe any conditional use case in `intent_details`, grounded
-in `account_fit` evidence and explicitly identified as inference. Do not create a
-signal from a hypothesis. Legacy request metadata and receipts remain unchanged.
-If an old signal label differs from a requested kind, explicitly map that
-existing check through `requirement_ref` and review its evidence; never guess
-synonyms or bypass current source and date checks.
-Never use this fallback for a required signal. Evidence URLs and sources
-may differ. Follow the [qualification policy](workflow-rules.md#qualification-policy)
-to corroborate the same project across sources: use the dated activity in
-`signal_evidence`, retain technical corroboration in the relevant
+present; each accepted account domain must be unique; `account_fit` must support
+ICP fit; when the request requires intent, `signal_evidence` must support a
+requested signal under `signal_match_mode` and its applicable bounds. When
+intent is optional (every saved signal explicitly preferred), missing intent
+does not block qualification or export. Leave `signal_evidence` absent when no
+requested signal is verified. `Signals` may still contain sourced supporting
+findings, with background facts labeled as context; leave it empty when neither
+is available. Describe any conditional use case in `intent_details`, grounded
+in `account_fit` evidence and explicitly identified as inference. Do not create
+a signal from a hypothesis. Legacy request metadata and receipts remain
+unchanged. If an old signal label differs from a requested kind, explicitly map
+that existing check through `requirement_ref` and review its evidence; never
+guess synonyms or bypass current source and date checks. Never use this fallback
+for a required signal. Evidence URLs and sources may differ. Follow the
+[qualification policy](workflow-rules.md#qualification-policy) to corroborate
+the same project across sources: use the dated activity in `signal_evidence`,
+retain technical corroboration in the relevant
 `qualification_checks[].evidence` arrays, and explain the linkage in
-`intent_details`. Keep each source's own date and attribution. Contact evidence must
-explicitly support a current role at that company; `approved_family` must be
-within the full user-approved role family and never an unapproved adjacent
-function; every accepted contact's `requested_role` must be in
-`request.requested_roles`; and contact fields must be absent unless requested
-by the effective field set, which defaults to email. Every accepted primary
-must contain every requested field. Every stored email, including an email on
-a backup, must have an `email_validation` receipt for the same address. Its
-source must identify Deepline and ZeroBounce, link to the matching
-`email_validation` route, use the same dynamically discovered tool,
-and record explicit `valid`, or `catch-all`/`unknown` with one nested `fallback`
-receipt for the same address. A service failure instead records `status: null`
-and `provider_status` equal to the failed execution route: `provider_error`,
-`timeout`, `rate_limited`, `auth_failed`, or `quota_exceeded`. It may use the
-same single fallback. `schema_error`, `config_error`, missing receipts, and
-unrecognized verdicts are ineligible. Non-failure ZeroBounce receipts still
-require an `ok` or `partial` route. The fallback requires Deepline/BounceBan, API
-`status: success` and `result: deliverable` after trimming/case normalization.
-It must link to a distinct later successful paid email-validation route with
-exactly one paid call. Preserve the original ZeroBounce status. Never allow
-fallback for invalid, do_not_mail, spamtrap, abuse, or unfamiliar verdicts;
-never chain fallbacks. A risky/unknown fallback stays unresolved;
-an undeliverable fallback is rejected. Keep the candidate and both receipts
-in unresolved/rejected outcomes, outside the verified workbook and target
-count. The failed ZeroBounce route and its cost reservation remain in the
-audit after successful fallback; a failure alone never accepts an email.
-Validate `primary_contact` and every item in `backup_contacts` with
-the same role and role-group rules. When
-`request.contact_role_groups` is present, its `primary` and
-`secondary` arrays must have `request.requested_roles` as their deduplicated
-union. Search and rank primary roles before secondary roles, but a valid
-secondary-role contact remains eligible when no primary-role contact passes;
-it must not create a false negative. If `role_group` is present, it must match
-the group containing `requested_role`; omit it when the group is unknown or
-the legacy request has no role groups. When
+`intent_details`. Keep each source's own date and attribution.
+When
 `qualification_checks` is present, required checks with `fail` reject the
 account, required checks with `unknown` make it unresolved, and preferred
 checks do not reject an account. A check with `unknown` must not be rewritten
@@ -1368,7 +1099,7 @@ limit are invalid.
 
 For new actual-cost runs, an explicit `max_deepline_credits_per_next_lead`
 is a stopping threshold on observed charges. Calls already running can exceed it;
-unknown billing pauses paid work. No verification money is reserved.
+unknown billing pauses paid work. No money is reserved for future research.
 
 For historical version 1 ledgers, the optional
 `max_deepline_credits_per_next_lead` is a hard cap only when explicitly requested. Do not insert it by default or change saved caps. When active, every paid Deepline route must
@@ -1379,9 +1110,7 @@ cost cannot prove the allowance and is invalid while the guard is active. The
 sum at each dispatch must include all earlier costs at that count or higher
 and must not exceed the configured allowance. Route changes,
 rejections, and failed lookups do not change the count; only a fully accepted
-lead advances it. Acceptance uses the requested contact fields and preserves
-explicit email opt-outs; any stored email must pass the email gate. Before a paid
-Deepline execution, the agent must add its conservative cost upper bound to
+lead advances it. Before a paid Deepline execution, the agent must add its conservative cost upper bound to
 the amount already charged at the current count or higher and must not run the call if
 the sum would exceed the allowance. The shared
 [paid-call ledger](adapter-io.md#paid-call-budget) enforces this cap before
@@ -1400,13 +1129,12 @@ locally captured base LLM estimates. Old ledgers retain hard reservation limits.
 `validate_run.py` derives this warning without modifying the run or its verdict.
 Unmarked or unbounded costs are reported as incomplete, never zero.
 
-The same progress output separates unresolved account evidence, contact
-completion, and provider/route failures using the existing stage and reason
-fields. It deduplicates companies and excludes accepted-company backup shortfalls.
-Contact-stage rows must retain their passing account `qualification_checks`;
-their `reason_text` must say what contact evidence is missing and the next action
-or concrete blocker. Do the same for account-stage evidence gaps. The agent uses
-these groups in the report; only complete accepted contacts enter `leads.xlsx`.
+The same progress output separates unresolved account evidence and
+provider/route failures using the existing stage and reason fields. It
+deduplicates companies. Account-stage rows must retain their
+`qualification_checks`; their `reason_text` must say what company evidence is
+missing and the next action or concrete blocker. The agent uses these groups in
+the report; only complete accepted companies enter `leads.xlsx`.
 
 Every version `1.1` or `1.2` route has `cost_credits`,
 `cost_upper_bound_credits`, and `cost_basis`. Use these combinations:
@@ -1436,8 +1164,9 @@ route. The overall status is `unknown` if any paid route is unknown,
 `estimated_range` if at least one paid route is estimated, and `exact`
 otherwise. Convert Deepline credits at the configured fixed rate of `$0.10`
 per credit. Keep ScrapingDog in credits because no dollar rate is configured.
-`accepted_leads` equals `summary.accepted_contacts`; divide Deepline dollars by
-that value for cost per lead, or use `null` when it is zero. Round derived
+For active company-only runs, the denominator is `summary.accepted_companies`;
+divide Deepline dollars by that value for cost per accepted company, or use
+`null` when it is zero. Historical artifacts retain their saved field names. Round derived
 dollar values to four decimal places. OpenRouter is not used by this skill, and
 Codex model cost is not part of direct provider cost.
 
@@ -1488,9 +1217,9 @@ requirements, not new `results.json` fields or workbook columns.
 - Persist `started_at` from the system clock before the first discovery or
   provider call. Use an ISO 8601 timestamp with a timezone. Preserve it across
   resumptions; do not infer it from file creation/modification or `retrieved_at`.
-- Record `leads_ready_at` when the target's final fully qualified lead is saved,
-  including requested contact fields and validation. Leave it unavailable for
-  a shortfall. This is distinct from total run completion.
+- Record `leads_ready_at` when the target's final fully qualified company is
+  saved. Leave it unavailable for a shortfall. This is distinct from total run
+  completion.
 - Record `completed_at` after result validation, workbook export and checks.
   Calculate `elapsed_seconds = completed_at - started_at` and display total
   elapsed time in minutes/seconds. Also show time to `leads_ready_at` when known.
@@ -1502,43 +1231,38 @@ requirements, not new `results.json` fields or workbook columns.
   runtime is unavailable or explicitly label a known-interval estimate with its
   boundaries. Never present a reconstructed interval as full runtime.
 
-### Accepted-lead sources
+### Accepted-company sources
 
 Maintain one report row per final accepted company, keyed by canonical domain:
 
-| Company / domain | Company discovery | Fit evidence | Intent evidence | Buyer role | Email lookup | Email validation |
-| --- | --- | --- | --- | --- | --- | --- |
+| Company / domain | Company discovery | Fit evidence | Intent evidence |
+| --- | --- | --- | --- |
 
 For each stage, identify the provider, underlying tool when returned, and route
 ID linking to the saved receipt. Include the original evidence URL for public
 sources. Distinguish the discovery channel (for example ScrapingDog Google
 search) from the publisher that proves intent (for example a company release).
-Deepline is the gateway; name the actual finder or validator when known. A
-publicly published email is sourced to that page, not to ZeroBounce. Preserve
-both validation tools when fallback was used. Mark missing attribution unknown;
-do not invent it or make another paid call solely to label it.
+Deepline is the gateway; name the actual company tool when known. Mark missing
+attribution unknown; do not invent it or make another paid call solely to label
+it.
 
 In `tyche_review`, select `company.discovery_source: {ref}` from the original
-account-discovery result and `primary_contact.email_source: {ref}` (or the
-backup contact's equivalent) from the chosen finder or published page. Code
-preserves the selected result index, provider/tool, receipt link and source URL.
-`email_ref` separately selects the validation verdict. Reuse these saved fields
-when patching a lead; changing its email clears the previous attribution.
+account-discovery result. Code preserves the selected result index,
+provider/tool, receipt link and source URL. Reuse these saved fields when
+patching a company.
 
 For a non-signal check of a requested company attribute, a saved Aviato funding
 result may have `url: null`. Its helper-supplied `source.result_index` selects the
 raw receipt record. Validation requires a successful receipt bound to this run
 and company, with the original funding stage, announcement date and text. Put
 interpretation in `claim`; code does not decide whether the stage satisfies the
-request. This exception does not apply to account-fit, contact or signal evidence.
+request. This exception does not apply to account-fit or signal evidence.
 
-Summarize the number of accepted companies first discovered by each channel/tool
-and accepted emails supplied by each finder or public source, plus validation
-counts. Assign one original discovery source and one selected email source per
-lead so these two totals each reconcile to the accepted count (use unknown or
-not requested where needed). Evidence and validation counts may overlap and
-must be labeled accordingly. Keep failed/unused routes and their costs separate
-from accepted-lead contribution. Counts alone do not establish provider accuracy
+Summarize the number of accepted companies first discovered by each channel/tool.
+Assign one original discovery source per company so the total reconciles to the
+accepted count (use unknown where needed). Evidence counts may overlap and must
+be labeled accordingly. Keep failed/unused routes and their costs separate from
+accepted-company contribution. Counts alone do not establish provider accuracy
 or comparative yield without the corresponding attempted-candidate denominator.
 
 ### Final-response checklist
@@ -1552,129 +1276,91 @@ Before sending the final chat response, verify it contains all four items:
 
 1. **Result and files:** accepted count versus target, workbook delivery and a
    report link for per-company attribution.
-2. **Sources Used:** name the company-discovery tools, fit/signal and buyer-role
-   evidence sources, email finder and email validator directly in chat. Include
-   accepted-company discovery counts, selected-email source counts and validation
-   counts. Name underlying tools, not just their gateway. Distinguish evidence
-   publishers from discovery tools; mark unknown or not-requested stages explicitly.
+2. **Sources Used:** name the company-discovery tools and fit/signal evidence
+   sources directly in chat. Include accepted-company discovery counts. Name
+   underlying tools, not just their gateway. Distinguish evidence publishers
+   from discovery tools; mark unknown stages explicitly.
 3. **Runtime and full cost:** total elapsed time, provider spend, LLM cost,
-   combined total and cost per accepted lead from saved run accounting. Distinguish
+   combined total and cost per accepted company from saved run accounting. Distinguish
    billed spend, unresolved reservations and model estimates; exclude monitoring.
    Label unknown amounts explicitly; provider-only spend is not the full sourcing cost.
-4. **Caveats:** material limitations and any target/contact shortfall; state none
-   when there are none.
+4. **Caveats:** material limitations and any company-target shortfall; state
+   none when there are none.
 
 A report link alone does not satisfy Sources Used. Check timing arithmetic and
 source-count reconciliation against the saved receipts. This is a final-answer
 self-check, not an additional sourcing step or a JSON-validator guarantee.
 
-## LinkedIn location and company size
+## LinkedIn company size
 
-Retrieve the exact matched company and person LinkedIn profiles through
-HarvestAPI via Deepline. Discover/describe the current company/profile getters,
-execute through the existing budgeted attempt helper, and reuse matching saved
-receipts. Search results and another provider's estimates cannot replace these
-field sources.
+Retrieve the exact matched company LinkedIn profile through HarvestAPI via
+Deepline. Discover/describe the current company getter, execute through the
+existing budgeted attempt helper, and reuse matching saved receipts. Search
+results and another provider's estimates cannot replace this field source.
 
 - Save LinkedIn `employeeCountRange` as `company.employee_range`, e.g. `11-50`
   or `10001+`. LinkedIn is authoritative for company size. Do not use
   `employeeCount` (associated member profiles), an exact headcount, or a range
   endpoint for qualification or export. Compare the whole range with the saved
   ICP: full containment passes, no overlap fails, partial overlap stays unknown.
-- Use the person's own `location.parsed.countryFull`/`country`, `state`, and
-  `city`; retain `location.linkedinText` and country codes from the response.
-  Use the response's country code when its parsed country is missing; leave
-  city/state blank when the response has no structured values for them.
-  Never substitute employment location, company headquarters, profile language,
-  or a guessed city for the person's location. Country is required for every
-  accepted primary/backup contact; populate city and state whenever supported.
-- Save `company.employee_range_evidence` and each contact's `location_evidence`
-  using `evidence_url`, `evidence_date`, `evidence_date_basis: observed_current`,
-  `evidence_text`, and `source: {provider: deepline, operation: execute, tool,
-  route_id}`. Keep the original range/location wording in the text. The URL must
-  match the corresponding LinkedIn entity and the route must be a successful
-  HarvestAPI company/profile getter. Missing facts or evidence stay unresolved.
-- A search result's `linkedin.com/in/ACoAA…` member id identifies the person
-  for the profile getter and nothing else. Save and deliver the public profile
-  URL that getter returns (`linkedinUrl` with a `publicIdentifier`), which the
-  delivery recheck matches to the saved contact by entity, name, current title
-  and employer. A member id, another page or a mismatched profile in the saved
-  link is refused at validation and delivery: nothing exports until the saved
-  record is corrected or the lead leaves the confirmed set.
+- Save `company.employee_range_evidence` using `evidence_url`, `evidence_date`,
+  `evidence_date_basis: observed_current`, `evidence_text`, and `source:
+  {provider: deepline, operation: execute, tool, route_id}`. Keep the original
+  range wording in the text. The URL must match the company LinkedIn entity and
+  the route must be a successful HarvestAPI company getter. Missing facts or
+  evidence stay unresolved.
 
-These fields are required independently of email/phone opt-outs.
-Review acceptance fills missing range/location values from the matching saved
-HarvestAPI response. Supplied values must agree; city/state stay blank when the
-response does not support them. The same receipt check runs during strict
+Review acceptance fills a missing range from the matching saved HarvestAPI
+response. A supplied value must agree. The same receipt check runs during strict
 validation and workbook export, reading the captured provider body rather than
 reviewer-written evidence text. It verifies the entity, run and request identity
-without another provider call. Keep `receipts/<route_id>.json` with the run.
-Old saved runs may need enrichment or receipt reconciliation before re-export;
-do not invent evidence, change their requests, or overwrite historical files to
+without another provider call. Keep `receipts/<route_id>.json` with the run. Old
+saved runs may need enrichment or receipt reconciliation before re-export; do
+not invent evidence, change their requests, or overwrite historical files to
 make them pass. Library-only structural checks without a run path are not a
 delivery gate; use the full strict validator CLI before delivery.
 
 ## `leads.xlsx` contract
 
-For version `1.2`, write a workbook with `Leads` and `Sources` worksheets.
-The first row of `Leads` is the fixed, ordered 19-column header:
+For version `2.0`, write a workbook with `Companies` and `Sources` worksheets.
+The first row of `Companies` is the fixed, ordered 11-column header:
 
 ```text
-Name,Email,Role,Company,LinkedIn,Website,Company LinkedIn,Industry,Sub Industry,Contact City,Contact State,Contact Country,HQ State,HQ Country,Company Employee Range,Description,Signals,Intent Details,Phone
+Company,Website,Company LinkedIn,Industry,Sub Industry,HQ State,HQ Country,Company Employee Range,Description,Signals,Intent Details
 ```
 
-Versions `1.0` and `1.1` keep their single `Leads` worksheet, 18-column
-layout (without `Signals`), and labelled signal/date/details/source text
-in `Intent Details`, with the same clarified location/range headers on new exports.
-Do not silently migrate or overwrite historical runs.
+Keep `signal_evidence.signal` and qualification signal tags in structured
+results; the client sheet displays their types inside `Signals`.
 
-Keep `signal_evidence.signal` and qualification signal tags in structured results;
-the client sheet displays their types inside `Signals` instead of a separate
-`Intent Signal` column.
-
-`Leads` contains one row per complete contact, including the primary contact and
-all complete additional contacts. Keep accepted-company order and group each
-company's contacts together, primary first. Repeat company details unchanged on
-every row; only contact fields vary. Do not create a separate `Contacts` sheet.
-For example, 15 companies with 3 complete contacts each produce 45 `Leads` rows.
-Company uniqueness and sourcing targets still use canonical domain; workbook
-rows represent distinct contacts within those companies. Pending contacts,
-rejected/unresolved companies and route outcomes are not lead rows.
-Keep the existing `Sources` sheet and include each additional contact's role and
-location evidence. Verify every saved row against the validated values before
-delivery. In these mappings, `contact` is the row's `primary_contact` or complete
-item from `backup_contacts`:
+`Companies` contains one row per accepted company in accepted-company order.
+Rejected and unresolved companies and route outcomes are not company rows. Keep
+the existing `Sources` sheet and include company fit, signal, employee-range and
+qualification-check evidence. Verify every saved row against the validated
+values before delivery.
 
 | Workbook column | `results.json` source |
 |---|---|
-| `Name` | `contact.full_name` |
-| `Email` | validated `contact.email`, otherwise blank |
-| `Role` | `contact.current_title` |
 | `Company` | `company.canonical_name` |
-| `LinkedIn` | `contact.linkedin_url`, the public profile URL the saved profile getter returned for this person. For an older record without it, `contact_url` stands in when it is itself a LinkedIn profile page, otherwise the profile URL of the contact's receipt-validated `location_evidence`. A member id (`linkedin.com/in/ACoAA…`) is lookup input and is never delivered. A contact whose profile was not fetched, whose link is not that profile, or whose identity does not match its receipt is refused at validation and delivery: the run does not export until the record is corrected or the lead leaves the confirmed set, and the partial export reports the shortfall |
 | `Website` | Direct company URL normalized against `company.domain`; recognized LinkedIn wrappers are unwrapped, and mismatched destinations require correction. |
 | `Company LinkedIn` | `company.linkedin_url`, otherwise blank |
-| `Industry` | `company.industry`, required canonical label for version `1.2` |
-| `Sub Industry` | `company.sub_industry`, required canonical child for version `1.2` |
-| `Contact City` | `contact.city`, otherwise blank |
-| `Contact State` | `contact.state`, otherwise blank |
-| `Contact Country` | required `contact.country` from LinkedIn through HarvestAPI |
+| `Industry` | `company.industry`, required canonical label for version `2.0` |
+| `Sub Industry` | `company.sub_industry`, required canonical child for version `2.0` |
 | `HQ State` | `company.hq_state`, otherwise blank |
 | `HQ Country` | `company.hq_country`, otherwise blank |
 | `Company Employee Range` | required `company.employee_range` from LinkedIn through HarvestAPI |
 | `Description` | required `company.description`, exactly two factual sentences |
 | `Signals` | Passed requested signal checks plus optional `supporting_findings`; context/activity labels, factual claims, dates and source URLs; older independent primary signals remain supported |
 | `Intent Details` | `intent_details`, a natural paragraph explaining the activity, its context and why the company matters now |
-| `Phone` | `contact.phone`, otherwise blank |
 
 Save supported company headquarters in `company.hq_state` and `company.hq_country`.
-If the getter omits headquarters, reuse explicit headquarters evidence from the existing
-qualification checks. Do not substitute a contact location or press dateline; unknown
-values remain blank and do not introduce an additional qualification gate.
+If the getter omits headquarters, reuse explicit headquarters evidence from the
+existing qualification checks. Do not substitute an activity location or press
+dateline; unknown values remain blank and do not introduce an additional
+qualification gate.
 
-Rejected/unresolved rows, pending contact profiles and provider receipts remain in
-`results.json` and `report.md`. `Sources` contains the accepted company's fit,
-signal, primary-role, contact-location, employee-range and qualification-check evidence, with
+Rejected/unresolved rows and provider receipts remain in `results.json` and
+`report.md`. `Sources` contains the accepted company's fit, signal,
+employee-range and qualification-check evidence, with
 readable excerpts (at most 2,000 characters) and unchanged source URLs. Select the
 supporting passage using the existing evidence `text` field, retaining material
 qualifiers and dates; do not copy unrelated page chrome. The selected receipt must
@@ -1699,8 +1385,8 @@ It does not infer event dates. Dated signals with an age bound require this
 activity date separately from source publication; a recap cannot renew an old
 event. The entire known period must fit the requested window, otherwise retain
 the signal as unknown or obtain narrower evidence. Older saved dated signals
-without `event_date` need review of their existing sources before resuming contact
-work or delivery; do not backfill the publication date automatically. For current-state evidence,
+without `event_date` need review of their existing sources before resuming
+research or delivery; do not backfill the publication date automatically. For current-state evidence,
 `observed_current` uses the observation date and does not establish event timing,
 duration or acceleration. The LLM chooses the activity meant by the request
 (announcement, opening, etc.) and preserves its status in the claim. Store reviewed requested signals in the existing
@@ -1716,38 +1402,35 @@ findings; no additional finding is required. Deduplicate related facts when writ
 The `Sources` rows for requested signals and supporting findings use
 `Field: Signals`; they also support the factual claims in `Intent Details`.
 
-`Email` and `Phone` are blank unless the
-input requests them and a verified value is available. Generate the file with
-`scripts/export_xlsx.mjs` so the spelling, order, types, and layout stay
-deterministic. Use the harness-provided `@oai/artifact-tool`; it is not a TYCHE
+Generate the file with `scripts/export_xlsx.mjs` so the spelling, order, types,
+and layout stay deterministic. Use the harness-provided `@oai/artifact-tool`; it is not a TYCHE
 project dependency and TYCHE does not install or pin it. When accepted rows
 exist, format the range as an Excel table with filters, hide gridlines, and wrap
 long description and intent text.
-Preserve exact employee counts as numbers, keep ranges as text, and leave
-unverified optional values as empty cells rather than placeholder text.
+Keep employee ranges as text and leave unverified optional values as empty
+cells rather than placeholder text.
 
-### Client writing and taxonomy (version `1.2`)
+### Client writing and taxonomy (version `2.0`)
 
 Finalize once per company before acceptance: reuse the saved sources, then use
 existing account-verification lookups for focused evidence gaps that could materially
 improve ICP-relevant intent. Stay within the run's budget and deadline. There is no
 minimum search count, source count or new-finding requirement. Save useful new facts
-and the narrative together; reuse company prose across all its contacts. Preserve a
-valid description and unchanged confirmed records. If extra research finds nothing,
+and the narrative together. Preserve a valid description and unchanged confirmed
+records. If extra research finds nothing,
 write honestly from existing support and retain the qualified company.
 
-The confirmation packet is the company QA pass: check every included contact,
-company/contact geography, spelling/grammar/capitalization, contradictions, missing
-required values, duplicates, placeholders, truncation and formatting artifacts.
+The confirmation packet is the company QA pass: check company geography,
+spelling/grammar/capitalization, contradictions, missing required values,
+duplicates, placeholders, truncation and formatting artifacts.
 Signals and Intent Details must describe the same supported facts and timing.
 Check required numeric claims against the source's actual entity, metric,
 currency/units and time period; network or group totals do not establish a
-company-specific threshold. Keep an unsupported required metric unresolved,
-preserving verified contacts; omit an unsupported optional number without
-disqualifying the company.
+company-specific threshold. Keep an unsupported required metric unresolved; omit an unsupported optional
+number without disqualifying the company.
 Repair actual errors before confirming; trim spaces and avoid em dashes. The exporter
 also normalizes em dashes and trailing spaces in display text without changing raw
-evidence, receipt-owned identities or source URLs. Optional gaps do not reject a lead;
+evidence, receipt-owned identities or source URLs. Optional gaps do not reject a company;
 hold missing required support for targeted research, and reject only evidenced failure
 of an original requirement. The run's final review retains strict delivery/accounting
 checks; it is not another routine enrichment or rewriting pass.
@@ -1758,7 +1441,7 @@ checks; it is not another routine enrichment or rewriting pass.
   customers, specialization or another useful business detail, typically
   "It serves...". These openings are examples, not fixed templates. Support both
   sentences with account-fit or qualification evidence. Keep signals, inferred
-  needs, contact-validation warnings, scoring and internal diagnostics out of it.
+  needs, scoring and internal diagnostics out of it.
 - Write `intent_details` as one natural paragraph covering every distinct,
   verified signal relevant to the request, including verified preferred signals.
   For each signal, describe what the company did with specific facts and supported
@@ -1839,8 +1522,8 @@ checks; it is not another routine enrichment or rewriting pass.
   Raw provider classifications stay in the saved receipts. Do not import PP's
   heuristic fallback rules or add another AI call to format the output.
 
-The semantic validator enforces these new required fields and taxonomy pairs
-only for version `1.2`; billing and all existing eligibility checks still apply.
+The semantic validator enforces these required fields and taxonomy pairs for
+version `2.0`; billing and all existing eligibility checks still apply.
 The exporter does not write narratives, classify companies, or infer dates.
 
 ## `report.md` minimum contents
@@ -1853,10 +1536,8 @@ The Markdown report is the human audit receipt. Include the normalized request,
 assumptions and as-of date; signal hypotheses and why routes differ; every
 capability search/describe and execute receipt (without secrets); pilot limits,
 rows, duplicates, route cost bases, confirmed and maximum provider credits,
-Deepline dollars and cost per accepted lead, and live provider statuses;
-account and contact gate decisions; primary/backups selection; adaptive
-reserve/refill decisions; all
-accepted, rejected, and unresolved rows with stable reasons; contact target
-shortfalls; the route frontier and call capacity; reviewed-company counts; and
+Deepline dollars and cost per accepted company, and live provider statuses;
+account gate decisions; adaptive reserve/refill decisions; all accepted,
+rejected, and unresolved rows with stable reasons; company target shortfalls; the route frontier and call capacity; reviewed-company counts; and
 the final stop reason. Do not claim a discovery-candidate endpoint ran, and do
 not include raw provider payloads or credentials.

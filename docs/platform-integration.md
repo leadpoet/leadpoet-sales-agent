@@ -18,7 +18,7 @@ User request + budget
 
 Codex owns sourcing decisions. Your backend owns customer authentication,
 approved limits, job state, cancellation, recovery, and access to artifacts.
-Keep company qualification, contact validation, and output formats unchanged.
+Keep company qualification and company output formats unchanged.
 
 Three integration changes are needed:
 
@@ -60,9 +60,8 @@ Three integration changes are needed:
 At job submission, persist the customer's authorized sourcing scope and data
 use with the job and supply it as trusted worker context on every start or
 resume. Authorization covers relevant research, enrichment, and validation
-tools using both submitted data and data found during the job, including exact
-work emails sent to ZeroBounce or the eligible BounceBan fallback. Do not ask
-for approval per contact or provider. Honor narrower customer restrictions.
+tools using both submitted data and company evidence found during the job. Do not ask
+for approval per company or provider. Honor narrower customer restrictions.
 The skill's [authorization rules](../.agents/skills/lead-sourcing/SKILL.md#authorization)
 carry this scope through the run; a skill cannot change runtime permissions.
 
@@ -71,9 +70,8 @@ the request, job ID, and approved budget:
 
 ```text
 This job is authorized to use relevant connected research, enrichment, and
-contact-validation tools with data supplied in the request or obtained during
-the job. This includes transmitting exact work emails for ZeroBounce and
-eligible BounceBan validation. Continue within the saved scope and budget
+company-validation tools with data supplied in the request or obtained during
+the job. Continue within the saved scope and budget
 without asking again. Retain this authorization on resume. Complete and
 validate the requested deliverables, or record a concrete terminal blocker
 after exhausting permitted alternatives.
@@ -115,7 +113,7 @@ total-cost cap.
 Before launch, verify that a job produces validated downloads, customers
 cannot access each other's jobs, cancellation prevents new paid calls, and
 concurrent calls or crash recovery cannot reuse a reservation or bypass a cap.
-Include an unattended acceptance run that discovers an email, validates it,
+Include an unattended acceptance run that discovers a company, qualifies it,
 survives a worker resume with authorization and budget intact, and exposes the
 validated downloads without a permission prompt. Also verify that a denied
 route finishes with a concrete saved reason while unaffected work continues.

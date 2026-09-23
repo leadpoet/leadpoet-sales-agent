@@ -17,6 +17,7 @@ import uuid
 # Standard API-equivalent USD per million tokens, per model, from the official model pages.
 # This is a comparison estimate, never a ChatGPT subscription/credit invoice. A receipt keeps the
 # rates it was written with; a model without a verified row is refused, never priced by analogy.
+# Keep historical rates so saved receipts retain their original cost basis.
 MODEL_PRICING = {
     'gpt-5.6-luna': {'input': '0.20', 'cached_input': '0.02', 'cache_write': '0.25', 'output': '1.20',
                      'source': 'https://developers.openai.com/api/docs/models/gpt-5.6-luna',
@@ -492,12 +493,6 @@ def write_research_report(directory, results, costs, commentary):
         f"Workbook checked: {validation.get('completed_at', 'unavailable')}.",
         f"Time to leads: {elapsed(clock.get('leads_ready_at'))}. Time to checked workbook: {elapsed(validation.get('completed_at'))}.",
         '', '## Research commentary', '', commentary.strip(), '', '## Run-only costs', '']
-    coverage = results.get('summary', {}).get('contact_coverage')
-    if coverage:
-        lines.insert(3, f"Contacts: {coverage['contacts']} across accepted companies. Minimum per company: "
-                     f"{coverage['minimum_per_company']}; target: {coverage['target_per_company']}. "
-                     f"Companies at target: {coverage['companies_at_target']}/{len(accepted)}. "
-                     f"Additional contacts needed for those companies: {coverage['target_shortfall']}.")
     model_cost = ("unavailable (usage not captured or unpriced)" if costs['model_usage_status'] == 'unavailable'
                   else f"${costs['estimated_llm_usd']:.4f}" +
                   (" known estimate; usage incomplete" if costs['model_usage_status'] == 'incomplete' else ""))
@@ -509,18 +504,16 @@ def write_research_report(directory, results, costs, commentary):
         lines += [f"- Provider budget held: ${costs['held_provider_usd']:.4f}; total charged/held plus model: ${costs['budget_total_usd']:.4f}."]
     lines.extend('- ' + note for note in costs.get('missing', []) + costs.get('limitations', []))
     lines += ['', 'Full numeric receipts: [run-costs.json](run-costs.json).', '', '## Accepted-lead sources', '',
-              '| Company / domain | Discovery | Fit | Intent | Buyer role | Email lookup | Validation |',
-              '| --- | --- | --- | --- | --- | --- | --- |']
-    counts = {kind: {} for kind in ('discovery', 'email', 'validation')}
+              '| Company / domain | Discovery | Fit | Intent |',
+              '| --- | --- | --- | --- |']
+    counts = {'discovery': {}}
     for row in accepted:
-        company, contact = row.get('company', {}), row.get('primary_contact', {})
+        company = row.get('company', {})
         discovery = source(company.get('discovery_source', row.get('discovery_source')))
-        email = source(contact.get('email_source')) if 'email' in request.get('contact_fields', ['email']) else 'not requested'
-        verifier = source(contact.get('email_validation')) if email != 'not requested' else 'not requested'
         values = [f"{company.get('canonical_name', '')} / {company.get('domain', '')}", discovery,
-                  source(row.get('account_fit')), source(row.get('signal_evidence')), source(contact), email, verifier]
+                  source(row.get('account_fit')), source(row.get('signal_evidence'))]
         lines.append('| ' + ' | '.join(cell(v) for v in values) + ' |')
-        for kind, evidence in [('discovery', discovery), ('email', email), ('validation', verifier)]:
+        for kind, evidence in [('discovery', discovery)]:
             label = evidence.split(' (')[0]
             counts[kind][label] = counts[kind].get(label, 0) + 1
     lines += ['', 'Source counts (unknown attribution is retained): ' + json.dumps(counts) + '.',
@@ -528,14 +521,14 @@ def write_research_report(directory, results, costs, commentary):
     for state in ('accepted', 'rejected', 'unresolved'):
         for row in results.get(state, []):
             company = row.get('company', row.get('candidate', {}))
-            lines.append('| ' + ' | '.join(cell(v) for v in (state, company.get('domain'), row.get('reason_text', 'Qualified; see saved evidence and contact selection'))) + ' |')
+            lines.append('| ' + ' | '.join(cell(v) for v in (state, company.get('domain'), row.get('reason_text', 'Qualified; see saved company evidence'))) + ' |')
     lines += ['', '## Research routes', '', '| Receipt | Provider / tool | Scope / phase | Status | Rows | Charged credits | Cost basis |',
               '| --- | --- | --- | --- | --- | --- | --- |']
     for route in results.get('routes', []):
         values = [route.get('route_id'), source(route), f"{route.get('scope')} / {route.get('phase')}", route.get('provider_status'),
                   route.get('rows_returned'), route.get("cost_credits"), route.get('billing_basis', route.get('cost_basis'))]
         lines.append('| ' + ' | '.join(cell(v) for v in values) + ' |')
-    lines += ['', '## Saved request and audit', '', 'The request, qualification evidence, contact selections and source frontier are in [results.json](results.json).', '',
+    lines += ['', '## Saved request and audit', '', 'The request, qualification evidence and source frontier are in [results.json](results.json).', '',
               '```json', json.dumps({k: results.get(k) for k in ('request', 'summary', 'cost_summary', 'stop_audit')}, indent=2), '```', '']
     path = directory / 'report.md'
     temporary = path.with_suffix('.tmp')

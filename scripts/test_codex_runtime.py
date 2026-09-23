@@ -50,13 +50,10 @@ class WorkspaceRuntimeTests(unittest.TestCase):
             book = root / 'leads.xlsx'; book.write_bytes(b'fixture workbook')
             receipt = SimpleNamespace(data={'exit_code': 0, 'started_at': '2026-09-16T00:00:00Z'})
             from run_attempt import review_fingerprint
-            for count, contact_target in ((5, None), (10, None), (10, 5)):
-                complete = count == 10 and contact_target is None
+            for count in (5, 10):
+                complete = count == 10
                 document = {'request': {'target_count': 10}, 'accepted': [{}] * count,
                             'stop_reason': 'target_met' if complete else 'time_limit_reached'}
-                if contact_target:
-                    document['request'].update(min_contacts_per_company=1, target_contacts_per_company=contact_target, contact_fields=[])
-                    document['accepted'] = [{'primary_contact': {'full_name': 'Ada Example', 'current_title': 'Owner'}} for _ in range(count)]
                 document['final_review'] = {'review_ref': review_fingerprint(document),
                                             'reviewed_at': '2026-09-16T01:00:00Z'}
                 run.write_text(json.dumps(document))
@@ -71,8 +68,7 @@ class WorkspaceRuntimeTests(unittest.TestCase):
                 self.assertEqual(status['status'], 'complete' if complete else 'partial')
                 self.assertTrue(status['artifact_verified'])
                 self.assertEqual(status['target_met'], complete)
-                if contact_target:
-                    self.assertEqual(status['contact_coverage']['target_shortfall'], 40)
+                self.assertNotIn('contact_coverage', status)
                 self.assertEqual(status['shortfall'], 10 - count)
                 self.assertEqual(status['stop_reason'], document['stop_reason'])
                 self.assertEqual(run.read_bytes(), before)
@@ -377,7 +373,7 @@ class SupervisorTests(unittest.TestCase):
             calls += 1
             document = json.loads(self.path.read_text())
             document.setdefault('unresolved', []).append({
-                'company': {'domain': f'progress-{calls}.example'}, 'stage': 'contact'})
+                'company': {'domain': f'progress-{calls}.example'}, 'stage': 'account'})
             self.path.write_text(json.dumps(document))
             receipt.finish(1)
             return 1
@@ -681,9 +677,9 @@ class ModelSelectionTests(unittest.TestCase):
 
     def test_default_model_and_priced_override_only(self):
         from codex_tyche import DEFAULT_MODEL, require_priced_model, selected_model
-        self.assertEqual(DEFAULT_MODEL, 'gpt-5.6-luna')
-        self.assertEqual(selected_model({}), 'gpt-5.6-luna')
-        self.assertEqual(selected_model({'TYCHE_MODEL': ''}), 'gpt-5.6-luna')
+        self.assertEqual(DEFAULT_MODEL, 'gpt-6-luna')
+        self.assertEqual(selected_model({}), 'gpt-6-luna')
+        self.assertEqual(selected_model({'TYCHE_MODEL': ''}), 'gpt-6-luna')
         self.assertEqual(selected_model({'TYCHE_MODEL': 'gpt-6-luna'}), 'gpt-6-luna')
         for model in ('gpt-5.6-luna', 'gpt-6-luna'):
             require_priced_model(model)
@@ -695,7 +691,7 @@ class ModelSelectionTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         import tyche_arena.host as host
         from codex_tyche import saved_run_model_conflict
-        self.assertEqual(host.MODEL, 'openai/gpt-5.6-luna')
+        self.assertEqual(host.MODEL, 'openai/gpt-6-luna')
         with tempfile.TemporaryDirectory() as directory:
             request = Path(directory) / 'request.txt'
             request.write_text('Synthetic.')
@@ -715,11 +711,11 @@ class ModelSelectionTests(unittest.TestCase):
                 'print(json.dumps([codex_tyche.MODEL, host.MODEL]))')
         result = subprocess.run(
             [sys.executable, '-c', code], cwd=root,
-            env={**os.environ, 'TYCHE_MODEL': 'gpt-6-luna'},
+            env={**os.environ, 'TYCHE_MODEL': 'gpt-5.6-luna'},
             capture_output=True, text=True, check=True,
         )
         self.assertEqual(json.loads(result.stdout),
-                         ['gpt-6-luna', 'openai/gpt-5.6-luna'])
+                         ['gpt-5.6-luna', 'openai/gpt-6-luna'])
 
     def test_malformed_receipt_is_refused_on_resume_and_recovery(self):
         from codex_tyche import recover_stopped_workers, saved_run_model_conflict

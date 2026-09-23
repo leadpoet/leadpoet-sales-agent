@@ -155,17 +155,23 @@ def linkedin_receipt_errors(document, run_file, *, fill_missing=False):
     if not isinstance(document, dict) or not isinstance(document.get("accepted", []), list):
         return ["results must be an object with an accepted array"]
     errors = []
-    from validate_run import ready_contact_indexes  # Imported here: validate_run imports this module.
+    from validate_run import company_stage, ready_contact_indexes  # Imported here: validate_run imports this module.
     request = document.get("request") if isinstance(document.get("request"), dict) else {}
+    company_only = company_stage(document)
     for index, row in enumerate(document.get("accepted", [])):
         if not isinstance(row, dict):
             continue
         base = f"accepted[{index}]"
-        contacts = [(f"{base}.primary_contact", row.get("primary_contact"))]
-        backups = row.get("backup_contacts", [])
-        contacts += [(f"{base}.backup_contacts[{i}]", c) for i, c in enumerate(backups if isinstance(backups, list) else [])]
-        entities = [(f"{base}.company", row.get("company"), "company", "employee_range_evidence", ("employee_range",))]
-        entities += [(p, c, "in", "location_evidence", ("country", "state", "city")) for p, c in contacts]
+        if company_only:
+            company = row.get("company")
+            contacts = []
+            entities = [(f"{base}.company", company, "company", "employee_range_evidence", ("employee_range",))]
+        else:
+            contacts = [(f"{base}.primary_contact", row.get("primary_contact"))]
+            backups = row.get("backup_contacts", [])
+            contacts += [(f"{base}.backup_contacts[{i}]", c) for i, c in enumerate(backups if isinstance(backups, list) else [])]
+            entities = [(f"{base}.company", row.get("company"), "company", "employee_range_evidence", ("employee_range",))]
+            entities += [(p, c, "in", "location_evidence", ("country", "state", "city")) for p, c in contacts]
         # The contract asks every contact for a current role at its company, with or without contact data.
         # Delivery rechecks each exported contact and each saved email against its recorded profile;
         # unexported pending profiles stay outside it.
