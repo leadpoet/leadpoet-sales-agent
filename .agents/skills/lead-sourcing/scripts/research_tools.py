@@ -1413,12 +1413,15 @@ class ResearchTools:
                 return self._field_view(self._field(self._document(), field), offset, limit)
             except ValueError as exc:
                 raise ValueError(f"input.field: {exc} Derived fields: requirements, costs, completion_candidates, pending_sources, strategy_review, taxonomy.") from exc
-        return {"request": self._document()["request"], "requirements": request_requirements(self._document()["request"]),
-                "writing_requirements": writing_requirements(self._document()["request"]),
-                "cached_descriptions": sorted({r["tool"] for r in self._document().get("routes", [])
+        document = self._document()
+        request = document["request"]
+        request_review = "Compare original_text with these interpreted must-haves and preferences before paid research. Company types, industries and geographies already have requirement refs; put other non-signal must-haves in icp.required_attributes. This request is company-only: review every company and intent requirement before acceptance; do not start contact work or infer buyer roles. Only the user can change the criteria."
+        return {"request": request, "requirements": request_requirements(request),
+                "writing_requirements": writing_requirements(request),
+                "cached_descriptions": sorted({r["tool"] for r in document.get("routes", [])
                     if r.get("operation") == "describe" and r.get("provider_status") == "ok" and r.get("tool")}),
                 "tool_guidance": "Mandatory verification prerequisites are checked. Choose research for the next evidence gap; do not inventory future phases first. Reuse cached descriptions with inspect(tool=...) when needed; no catalog search is needed for these IDs.",
-                "request_review": "Compare original_text with these interpreted must-haves and preferences before paid research. Company types, industries and geographies already have requirement refs; put other non-signal must-haves in icp.required_attributes. Review each before company acceptance. Only the user can change the criteria.", **self._overview()}
+                "request_review": request_review, **self._overview()}
 
     def _company_review(self, row, sources, receipts=None):
         """Show the judgment under review beside its requirement and saved evidence."""

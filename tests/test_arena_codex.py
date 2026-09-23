@@ -708,6 +708,9 @@ def test_trigger_returns_reviewed_checkpoint_with_codex_configuration(lab, monke
     assert json.loads(lab.output.read_text()) == {"companies": rows}
     assert len(rows) == 1
     assert "contact" not in rows[0]
+    inspect = lab.research[0].call("tyche_inspect", {})
+    assert "company-only" in inspect["request_review"]
+    assert "do not start contact work or infer buyer roles" in inspect["request_review"]
     assert rows[0]["intent_signals"][0]["matched_icp_signal"] == 0
     assert rows[0]["intent_signals"][0]["date"] == "2026-08-12"
     assert len(lab.sessions) == 1

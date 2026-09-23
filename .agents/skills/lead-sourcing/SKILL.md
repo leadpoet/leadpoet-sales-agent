@@ -11,6 +11,8 @@ LLM researches; tools validate. No CRM writes or outreach.
 
 Resume with `tyche_inspect()`; preserve request, authorization, budget, pending work and evidence.
 
+This model is company-only. Qualify and accept one row per company after company fit, intent evidence, writing and evidence review. Do not enter contact phases or infer buyer roles; keep every company qualification, source, budget, review and stopping rule.
+
 Read [workflow rules](references/workflow-rules.md),
 [input contract](references/output-contract.md#input-contract) and
 [lifecycle invariants](references/output-contract.md#lifecycle-invariants).
