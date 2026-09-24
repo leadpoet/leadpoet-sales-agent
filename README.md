@@ -1,261 +1,113 @@
-# TYCHE
+# SN71 Arena challenger
 
-For the Codex integration that runs inside the Leadpoet lab, see
-[Leadpoet lab integration](docs/leadpoet-arena.md). It uses the lab runtime
-from subnet PR #198 and returns reviewed JSON through `harness.run_icp(icp)`.
+This submission bundle targets the live v5 contract checked on 2026-09-15.
+Entrypoint: `harness.run_icp(icp) -> list[dict]`, at most five companies.
 
-**Open-source company sourcing with evidence and spending controls.**
+## Pipeline
 
-TYCHE finds companies that match your ideal customer profile, checks the facts
-and buying signals you care about.
-It runs in Codex and delivers an Excel lead list, structured JSON, and an audit
-report with sources and costs.
+1. Free Hunter discovery, followed by at most two paid discovery searches.
+2. Batch company profiling and structured company records. Reject contradictory
+   fit, unreadable/conflicting requested headcount, and unknown headquarters.
+3. In contact-required rounds, search HarvestAPI for requested current roles and
+   fetch provider-supported emails. Only companies with supported contacts
+   proceed to paid intent research. Retain a spare when the call budget allows.
+4. Route primary intent research by category: hiring, leadership, funding,
+   expansion, product, technology adoption, social activity, or podcast.
+5. Quote source text, reject stale primary evidence, and preserve criterion
+   indexes. Source titles cannot substitute for support in the quoted text.
+6. Produce one evidence-grounded `intent_details` paragraph and validate every
+   row with Pydantic before emitting it. Bad rows do not invalidate good rows.
 
-[Quick start](#quick-start) · [Requests and defaults](#requests-and-defaults) ·
-[Outputs](#outputs) · [Build on TYCHE](#build-on-tyche)
+`contacts.py` and `arena_models.py` reuse official baseline components;
+see [UPSTREAM.md](UPSTREAM.md) and the preserved upstream MIT notice.
+`LICENSE` is the complete Tyche AGPL text required by Arena admission.
 
-## What it does
+## Frozen policies
 
-- **Qualifies companies first.** Checks company fit and buying signals separately,
-  preserving required criteria, preferences, and missing evidence.
-- **Controls run spending.** Stops new paid work at the observed provider-plus-model
-  cutoff and keeps the same budget and receipts through interruptions.
+The live round currently requires:
 
-- **Offers optional parallel research.** File-based runs use one researcher by
-  default. Choose `--workers 2` or `--workers 3` for the same workflow with exclusive
-  company claims and one shared budget; see [parallel research](docs/codex-isolated-testing.md#parallel-company-research).
-- **Saves confirmed leads as it goes.** Updates `leads.json` after each evidence
-  review, so a partial list is available before the full target is reached.
-- **Delivers traceable results.** Saves accepted, rejected, and unresolved outcomes;
-  validates the result and workbook before delivery.
+- `leadpoet.lab_arena.output.v5`
+- `arena_integrity_v1`
+- `contacts_v1`
+- `intent_details_v1`
 
-## Quick start
+v5 emits `intent_details` and contact claims. It omits `fit_summary`,
+`fit_evidence_urls`, and per-signal `snippet` / `why_now`.
+Legacy company-only ICPs without policy markers retain the older output shape.
+Unknown explicit policies stop before provider work.
 
-### 1. Prepare your environment
+The gateway injects policies into each ICP; the sandbox cannot query the public
+Gateway directly. The external preflight checks the live round before upload.
 
-You need:
+## Verify
 
-- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) on `PATH`, with a reusable
-  file-based login (`codex login`). You can submit requests from Codex desktop.
-- Python 3.10 or later, plus an installed, authenticated Deepline CLI for provider
-  research and LinkedIn company verification.
-- The Codex workbook runtime: Node.js, Python, and `@oai/artifact-tool`. The launcher
-  discovers the installed desktop bundle. Other hosts must configure the
-  [runtime paths](docs/codex-isolated-testing.md#workbook-finalization-and-usage-reconciliation)
-  before sourcing; installing the Codex CLI alone does not supply the exporter.
-- A `SCRAPINGDOG_API_KEY` if you want to use ScrapingDog routes.
+Use Python 3.11+ with Pydantic 2.12+ and pytest. Official parity tests also need
+the LeadPoet project's dependencies. Set `LEADPOET_REPO` to a current official
+checkout, not an old copy which only understands v1.
 
-```bash
-git clone https://github.com/gzaentz/tyche.git
-cd tyche
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-deepline health --json
-```
-
-Deepline executions use the direct API with `DEEPLINE_API_KEY` or the existing
-production SDK login, preserving raw error responses and billing IDs. Custom
-CLI configurations retain their CLI transport. Catalog discovery still uses
-the CLI. Export `SCRAPINGDOG_API_KEY`
-to enable ScrapingDog. Set `DEEPLINE_BIN` to the executable's absolute path if it
-is outside `PATH`.
-
-Local `.env` files are **not loaded automatically**. In a Bash or Zsh terminal,
-load your own file before starting Codex:
+From the project root:
 
 ```bash
-set -a
-source .env
-set +a
+export LEADPOET_REPO=/absolute/path/to/current/leadpoet
+leadpoet/.venv/bin/python tools/verify_arena.py --repo "$LEADPOET_REPO"
 ```
 
-Keep credentials out of committed files.
+This reads the current public round, checks its policies and submission window,
+verifies the full license and source archive, runs the real Arena host entrypoint
+against a fake broker, then runs contact and regression tests. No paid providers
+or wallet operations are used. An outdated official validator must fail.
 
-Use that same Python environment for the launcher. Native tools and the
-`run_attempt.py` CLI check provider inputs against the saved live JSON Schema,
-including nested fields, before paid dispatch. Describe the tool in the run first.
-An invalid input returns its field path and constraint for correction; no paid
-request or spending reservation is created. Unresolved provider bills stay pending for reconciliation; they do not block new work.
-
-### 2. Check the launcher
-
-Install the same released Codex client used by Arena without changing your global CLI:
-
-```sh
-npm install --prefix .runtime --no-audit --no-fund --save-exact @openai/codex@0.154.0
-```
-
-The launcher checks the version. `TYCHE_CODEX_BINARY` may select another installation
-of that exact version. Local and Arena execution call the same supervisor in
-`scripts/codex_tyche.py`; see [the Arena adapter](docs/leadpoet-arena.md).
-
-Run this from your regular host terminal:
+For offline tests only:
 
 ```bash
-python3 scripts/codex_tyche.py --check
+LEADPOET_REPO=/absolute/path/to/current/leadpoet leadpoet/.venv/bin/python arena-agent-174/local_test.py
+LEADPOET_REPO=/absolute/path/to/current/leadpoet leadpoet/.venv/bin/python -m pytest tests -q
 ```
 
-This checks isolation and session startup without a model turn or provider
-calls. It does not verify model-service connectivity or provider credentials.
-Use `--smoke` for an optional read-only model response with no provider calls.
-See [launcher setup and troubleshooting](docs/codex-isolated-testing.md).
+The fake broker proves the transport and contract, not factual correctness,
+email deliverability, real provider latency, or champion eligibility.
 
-The [launcher](scripts/codex_tyche.py) pins **`gpt-6-luna`**, **`high` reasoning**
-and the **`fast` service tier**. It loads project-local sourcing instructions in
-an isolated session while retaining the worker's sandbox and network policy.
-Before any model turn, it checks the pinned Codex model list and refuses an
-unsupported model, reasoning effort, speed tier, or silent fallback.
-Arena uses `openai/gpt-6-luna` through OpenRouter Responses. Local Codex access
-depends on the logged-in account; an unavailable model fails before paid work.
-A resumed run must use the model recorded in its receipts. Historical model
-rates remain available for cost reconciliation.
+## Budgets
 
-### 3. Ask for leads
+Per ICP: at most 8 Exa searches, 2 dynamic scrapes, 12 contact calls,
+4 contact calls per candidate, 28 Deepline attempts, and 4 OpenRouter attempts.
+Contact work reserves 8 remaining Deepline calls and 100 seconds for evidence.
+All broker attempts count locally, including lost replies. The host's limits
+remain authoritative. The model is Gemini 2.5 Flash Lite with GPT-4.1 Mini as
+fallback; both were listed in the live OpenRouter catalog on 2026-09-15.
 
-Open this repository in Codex and describe the companies, signals, and
-budget you want. For example:
+Call ceilings are not dollar ceilings. Actual contact, LLM, search and scraping
+costs must all be measured. Current cost eligibility is bounded by $80 overall
+and $0.80 per independently qualified company/contact pair. A contact claim
+created by this harness is not yet an independently qualified pair.
 
-```text
-Source 5 US B2B SaaS companies with 50–500 employees. Exclude agencies and
-consultancies. Each must have posted at least 3 sales openings in the last
-30 days. Spend at most $4 total on sourcing providers and model calls.
-```
+## Submission
 
-[AGENTS.md](AGENTS.md) routes sourcing requests through the isolated launcher
-and saves each request under `reports/<run-id>/request.txt`. Code changes and
-questions stay in your ordinary Codex session.
-
-For a terminal-driven run, create a unique directory under `reports/`, save your
-request and that directory path in a UTF-8 `request.txt`, then run from the host
-terminal, replacing `<run-id>` with your directory name:
+`submit.sh` resolves this directory rather than a hardcoded WSL path. It runs
+preflight once and delegates to the current official submission helper only
+with an explicit `--send` argument. Credentials stay outside the source bundle.
 
 ```bash
-python3 scripts/codex_tyche.py --exec-file reports/<run-id>/request.txt
+LEADPOET_REPO=/absolute/path/to/current/leadpoet bash arena-agent-174/submit.sh
+# After real provider/scorer validation and with funded runtime credentials:
+LEADPOET_REPO=/absolute/path/to/current/leadpoet bash arena-agent-174/submit.sh --send
 ```
 
-## Requests and defaults
+Set `ARENA_PYTHON` if the virtualenv is separate from the official checkout.
+Set `ARENA_WALLET` and `ARENA_HOTKEY` for the registered miner wallet.
+Do not use the historical `tools/retry_submit.py` flow for this bundle.
+Accepted sources may be published by the subnet after evaluation; a private
+GitHub repository does not make an Arena submission permanently private.
 
-| Setting | Behavior |
-| --- | --- |
-| Companies | Give a target count, geography, industry, size, and exclusions. Distinguish must-haves from preferences. |
-| Buying signals | Specify the evidence and date window. Required signals match **any** by default; ask for **all** when each is mandatory. |
-| Run budget | **$0.80 × requested leads** when omitted. Reported provider charges plus estimated base LLM cost. An explicit budget, including zero, overrides this default. |
-| Time | Two hours by default. An explicit time limit overrides it; speed benchmarks do not. Resuming preserves the original clock. |
+## Champion target
 
-Company size uses the published LinkedIn employee range. Contact discovery,
-email validation and contact fields are not part of this company-only model. See the
-[input and output contract](.agents/skills/lead-sourcing/references/output-contract.md)
-for exact fields and evidence rules.
+A challenger needs the highest eligible score AND at least baseline +1.0.
+Company fit, primary evidence, intent details and contact verification all have
+to pass. Cost eligibility and reward eligibility are separate checks. No king
+or `epoch_eligible=false` in a public snapshot does not by itself determine
+whether a future winning round can activate rewards.
 
-New runs use one **soft cost cutoff**: provider charges plus estimated
-base LLM usage. Completed ScrapingDog requests use documented endpoint tariffs;
-unknown charges remain pending for reconciliation and do not consume budget
-until confirmed. Check after each response and before further paid work. Calls
-already running can take the final total above the threshold. The report
-separates provider charges, estimated LLM cost and pending calls.
-Old ledgers retain their original reservation policy. Request IDs, receipts,
-original limits and duplicate-call protection survive every continuation.
-
-TYCHE continues until it meets the qualified target, cannot fund further required
-work, or reaches the saved deadline. Exhausted searches require a strategy change;
-an early worker exit automatically continues the same saved run. Genuine runtime
-or access failures stay blocked, not completed. Shortfalls remain visible. It does not send
-outreach or write to a CRM.
-
-## Outputs
-
-Each run saves its files under `reports/<run-id>/`:
-
-| File | Contents |
-| --- | --- |
-| `leads.json` | Continuously saved confirmed companies, with evidence, target, count, and update time. Available during research. |
-| `leads.xlsx` | One row per accepted company, with company details, signals and intent, plus a **Sources** worksheet. |
-| `results.json` | Versioned accepted, rejected, and unresolved records with evidence and accounting. |
-| `report.md` | Human-readable findings, shortfalls, decisions, sources, and provider costs. |
-| `run-costs.json` | Provider and isolated-worker model usage/cost summary, including estimates and missing usage. |
-
-The run also retains validation, workbook previews, provider receipts, and
-`results.json.budget.json`. Keep the entire directory to resume with the same
-scope and accounting. Model cost excludes the outer development conversation.
-
-Delivery requires the full validator to return **`delivery_allowed: true`**,
-a verified saved workbook, and review of its preview. A process exit or model
-message alone does not establish completion. Partial files remain progress
-artifacts until they pass the delivery checks.
-
-To consume confirmed leads during research, read the `leads` array in `leads.json`.
-An atomic replacement keeps readers from seeing a half-written file. Unfinished
-candidates stay in `results.json`; later research failures preserve the confirmed
-list. Changed or withdrawn leads are removed until reviewed again. The JSON does
-not wait for all requested leads or for the final Excel export. See the
-[confirmed JSON contract](.agents/skills/lead-sourcing/references/output-contract.md#leadsjson-confirmed-leads).
-The bundled arena adapter publishes those confirmed leads to
-`/output/companies.json` on approval, so cost/time cutoffs can retain a partial list.
-
-## Build on TYCHE
-
-Codex chooses sources, queries, follow-ups, and qualification judgments. Local
-Python tools handle execution, observed-cost checks, receipts, and validation;
-the Node exporter builds the workbook.
-
-```text
-Request → isolated Codex session → research and evidence review
-                                → provider adapters + budget ledger
-                                → strict validation → JSON / report / Excel
-```
-
-File-backed runs expose five native tools over local MCP:
-
-| Tool | Purpose |
-| --- | --- |
-| `tyche_start` | Initialize or resume the request, combined cost cutoff. |
-| `tyche_lookup` | Run a selected provider tool or up to three independent checks; record spending and save receipts. |
-| `tyche_review` | Save findings, review completed leads, and automatically update confirmed JSON on approval. |
-| `tyche_inspect` | Read saved state, discover tools, and inspect schemas, pricing, or receipts. |
-| `tyche_finish` | Validate reviewed results, export and verify the workbook, and write the report. |
-
-### Where to work
-
-| Change | Start here |
-| --- | --- |
-| Research behavior and qualification | [Sourcing skill](.agents/skills/lead-sourcing/SKILL.md) and [workflow rules](.agents/skills/lead-sourcing/references/workflow-rules.md) |
-| Provider selection | [Tool guide](.agents/skills/lead-sourcing/references/tools.md) |
-| Tool inputs, adapters, and budgets | [Native tool and adapter contracts](.agents/skills/lead-sourcing/references/adapter-io.md) |
-| JSON fields and workbook layout | [Output contract](.agents/skills/lead-sourcing/references/output-contract.md) |
-| Model settings, isolation, and recovery | [Launcher](scripts/codex_tyche.py) and [runtime guide](docs/codex-isolated-testing.md) |
-| Application integration | [Platform integration design](docs/platform-integration.md) — worker hosting and a protected provider gateway are planned, not shipped. |
-
-Provider capabilities and prices are discovered live. Extend the existing
-adapters and preserve evidence gates, budget checks, and uncertain-charge
-reconciliation. The local ledger is writable by the worker; a hosted product
-must enforce authoritative spending and credential access in its backend.
-
-### Verify changes
-
-Run the local test suites from the repository root:
-
-```bash
-python3 -m unittest discover -s .agents/skills/lead-sourcing/tests -p 'test_*.py'
-python3 -m unittest discover -s scripts -p 'test_*.py'
-```
-
-Validate a saved run with:
-
-```bash
-python3 .agents/skills/lead-sourcing/scripts/validate_run.py reports/<run-id>/results.json
-```
-
-Use the full validator for delivery; `--check-stop` alone can return a successful
-exit while research still needs to continue. For exporter dependencies, manual
-export, and receipt reconciliation, see the [runtime guide](docs/codex-isolated-testing.md).
-
-## License
-
-[GNU AGPL-3.0](LICENSE).
-
----
-
-<p align="center">
-  <img src="docs/assets/tyche-characters.svg" alt="Tyche rendered with Unicode block characters, wearing an ornate crown beside a child and a fruit-filled cornucopia." width="640">
-</p>
+Next performance gate: measure actual qualified pairs and full successful-call
+cost on representative public ICPs using real providers and the official scorer.
+Then compare against the same frozen baseline and ICPs. Offline tests cannot
+provide an honest win probability.
