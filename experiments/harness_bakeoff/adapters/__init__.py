@@ -1,0 +1,1 @@
+"""PydanticAI lead-sourcing adapter."""

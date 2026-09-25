@@ -48,6 +48,12 @@ _SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/~-]{0,199}$")
 _ISO2_CODES = frozenset(
     "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW".split()
 )
+_ISO2_COUNTRY_NAMES = {
+    "US": "United States", "GB": "United Kingdom", "CA": "Canada",
+    "AU": "Australia", "DE": "Germany", "FR": "France", "IE": "Ireland",
+    "IN": "India", "NZ": "New Zealand", "SG": "Singapore",
+    "AE": "United Arab Emirates",
+}
 
 
 def _canonical_employee_band(value: Any) -> Any:
@@ -225,19 +231,27 @@ class RequiredAttributeEvidence(BaseModel):
 class ContactLocation(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    country: str = Field(min_length=2, max_length=2)
+    country: str = Field(min_length=2, max_length=80)
     region: Optional[str] = Field(default=None, min_length=1, max_length=120)
     city: Optional[str] = Field(default=None, min_length=1, max_length=120)
 
     @field_validator("country", mode="before")
     @classmethod
     def validate_country(cls, value: Any) -> Any:
+        # The Arena judge's contact contract rejects a bare ISO-2 code ("US")
+        # and requires a full country name, so a 2-letter code is normalized to
+        # its full name here; a full name is accepted and passed through.
         if not isinstance(value, str):
             return value
-        code = value.strip().upper()
-        if code not in _ISO2_CODES:
-            raise ValueError("must be a recognized two-letter country code")
-        return code
+        text = value.strip()
+        if len(text) == 2:
+            code = text.upper()
+            if code not in _ISO2_CODES:
+                raise ValueError("must be a recognized two-letter country code")
+            return _ISO2_COUNTRY_NAMES.get(code, code)
+        if text in _ISO2_COUNTRY_NAMES.values():
+            return text
+        raise ValueError("must be a recognized country")
 
 
 class ContactEmailSource(BaseModel):
@@ -379,29 +393,7 @@ class CompanyResult(_CompanyFields):
         return [_public_http_url(value) for value in values]
 
 
-class CompanyStageEvidence(BaseModel):
-    """One saved source passage offered to the scorer's stage research.
-
-    Mirrors CompetitionCompanyStageEvidence (competition_models.py, added
-    2026-09-19): v5 only, at most three per company, and the URL must be a
-    public page. The passage is a quotation, never our own wording.
-    """
-
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    url: str = Field(max_length=2_048)
-    quote: str = Field(min_length=1, max_length=2_000)
-
-    @field_validator("url")
-    @classmethod
-    def validate_url(cls, value: str) -> str:
-        return _public_http_url(value)
-
-
 class IntentDetailsCompanyResult(_CompanyFields):
-    company_stage_evidence: list[CompanyStageEvidence] = Field(
-        default_factory=list, max_length=3,
-    )
     intent_details: str = Field(
         min_length=1,
         max_length=2_000,
@@ -426,7 +418,7 @@ class IntentDetailsCompanyResult(_CompanyFields):
             for character in value
         ):
             raise ValueError("must not contain control characters")
-        if re.search(r"(?:^|\n)\s*(?:#{1,6}\s|[-*\u2022]\s|\d+[.)]\s|>)", value) or "```" in value:
+        if re.search(r"(?:^|\n)\s*(?:#{1,6}\s|[-*•]\s|\d+[.)]\s|>)", value) or "```" in value:
             raise ValueError("must be prose, not a heading, list or code block")
         return " ".join(value.split())
 
@@ -564,10 +556,6 @@ def _intent_contract(icp: dict[str, Any]) -> list[dict[str, Any]]:
         raw_signals = [raw_signals]
     ordered_values = list(raw_signals) if isinstance(raw_signals, list) else []
     if not ordered_values:
-        # Preserve the gateway's singular primary before optional bonuses.
-        primary = icp.get("intent_signal_text") or icp.get("intent_signal")
-        if primary:
-            ordered_values.append(primary)
         ordered_values.extend(explicit_required)
         ordered_values.extend(explicit_bonuses)
     else:

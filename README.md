@@ -1,113 +1,205 @@
-# SN71 Arena challenger
+# Leadpoet PydanticAI Harness
 
-This submission bundle targets the live v5 contract checked on 2026-09-15.
-Entrypoint: `harness.run_icp(icp) -> list[dict]`, at most five companies.
+An open-source PydanticAI agent for live B2B company sourcing.
 
-## Pipeline
+The harness takes one ICP and returns up to five companies that match it and
+have a verified, recent intent signal. Each result includes a clear sales-facing
+reason and public evidence URLs.
 
-1. Free Hunter discovery, followed by at most two paid discovery searches.
-2. Batch company profiling and structured company records. Reject contradictory
-   fit, unreadable/conflicting requested headcount, and unknown headquarters.
-3. In contact-required rounds, search HarvestAPI for requested current roles and
-   fetch provider-supported emails. Only companies with supported contacts
-   proceed to paid intent research. Retain a spare when the call budget allows.
-4. Route primary intent research by category: hiring, leadership, funding,
-   expansion, product, technology adoption, social activity, or podcast.
-5. Quote source text, reject stale primary evidence, and preserve criterion
-   indexes. Source titles cannot substitute for support in the quoted text.
-6. Produce one evidence-grounded `intent_details` paragraph and validate every
-   row with Pydantic before emitting it. Bad rows do not invalidate good rows.
+This repository contains no Research Lab deployment or persistence code. The
+competition host calls the stable function directly.
 
-`contacts.py` and `arena_models.py` reuse official baseline components;
-see [UPSTREAM.md](UPSTREAM.md) and the preserved upstream MIT notice.
-`LICENSE` is the complete Tyche AGPL text required by Arena admission.
+## Development and promotion
 
-## Frozen policies
+- `main` is the development and testing branch. A push to `main` does not
+  change the daily Research Lab baseline.
+- `lab` is the explicitly promoted baseline. Research Lab downloads this
+  branch when it freezes the baseline for a new rebenchmark.
+- A running round keeps its downloaded source, including after a restart.
+  Updating `lab` affects the next baseline snapshot, not saved results.
 
-The live round currently requires:
-
-- `leadpoet.lab_arena.output.v5`
-- `arena_integrity_v1`
-- `contacts_v1`
-- `intent_details_v1`
-
-v5 emits `intent_details` and contact claims. It omits `fit_summary`,
-`fit_evidence_urls`, and per-signal `snippet` / `why_now`.
-Legacy company-only ICPs without policy markers retain the older output shape.
-Unknown explicit policies stop before provider work.
-
-The gateway injects policies into each ICP; the sandbox cannot query the public
-Gateway directly. The external preflight checks the live round before upload.
-
-## Verify
-
-Use Python 3.11+ with Pydantic 2.12+ and pytest. Official parity tests also need
-the LeadPoet project's dependencies. Set `LEADPOET_REPO` to a current official
-checkout, not an old copy which only understands v1.
-
-From the project root:
+After testing a selected `main` commit, promote it with an ordinary
+fast-forward push from a clean checkout:
 
 ```bash
-export LEADPOET_REPO=/absolute/path/to/current/leadpoet
-leadpoet/.venv/bin/python tools/verify_arena.py --repo "$LEADPOET_REPO"
+git fetch origin
+git switch main
+git merge --ff-only origin/main
+git push origin HEAD:lab
 ```
 
-This reads the current public round, checks its policies and submission window,
-verifies the full license and source archive, runs the real Arena host entrypoint
-against a fake broker, then runs contact and regression tests. No paid providers
-or wallet operations are used. An outdated official validator must fail.
+Do not force-push either branch. Promotion needs no release manifest,
+attestation, or extra model-identity protocol. Miner forks still use the same
+input/output contract and can use any harness.
 
-For offline tests only:
+## Stable contract
+
+The public entrypoint is:
+
+```python
+from harness import run_icp
+
+companies = run_icp(icp)
+```
+
+Its signature is:
+
+```python
+def run_icp(icp: dict) -> list[dict]:
+    """Return up to five best-fit companies, ranked best first."""
+```
+
+The host passes one JSON object for one daily ICP. `icp_id` is always present
+and non-empty. The current input fields are:
+
+```json
+{
+  "icp_id": "icp_20260904_001",
+  "prompt": "Find software companies with recent momentum.",
+  "industry": "Software",
+  "sub_industry": "SaaS",
+  "geography": "United States",
+  "country": "United States",
+  "employee_count": ["51-200", "201-500"],
+  "company_stage": "Series A",
+  "product_service": "A business platform used by operating teams",
+  "required_attribute": "Sells a business product used by operating teams",
+  "intent_signals": ["Announced a funding round in the last 12 months"],
+  "intent_signal": "Announced a funding round in the last 12 months",
+  "intent_category": "FUNDING",
+  "intent_max_age_days": 365,
+  "bonus_intents": []
+}
+```
+
+An agent must accept additional input fields so the host can add descriptive
+ICP data without changing the function signature.
+
+The current primary intent is at index 0, with its category and freshness in
+`intent_category` and `intent_max_age_days`. Bonus intents are optional and
+never replace the primary intent. Structured `required_intents` are also
+accepted for standalone callers. `product_service` describes the target
+company's own offering; it is a fit criterion, not evidence of buying intent.
+
+The return value is a JSON list, or `[]` when no company can be verified:
+
+```json
+[{
+  "company_name": "Example",
+  "company_website": "https://example.com/",
+  "company_linkedin": "https://www.linkedin.com/company/example/",
+  "industry": "Software",
+  "employee_count": "51-200",
+  "company_stage": "Series A",
+  "country": "United States",
+  "state": "California",
+  "fit_summary": "Why the company fits the ICP.",
+  "fit_evidence_urls": ["https://example.com/about"],
+  "intent_signals": [{
+    "matched_icp_signal": 0,
+    "description": "The required recent event.",
+    "date": "2026-08-20",
+    "why_now": "Why a sales representative should contact the company now.",
+    "url": "https://example.com/news/event",
+    "snippet": "Source text that supports the claim."
+  }],
+  "required_attribute": {
+    "text": "The required company characteristic.",
+    "passed": true,
+    "evidence_url": "https://example.com/about",
+    "evidence_quote": "Source text that proves the characteristic.",
+    "explanation": "Why the evidence satisfies the requirement."
+  }
+}]
+```
+
+The harness can use these tools: `search_companies`, `get_company_profile`,
+`get_company_events`, `search_web`, `fetch_page`, and `submit_companies`.
+For `HIRING` or `JOBS` event lookups, `get_company_events` accepts one optional
+PredictLeads `job_category` and returns a bounded plain-text job description
+when the provider supplies one.
+In the Arena, reasoning uses OpenRouter and research uses Deepline, including
+Exa search and page contents through Deepline. No separate Exa or ScrapingDog
+key is required for this native path. The standalone tools below remain separate.
+
+## Miner competition contract
+
+Miners can fork this repository and change the model, harness, prompts,
+routing, tools, and dependencies. Submit the source folder through the miner
+menu. The subnet requires only a top-level `harness.py` with this callable:
+
+```python
+def run_icp(icp: dict) -> list[dict]:
+    """Return up to five companies, ranked best first."""
+```
+
+The host passes one ordinary ICP dictionary and validates the returned list
+against the output fields shown above. It also supplies approved provider API
+access and enforces the same time, call, and cost limits for the baseline and
+all miner submissions. The CLI sends runtime credentials separately from the
+source archive; the sandbox receives provider access, not raw provider keys.
+
+The source folder can contain normal local modules and a `requirements.txt`.
+It does not need a Dockerfile, command-line adapter, Git commit, source
+identity, receipt, manifest, replay proof, or GitHub attestation. The upload
+checksum is used only to detect a damaged transfer.
+
+Submit this source repository to the Arena as the public baseline or use it as
+the starting point for a miner fork. The host imports `harness.run_icp` and
+supplies provider access through its worker socket.
+
+## Install
+
+Use Python 3.11 or newer and Node.js 20 or newer.
 
 ```bash
-LEADPOET_REPO=/absolute/path/to/current/leadpoet leadpoet/.venv/bin/python arena-agent-174/local_test.py
-LEADPOET_REPO=/absolute/path/to/current/leadpoet leadpoet/.venv/bin/python -m pytest tests -q
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt -r requirements-local.txt
+npm ci --prefix experiments/harness_bakeoff/deepline
+export BAKEOFF_DEEPLINE_BIN="$PWD/experiments/harness_bakeoff/deepline/node_modules/.bin/deepline"
 ```
 
-The fake broker proves the transport and contract, not factual correctness,
-email deliverability, real provider latency, or champion eligibility.
+For the local runner only, set `OPENROUTER_API_KEY`, `DEEPLINE_API_KEY`, and
+`SCRAPINGDOG_API_KEY` in the process environment. `EXA_API_KEY` is optional.
+The Arena adapter does not read these keys. Do not commit keys or private ICP
+data.
 
-## Budgets
+## Run live sourcing
 
-Per ICP: at most 8 Exa searches, 2 dynamic scrapes, 12 contact calls,
-4 contact calls per candidate, 28 Deepline attempts, and 4 OpenRouter attempts.
-Contact work reserves 8 remaining Deepline calls and 100 seconds for evidence.
-All broker attempts count locally, including lost replies. The host's limits
-remain authoritative. The model is Gemini 2.5 Flash Lite with GPT-4.1 Mini as
-fallback; both were listed in the live OpenRouter catalog on 2026-09-15.
-
-Call ceilings are not dollar ceilings. Actual contact, LLM, search and scraping
-costs must all be measured. Current cost eligibility is bounded by $80 overall
-and $0.80 per independently qualified company/contact pair. A contact claim
-created by this harness is not yet an independently qualified pair.
-
-## Submission
-
-`submit.sh` resolves this directory rather than a hardcoded WSL path. It runs
-preflight once and delegates to the current official submission helper only
-with an explicit `--send` argument. Credentials stay outside the source bundle.
+Store real ICPs in an uncommitted JSON file outside this repository. The file
+can contain a JSON array or an object with an `icps` array.
 
 ```bash
-LEADPOET_REPO=/absolute/path/to/current/leadpoet bash arena-agent-174/submit.sh
-# After real provider/scorer validation and with funded runtime credentials:
-LEADPOET_REPO=/absolute/path/to/current/leadpoet bash arena-agent-174/submit.sh --send
+python -m experiments.harness_bakeoff.runner preflight
+python -m experiments.harness_bakeoff.runner all \
+  --icp-file /absolute/path/to/icps.json \
+  --evaluation-date YYYY-MM-DD
 ```
 
-Set `ARENA_PYTHON` if the virtualenv is separate from the official checkout.
-Set `ARENA_WALLET` and `ARENA_HOTKEY` for the registered miner wallet.
-Do not use the historical `tools/retry_submit.py` flow for this bundle.
-Accepted sources may be published by the subnet after evaluation; a private
-GitHub repository does not make an Arena submission permanently private.
+The smoke phase runs one live one-company attempt. The scored phase runs each
+selected ICP twice. Each attempt uses a fresh process and the same provider,
+token, time, and cost limits. Results must be written outside the repository.
 
-## Champion target
+## Optional standalone one-shot adapter
 
-A challenger needs the highest eligible score AND at least baseline +1.0.
-Company fit, primary evidence, intent details and contact verification all have
-to pass. Cost eligibility and reward eligibility are separate checks. No king
-or `epoch_eligible=false` in a public snapshot does not by itself determine
-whether a future winning round can activate rewards.
+The native Arena imports `harness.run_icp` directly and does not use
+`production_runner.py`. This optional adapter prints one `PYDANTIC_HARNESS_RESULT_JSON=` line for
+reliable parsing. Run its live preflight once per daily batch. Pass the selected
+model and its public pricing to each run; `run` does not repeat the paid model
+probe.
 
-Next performance gate: measure actual qualified pairs and full successful-call
-cost on representative public ICPs using real providers and the official scorer.
-Then compare against the same frozen baseline and ICPs. Offline tests cannot
-provide an honest win probability.
+```bash
+python production_runner.py preflight
+python production_runner.py run \
+  --model openai/example \
+  --model-pricing-json '{"prompt":"0.000001","completion":"0.000002"}' \
+  --evaluation-date YYYY-MM-DD < /absolute/path/to/one-icp.json
+```
+
+Each `run` call reads one raw ICP JSON object and starts a fresh `run_icp`
+worker process. The adapter does not deploy code or persist state.
+
+## License
+
+MIT
