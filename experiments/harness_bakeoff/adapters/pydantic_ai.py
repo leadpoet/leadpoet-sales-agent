@@ -114,6 +114,17 @@ _LOCAL_FINALIZE_ELAPSED_SECONDS = 540.0
 # Per-ICP model spend. The round budget is shared by all twenty ICPs, and a
 # challenger that exhausts it mid-round returns nothing for every later ICP.
 _RUN_COST_LIMIT_USD = Decimal("1.75")
+# The Arena zeroes an ICP whose sourcing spend exceeds $0.80 per qualified
+# company (arena 09-25 ICP8: one qualified company, $1.03 spent, scored 0).
+# Stop research, then refuse new paid research, then skip optional post-run
+# fetches, so one qualified company always stays cost-eligible.
+_FINALIZE_SPEND_USD = 0.55
+_HARD_SPEND_USD = 0.62
+_POST_RUN_SPEND_USD = 0.70
+_DEEPLINE_USD_PER_CALL_ESTIMATE = 0.0093  # arena 09-25 average: $2.432 / 263 calls
+_SPEND_CACHE_SECONDS = 2.0
+_SPEND_CACHE: dict[str, float] = {"at": -1e9, "usd": 0.0}
+_ACTIVE_USAGE: "RunUsage | None" = None
 _RUN_STARTED_AT: float | None = None
 _FINALIZE_ELAPSED_SECONDS = _LOCAL_FINALIZE_ELAPSED_SECONDS
 _ARENA_REQUEST_OUTPUT_TOKENS = 4_096
@@ -455,6 +466,33 @@ def _deepline_calls() -> int:
     return 0 if budget is None else budget.deepline_calls()
 
 
+def _sourcing_spend_usd() -> float:
+    """This ICP's sourcing spend so far, as the Arena's cost rule counts it.
+
+    In the Arena the host reports the exact successful (and unresolved)
+    per-ICP spend, including model calls. Elsewhere, or if the host cannot
+    answer, estimate it from the run's model cost and Deepline call count.
+    """
+
+    now = time.monotonic()
+    if now - _SPEND_CACHE["at"] < _SPEND_CACHE_SECONDS:
+        return _SPEND_CACHE["usd"]
+    usd: float | None = None
+    if str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip():
+        try:
+            import lab_arena_checkpoint
+
+            cost = lab_arena_checkpoint.quota_usage(include_sourcing_cost=True)["sourcing_cost"]
+            usd = (int(cost["successful_microusd"]) + int(cost["success_unresolved_microusd"])) / 1_000_000
+        except Exception:  # noqa: BLE001 - fall back to the local estimate
+            usd = None
+    if usd is None:
+        model_cost = float(getattr(_ACTIVE_USAGE, "cost", 0) or 0) if _ACTIVE_USAGE is not None else 0.0
+        usd = model_cost + _deepline_calls() * _DEEPLINE_USD_PER_CALL_ESTIMATE
+    _SPEND_CACHE.update(at=now, usd=usd)
+    return usd
+
+
 def _finalization_due(usage: RunUsage) -> bool:
     return (
         usage.input_tokens >= _FINALIZE_INPUT_TOKENS
@@ -462,6 +500,7 @@ def _finalization_due(usage: RunUsage) -> bool:
         or usage.tool_calls >= _FINALIZE_TOOL_CALLS
         or _deepline_calls() >= _FINALIZE_DEEPLINE_CALLS
         or _elapsed_seconds() >= _FINALIZE_ELAPSED_SECONDS
+        or _sourcing_spend_usd() >= _FINALIZE_SPEND_USD
     )
 
 
@@ -649,6 +688,8 @@ class _ToolBudget:
 
         if url in self.pages:
             return self.pages[url]
+        if _sourcing_spend_usd() >= _POST_RUN_SPEND_USD:
+            return None  # the evidence pass keeps the signal unverified
         with self._lock:
             if self.calls >= self.maximum or self.deepline_calls() >= _PROVIDER_CALL_QUOTA - 1:
                 return None
@@ -663,11 +704,14 @@ class _ToolBudget:
 
     def call(self, name: str, arguments: dict[str, Any]) -> Any:
         if name != "submit_companies":
+            over_spend = _sourcing_spend_usd() >= _HARD_SPEND_USD
             with self._lock:
                 if self.calls >= self.maximum:
                     raise RuntimeError(f"provider-call limit of {self.maximum} exceeded")
                 if self.deepline_calls() >= _RESEARCH_DEEPLINE_CALLS:
                     return {"ok": False, "error": "provider budget exhausted: call submit_companies now"}
+                if over_spend:
+                    return {"ok": False, "error": "sourcing budget reached: call submit_companies now"}
                 self.calls += 1
         try:
             if name == "get_company_profile":
@@ -700,6 +744,7 @@ class _ToolBudget:
 async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
     global _RUN_STARTED_AT, _FINALIZE_ELAPSED_SECONDS, _RESEARCH_DEEPLINE_CALLS, _FINALIZE_DEEPLINE_CALLS
     _RUN_STARTED_AT = time.monotonic()
+    _SPEND_CACHE.update(at=-1e9, usd=0.0)
     arena_mode = bool(str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip())
     _FINALIZE_ELAPSED_SECONDS = (
         _ARENA_FINALIZE_ELAPSED_SECONDS if arena_mode else _LOCAL_FINALIZE_ELAPSED_SECONDS
@@ -904,6 +949,8 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
         await close_resources()
         raise
     run_usage = RunUsage()
+    global _ACTIVE_USAGE
+    _ACTIVE_USAGE = run_usage
     try:
         skip_reason = _contact_round_skip_reason(icp) if contact_enabled else ""
         if skip_reason:
@@ -1022,6 +1069,7 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
             and _homepage_binding_enabled()
             and callable(getattr(tool_client, "fetch_homepage_html", None))
             and deadline - _elapsed_seconds() >= _HOMEPAGE_LINKEDIN_MIN_SECONDS
+            and _sourcing_spend_usd() < _POST_RUN_SPEND_USD
         ):
             # The judge reuses an exactly bound LinkedIn company profile as fit
             # evidence; publish only the page the company's own homepage links.

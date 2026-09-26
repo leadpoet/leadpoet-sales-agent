@@ -292,7 +292,9 @@ class HarnessContractTests(unittest.TestCase):
         # Real ICPs already render near 12,100 characters, so this synthetic
         # fixture's cap never bound production. Raised for the measured slot-
         # filling guidance: empty slots were the largest single scoring loss.
-        self.assertLessEqual(len(prompt), 12_100)
+        # Raised again for the proof-source, later-round and partnership rules
+        # the judge enforces since 2026-09-24 (~100 tokens per request).
+        self.assertLessEqual(len(prompt), 12_500)
 
     def test_prompt_prioritizes_primary_and_requires_event_grounding(self) -> None:
         prompt = build_prompt(
