@@ -300,7 +300,7 @@ def build_prompt(icp: dict[str, Any], max_companies: int | None = None) -> str:
         "facilities or hires) that names several companies with the required event: one fetch_page can seed several "
         "candidates, and that page is valid index-0 evidence for each company it names with the event and a date. "
         "After each verified company, move straight to the next hit until the status line says research stops.\n"
-        "0. The budget is about 26 provider calls: search_web, fetch_page and get_company_events cost 1 each, "
+        "0. The budget is about 56 provider calls: search_web, fetch_page and get_company_events cost 1 each, "
         "get_company_profile costs 2 (the company record and its LinkedIn size); pass include_financing=true only "
         "when no article you read names the company's latest round, because it costs about five searches. Alternate "
         "strictly: one discovery search, then verify its best one or two hits before any further search. Verify "

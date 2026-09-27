@@ -58,14 +58,17 @@ _RESEARCH_TOOL_NAMES = frozenset(
 )
 _COMPACTABLE_TOOL_NAMES = _RESEARCH_TOOL_NAMES - {"fetch_page"}
 _MAX_PRIOR_TOOL_RESULT_BYTES = 1_200
-_FINALIZE_INPUT_TOKENS = 170_000
-_FINALIZE_REQUESTS = 22
-_FINALIZE_TOOL_CALLS = 26
-_PROVIDER_CALL_QUOTA = 30  # the Arena's per-ICP Deepline quota
+# Current Arena rounds grant 200 Deepline and 2000 OpenRouter calls per ICP and a
+# 3600 s window. Research runs longer (about 56 Deepline calls / 600 s) and stays
+# bounded by the host-reported sourcing spend gates below.
+_FINALIZE_INPUT_TOKENS = 420_000
+_FINALIZE_REQUESTS = 44
+_FINALIZE_TOOL_CALLS = 58
+_PROVIDER_CALL_QUOTA = 68  # own per-ICP Deepline stop (the Arena grants 200)
 # get_company_profile alone can cost three Deepline calls, so the reserve and
 # the hard stop are measured in provider calls, not tool calls.
-_FINALIZE_DEEPLINE_CALLS = 26
-_RESEARCH_DEEPLINE_CALLS = 28
+_FINALIZE_DEEPLINE_CALLS = 54
+_RESEARCH_DEEPLINE_CALLS = 56
 # Under contacts_v1 a company without a verified contact scores zero, so a run
 # that requires contacts keeps Deepline calls back for the contact pass: one
 # role-matched search plus up to three profile lookups per company.
@@ -104,12 +107,12 @@ _ACTIVE_BUDGET: "_ToolBudget | None" = None
 # cut off by the 285 s run_timeout, so a model that had not stopped by itself lost
 # the whole ICP (arena 09-24 ICP06). Finalize at 220 s, leaving time for the answer.
 # The 880 s hard deadline below only bounds post-run evidence checks.
-_ARENA_FINALIZE_ELAPSED_SECONDS = float(os.environ.get("BAKEOFF_ARENA_FINALIZE_SECONDS") or 220.0)
+_ARENA_FINALIZE_ELAPSED_SECONDS = float(os.environ.get("BAKEOFF_ARENA_FINALIZE_SECONDS") or 600.0)
 _EVIDENCE_MIN_SECONDS = 25.0
 _HOMEPAGE_LINKEDIN_MIN_SECONDS = 30.0
 _HOMEPAGE_LINKEDIN_FETCH_SECONDS = 20.0
 _REVERIFY_MIN_SECONDS = 45.0
-_ARENA_HARD_DEADLINE_SECONDS = float(os.environ.get("BAKEOFF_ARENA_HARD_DEADLINE_SECONDS") or 880.0)
+_ARENA_HARD_DEADLINE_SECONDS = float(os.environ.get("BAKEOFF_ARENA_HARD_DEADLINE_SECONDS") or 1500.0)
 _LOCAL_FINALIZE_ELAPSED_SECONDS = 540.0
 # Per-ICP model spend. The round budget is shared by all twenty ICPs, and a
 # challenger that exhausts it mid-round returns nothing for every later ICP.
@@ -118,9 +121,9 @@ _RUN_COST_LIMIT_USD = Decimal("1.75")
 # company (arena 09-25 ICP8: one qualified company, $1.03 spent, scored 0).
 # Stop research, then refuse new paid research, then skip optional post-run
 # fetches, so one qualified company always stays cost-eligible.
-_FINALIZE_SPEND_USD = 0.55
-_HARD_SPEND_USD = 0.62
-_POST_RUN_SPEND_USD = 0.70
+_FINALIZE_SPEND_USD = 0.58
+_HARD_SPEND_USD = 0.64
+_POST_RUN_SPEND_USD = 0.72
 _DEEPLINE_USD_PER_CALL_ESTIMATE = 0.0093  # arena 09-25 average: $2.432 / 263 calls
 _SPEND_CACHE_SECONDS = 2.0
 _SPEND_CACHE: dict[str, float] = {"at": -1e9, "usd": 0.0}
@@ -128,7 +131,7 @@ _ACTIVE_USAGE: "RunUsage | None" = None
 _RUN_STARTED_AT: float | None = None
 _FINALIZE_ELAPSED_SECONDS = _LOCAL_FINALIZE_ELAPSED_SECONDS
 _ARENA_REQUEST_OUTPUT_TOKENS = 4_096
-_RUN_OUTPUT_TOKENS_LIMIT = 15_000
+_RUN_OUTPUT_TOKENS_LIMIT = 28_000
 _FINALIZE_MARKER = "[research-budget-reserve]"
 _STATUS_MARKER = "[research-status]"
 _MIN_COMPANIES_BEFORE_EARLY_STOP = 3
@@ -603,14 +606,40 @@ def _prepare_research_tools(
     return [] if _finalization_due(context.usage) else tool_definitions
 
 
+def _arena_wall_clock_seconds() -> float | None:
+    """The sandbox's execution window (LAB_ARENA_WALL_CLOCK_SECONDS), when the host sets it."""
+
+    try:
+        value = float(os.environ.get("LAB_ARENA_WALL_CLOCK_SECONDS") or 0)
+    except ValueError:
+        return None
+    return value if value >= 300 else None
+
+
+def _arena_time_limits() -> tuple[float, float, float]:
+    """Finalize point, agent.run timeout and hard deadline, fitted inside the host window.
+
+    Defaults are 600 s / 690 s / 1500 s; a shorter window scales them down so the
+    answer and the evidence pass always finish before the host stops the ICP.
+    """
+
+    finalize, run_timeout, deadline = _ARENA_FINALIZE_ELAPSED_SECONDS, 690.0, _ARENA_HARD_DEADLINE_SECONDS
+    window = _arena_wall_clock_seconds()
+    if window is not None:
+        deadline = min(deadline, window - 60.0)
+        run_timeout = min(run_timeout, deadline - 150.0)
+        finalize = min(finalize, run_timeout - 70.0)
+    return max(60.0, finalize), max(90.0, run_timeout), max(150.0, deadline)
+
+
 def _run_usage_limits() -> UsageLimits:
     """Keep cumulative run limits separate from the per-request model cap."""
 
     return UsageLimits(
         cost_limit=_RUN_COST_LIMIT_USD,
-        request_limit=30,
-        tool_calls_limit=30,
-        input_tokens_limit=260_000,
+        request_limit=52,
+        tool_calls_limit=62,
+        input_tokens_limit=520_000,
         output_tokens_limit=_RUN_OUTPUT_TOKENS_LIMIT,
     )
 
@@ -746,8 +775,12 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
     _RUN_STARTED_AT = time.monotonic()
     _SPEND_CACHE.update(at=-1e9, usd=0.0)
     arena_mode = bool(str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip())
+    global _ARENA_HARD_DEADLINE_SECONDS
+    arena_finalize, arena_run_timeout, arena_deadline = _arena_time_limits()
+    if arena_mode:
+        _ARENA_HARD_DEADLINE_SECONDS = arena_deadline
     _FINALIZE_ELAPSED_SECONDS = (
-        _ARENA_FINALIZE_ELAPSED_SECONDS if arena_mode else _LOCAL_FINALIZE_ELAPSED_SECONDS
+        arena_finalize if arena_mode else _LOCAL_FINALIZE_ELAPSED_SECONDS
     )
     contact_enabled = (
         icp.get("contact_policy") == "contacts_v1"
@@ -767,10 +800,10 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
         5,
         5,
     )
-    max_provider_calls = _positive_integer("BAKEOFF_MAX_PROVIDER_CALLS", 30, 100)
+    max_provider_calls = _positive_integer("BAKEOFF_MAX_PROVIDER_CALLS", 62, 100)
     run_timeout = _positive_float(
         "BAKEOFF_RUN_TIMEOUT_SECONDS",
-        285.0 if arena_mode else 720.0,
+        arena_run_timeout if arena_mode else 720.0,
         3600.0,
     )
     tool_timeout = _positive_float("BAKEOFF_TOOL_TIMEOUT_SECONDS", 90.0, 600.0)

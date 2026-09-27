@@ -203,3 +203,12 @@ worker process. The adapter does not deploy code or persist state.
 ## License
 
 MIT
+
+## Longer research (derived from the arena-2026-09-26 winner, lab@75a3b71)
+Current Arena rounds grant 200 Deepline and 2000 OpenRouter calls per ICP and a long execution window,
+while this harness stopped research at about 26 Deepline calls and 220 s. Research now runs to about
+56 Deepline calls / 600 s (the model's answer and the evidence pass follow; all three limits shrink to
+fit a shorter LAB_ARENA_WALL_CLOCK_SECONDS window). Spend stays bounded by the host-reported sourcing
+cost gates, raised slightly to $0.58 finalize / $0.64 no new paid research / $0.72 no optional post-run
+fetches, so one qualified company keeps an ICP under the $0.80 per-company cost rule.
+
