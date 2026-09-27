@@ -7,7 +7,7 @@ import re
 import unicodedata
 from copy import deepcopy
 from datetime import date as ISODate
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from pydantic import (
@@ -431,14 +431,48 @@ class IntentDetailsContactCompanyResult(IntentDetailsCompanyResult):
     contact: Optional[ContactResult] = None
 
 
+class DecisionSummary(BaseModel):
+    """One concise model-authored decision for the private Arena trajectory."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    objective: str = Field(min_length=1, max_length=500)
+    evidence: list[str] = Field(min_length=0, max_length=5)
+    rationale: str = Field(min_length=1, max_length=500)
+    next_action: str = Field(min_length=1, max_length=500)
+    decision: Literal["investigate", "accept", "reject", "defer", "finish"]
+    candidate: Optional[str] = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("decision evidence must contain strings")
+            item = value.strip()
+            if not item or len(item) > 500:
+                raise ValueError("decision evidence must contain 1-500 characters")
+            normalized.append(item)
+        return normalized
+
+
+class FinalDecisionSummary(DecisionSummary):
+    """The final model-authored decision attached to submit_companies."""
+
+    decision: Literal["finish"]
+
+
 class CompaniesResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     companies: list[CompanyResult] = Field(default_factory=list)
+    decision_summary: FinalDecisionSummary
 
 
 class IntentDetailsCompaniesResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     companies: list[IntentDetailsCompanyResult] = Field(default_factory=list)
+    decision_summary: FinalDecisionSummary
 
 
 def companies_result_model(intent_details_policy: Any = None) -> type[BaseModel]:

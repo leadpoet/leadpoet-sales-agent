@@ -22,7 +22,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from experiments.harness_bakeoff import evidence, reverify
+from experiments.harness_bakeoff import decision_logging, evidence, reverify
 from experiments.harness_bakeoff.models import (
     CompaniesResult,
     _canonical_company_stage,
@@ -138,7 +138,8 @@ _MIN_COMPANIES_BEFORE_EARLY_STOP = 3
 _FINALIZE_PROMPT = (
     f"{_FINALIZE_MARKER} Research is complete because the run must reserve capacity "
     "for its final structured output. Do not request more research tools. Call "
-    "submit_companies now. Include every company for which you have already read, in tool "
+    "submit_companies now with a concise decision_summary whose decision is finish. "
+    "Include every company for which you have already read, in tool "
     "results: a fetched article, a fetched job page, or a job listing returned by "
     "get_company_events naming the required index-0 event with its date, "
     "the company's own website, an employee band from the profile or an article, its HQ "
@@ -537,6 +538,26 @@ def _without_status_parts(message: messages.ModelRequest) -> messages.ModelReque
     return message if len(parts) == len(message.parts) else dataclasses.replace(message, parts=parts)
 
 
+def _without_decision_summary_parts(
+    message: messages.ModelResponse,
+) -> messages.ModelResponse:
+    """Keep recorded summaries out of later paid model context."""
+
+    changed = False
+    parts: list[messages.ModelResponsePart] = []
+    for part in message.parts:
+        if (
+            isinstance(part, messages.ToolCallPart)
+            and part.tool_name in _RESEARCH_TOOL_NAMES
+        ):
+            arguments = decision_logging.strip_decision_summary(part.args)
+            if arguments is not part.args and arguments != part.args:
+                part = dataclasses.replace(part, args=arguments)
+                changed = True
+        parts.append(part)
+    return dataclasses.replace(message, parts=parts) if changed else message
+
+
 def _process_history(
     context: RunContext[Any], history: list[messages.ModelMessage]
 ) -> list[messages.ModelMessage]:
@@ -553,6 +574,9 @@ def _process_history(
     prior_returns = set(tool_returns[:-1])
     processed: list[messages.ModelMessage] = []
     for message_index, message in enumerate(history):
+        if isinstance(message, messages.ModelResponse):
+            processed.append(_without_decision_summary_parts(message))
+            continue
         if not isinstance(message, messages.ModelRequest):
             processed.append(message)
             continue
@@ -844,6 +868,7 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
 
     def search_companies(
         query: str,
+        decision_summary: dict[str, Any],
         industry: str = "",
         geography: str = "",
         employee_count: list[str] = [],
@@ -851,7 +876,8 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
     ) -> Any:
         """Discover candidate companies with Deepline and the supplied ICP filters."""
 
-        return budget.call(
+        return decision_logging.research_call(
+            budget,
             "search_companies",
             {
                 "query": query,
@@ -860,25 +886,34 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
                 "employee_count": employee_count,
                 "limit": limit,
             },
+            decision_summary,
         )
 
-    def get_company_profile(domain: str, include_financing: bool = False) -> Any:
+    def get_company_profile(
+        domain: str,
+        decision_summary: dict[str, Any],
+        include_financing: bool = False,
+    ) -> Any:
         """Get Deepline firmographics, LinkedIn band evidence, and optionally financing."""
 
-        return budget.call(
+        return decision_logging.research_call(
+            budget,
             "get_company_profile",
             {"domain": domain, "include_financing": bool(include_financing)},
+            decision_summary,
         )
 
     def get_company_events(
         domain: str,
+        decision_summary: dict[str, Any],
         categories: list[str] = [],
         job_category: str = "",
         limit: int = 5,
     ) -> Any:
         """Find events, optionally filtering jobs by one coarse provider category."""
 
-        return budget.call(
+        return decision_logging.research_call(
+            budget,
             "get_company_events",
             {
                 "domain": domain,
@@ -886,17 +921,20 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
                 "job_category": job_category,
                 "limit": limit,
             },
+            decision_summary,
         )
 
     def search_web(
         query: str,
+        decision_summary: dict[str, Any],
         mode: str = "search",
         limit: int = 5,
         recency_days: int | None = None,
     ) -> Any:
         """Search the public web, news, or jobs for evidence."""
 
-        return budget.call(
+        return decision_logging.research_call(
+            budget,
             "search_web",
             {
                 "query": query,
@@ -904,12 +942,22 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
                 "limit": limit,
                 "recency_days": recency_days,
             },
+            decision_summary,
         )
 
-    def fetch_page(url: str, max_chars: int = 4000) -> Any:
+    def fetch_page(
+        url: str,
+        decision_summary: dict[str, Any],
+        max_chars: int = 4000,
+    ) -> Any:
         """Fetch one public evidence page and return its extracted text."""
 
-        return budget.call("fetch_page", {"url": url, "max_chars": max_chars})
+        return decision_logging.research_call(
+            budget,
+            "fetch_page",
+            {"url": url, "max_chars": max_chars},
+            decision_summary,
+        )
 
     max_output_tokens = (
         _ARENA_REQUEST_OUTPUT_TOKENS if arena_mode else _RUN_OUTPUT_TOKENS_LIMIT
@@ -998,8 +1046,12 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             timeout=run_timeout,
         )
+        model_output = result.output.model_dump(mode="json")
+        decision_logging.record_model_decision(
+            model_output.pop("decision_summary")
+        )
         companies = validate_companies(
-            result.output.model_dump(mode="json"),
+            model_output,
             max_companies,
             intent_details_policy=icp.get("intent_details_policy"),
         )
