@@ -64,6 +64,10 @@ def test_decision_summary_rejects_unbounded_or_unknown_content() -> None:
         DecisionSummary.model_validate({**SUMMARY, "rationale": "x" * 501})
     with pytest.raises(ValidationError):
         DecisionSummary.model_validate({**SUMMARY, "private_reasoning": "hidden"})
+    with pytest.raises(ValidationError):
+        DecisionSummary.model_validate(
+            {**SUMMARY, "evidence": ["\U0001f50e" * 500] * 5}
+        )
 
 
 def test_research_call_logs_exact_model_fields_without_provider_arg_leak(

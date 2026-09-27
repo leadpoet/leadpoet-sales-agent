@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 import unicodedata
 from copy import deepcopy
@@ -455,6 +456,19 @@ class DecisionSummary(BaseModel):
                 raise ValueError("decision evidence must contain 1-500 characters")
             normalized.append(item)
         return normalized
+
+    @model_validator(mode="after")
+    def validate_encoded_size(self) -> "DecisionSummary":
+        # Leave room for the host helper's control and schema-version fields.
+        encoded = json.dumps(
+            self.model_dump(mode="json", exclude_none=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        if len(encoded) > 4_000:
+            raise ValueError("decision summary exceeds the Arena frame limit")
+        return self
 
 
 class FinalDecisionSummary(DecisionSummary):
