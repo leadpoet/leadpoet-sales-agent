@@ -22,7 +22,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from experiments.harness_bakeoff import decision_logging, evidence, reverify
+from experiments.harness_bakeoff import evidence, reverify
 from experiments.harness_bakeoff.models import (
     CompaniesResult,
     _canonical_company_stage,
@@ -133,13 +133,17 @@ _FINALIZE_ELAPSED_SECONDS = _LOCAL_FINALIZE_ELAPSED_SECONDS
 _ARENA_REQUEST_OUTPUT_TOKENS = 4_096
 _RUN_OUTPUT_TOKENS_LIMIT = 28_000
 _FINALIZE_MARKER = "[research-budget-reserve]"
+_MAX_SEARCH_STREAK = 3
+_SEARCH_STREAK_ERROR = (
+    "search refused: three searches in a row without reading a page. Call fetch_page on the most "
+    "promising hit from your last searches (or get_company_profile on its company) before searching again."
+)
 _STATUS_MARKER = "[research-status]"
 _MIN_COMPANIES_BEFORE_EARLY_STOP = 3
 _FINALIZE_PROMPT = (
     f"{_FINALIZE_MARKER} Research is complete because the run must reserve capacity "
     "for its final structured output. Do not request more research tools. Call "
-    "submit_companies now with a concise decision_summary whose decision is finish. "
-    "Include every company for which you have already read, in tool "
+    "submit_companies now. Include every company for which you have already read, in tool "
     "results: a fetched article, a fetched job page, or a job listing returned by "
     "get_company_events naming the required index-0 event with its date, "
     "the company's own website, an employee band from the profile or an article, its HQ "
@@ -179,6 +183,43 @@ def _filter_explicit_stage_conflicts(
             and returned != requested
         )
     ]
+
+
+# Hosts the judge's page reader cannot use (paywall, login or bot wall). A
+# stage-evidence URL there wastes one of the investigator's three page reads
+# (arena 09-27: LaunchDarkly's cbinsights Series D link 'could not be fetched').
+_UNREADABLE_EVIDENCE_HOSTS = (
+    "cbinsights.com", "crunchbase.com", "pitchbook.com", "linkedin.com", "tracxn.com",
+    "zoominfo.com", "owler.com", "dealroom.co", "craft.co", "bloomberg.com", "wsj.com",
+    "ft.com", "growjo.com", "rocketreach.co", "cbinsights.io", "globaldata.com",
+)
+
+
+def _unreadable_evidence_host(url: Any) -> bool:
+    host = _domain_key(url)
+    return any(host == blocked or host.endswith("." + blocked) for blocked in _UNREADABLE_EVIDENCE_HOSTS)
+
+
+def _clean_stage_evidence(icp: dict[str, Any], companies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop stage-evidence links the judge cannot read; keep everything else.
+
+    The judge treats a submitted stage link as a locator: it fetches the page
+    and quotes it itself, spending one of three page reads. A link on a host
+    its reader cannot load only wastes that read (arena 09-27: LaunchDarkly's
+    cbinsights Series D link 'could not be fetched'). Quote wording is not
+    filtered: first-party 'we raised ... Series A' pages without the company
+    name still proved stage for EdgeTier and Payslip.
+    """
+
+    del icp  # the host rule is stage independent
+    for company in companies:
+        items = company.get("company_stage_evidence")
+        if isinstance(items, list) and items:
+            company["company_stage_evidence"] = [
+                item for item in items
+                if isinstance(item, dict) and not _unreadable_evidence_host(item.get("url"))
+            ][:3]
+    return companies
 
 
 def _domain_key(value: Any) -> str:
@@ -538,26 +579,6 @@ def _without_status_parts(message: messages.ModelRequest) -> messages.ModelReque
     return message if len(parts) == len(message.parts) else dataclasses.replace(message, parts=parts)
 
 
-def _without_decision_summary_parts(
-    message: messages.ModelResponse,
-) -> messages.ModelResponse:
-    """Keep recorded summaries out of later paid model context."""
-
-    changed = False
-    parts: list[messages.ModelResponsePart] = []
-    for part in message.parts:
-        if (
-            isinstance(part, messages.ToolCallPart)
-            and part.tool_name in _RESEARCH_TOOL_NAMES
-        ):
-            arguments = decision_logging.strip_decision_summary(part.args)
-            if arguments is not part.args and arguments != part.args:
-                part = dataclasses.replace(part, args=arguments)
-                changed = True
-        parts.append(part)
-    return dataclasses.replace(message, parts=parts) if changed else message
-
-
 def _process_history(
     context: RunContext[Any], history: list[messages.ModelMessage]
 ) -> list[messages.ModelMessage]:
@@ -574,9 +595,6 @@ def _process_history(
     prior_returns = set(tool_returns[:-1])
     processed: list[messages.ModelMessage] = []
     for message_index, message in enumerate(history):
-        if isinstance(message, messages.ModelResponse):
-            processed.append(_without_decision_summary_parts(message))
-            continue
         if not isinstance(message, messages.ModelRequest):
             processed.append(message)
             continue
@@ -732,6 +750,7 @@ class _ToolBudget:
         self._lock = threading.Lock()
         self._profile_lock = threading.Lock()
         self.pages: dict[str, str] = {}
+        self.search_streak = 0
 
     def deepline_calls(self) -> int:
         return int(getattr(self.client, "deepline_calls", 0) or 0)
@@ -761,6 +780,11 @@ class _ToolBudget:
             with self._lock:
                 if self.calls >= self.maximum:
                     raise RuntimeError(f"provider-call limit of {self.maximum} exceeded")
+                # Arena 09-27 ICP01: 23 news searches in a row, no page read,
+                # nothing submitted. Refuse (free) a fourth consecutive search.
+                if name == "search_web" and self.search_streak >= _MAX_SEARCH_STREAK:
+                    return {"ok": False, "error": _SEARCH_STREAK_ERROR}
+                self.search_streak = self.search_streak + 1 if name == "search_web" else 0
                 if self.deepline_calls() >= _RESEARCH_DEEPLINE_CALLS:
                     return {"ok": False, "error": "provider budget exhausted: call submit_companies now"}
                 if over_spend:
@@ -868,7 +892,6 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
 
     def search_companies(
         query: str,
-        decision_summary: dict[str, Any],
         industry: str = "",
         geography: str = "",
         employee_count: list[str] = [],
@@ -876,8 +899,7 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
     ) -> Any:
         """Discover candidate companies with Deepline and the supplied ICP filters."""
 
-        return decision_logging.research_call(
-            budget,
+        return budget.call(
             "search_companies",
             {
                 "query": query,
@@ -886,34 +908,25 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
                 "employee_count": employee_count,
                 "limit": limit,
             },
-            decision_summary,
         )
 
-    def get_company_profile(
-        domain: str,
-        decision_summary: dict[str, Any],
-        include_financing: bool = False,
-    ) -> Any:
+    def get_company_profile(domain: str, include_financing: bool = False) -> Any:
         """Get Deepline firmographics, LinkedIn band evidence, and optionally financing."""
 
-        return decision_logging.research_call(
-            budget,
+        return budget.call(
             "get_company_profile",
             {"domain": domain, "include_financing": bool(include_financing)},
-            decision_summary,
         )
 
     def get_company_events(
         domain: str,
-        decision_summary: dict[str, Any],
         categories: list[str] = [],
         job_category: str = "",
         limit: int = 5,
     ) -> Any:
         """Find events, optionally filtering jobs by one coarse provider category."""
 
-        return decision_logging.research_call(
-            budget,
+        return budget.call(
             "get_company_events",
             {
                 "domain": domain,
@@ -921,20 +934,17 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
                 "job_category": job_category,
                 "limit": limit,
             },
-            decision_summary,
         )
 
     def search_web(
         query: str,
-        decision_summary: dict[str, Any],
         mode: str = "search",
         limit: int = 5,
         recency_days: int | None = None,
     ) -> Any:
         """Search the public web, news, or jobs for evidence."""
 
-        return decision_logging.research_call(
-            budget,
+        return budget.call(
             "search_web",
             {
                 "query": query,
@@ -942,22 +952,12 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
                 "limit": limit,
                 "recency_days": recency_days,
             },
-            decision_summary,
         )
 
-    def fetch_page(
-        url: str,
-        decision_summary: dict[str, Any],
-        max_chars: int = 4000,
-    ) -> Any:
+    def fetch_page(url: str, max_chars: int = 4000) -> Any:
         """Fetch one public evidence page and return its extracted text."""
 
-        return decision_logging.research_call(
-            budget,
-            "fetch_page",
-            {"url": url, "max_chars": max_chars},
-            decision_summary,
-        )
+        return budget.call("fetch_page", {"url": url, "max_chars": max_chars})
 
     max_output_tokens = (
         _ARENA_REQUEST_OUTPUT_TOKENS if arena_mode else _RUN_OUTPUT_TOKENS_LIMIT
@@ -1046,17 +1046,14 @@ async def _run(icp: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             timeout=run_timeout,
         )
-        model_output = result.output.model_dump(mode="json")
-        decision_logging.record_model_decision(
-            model_output.pop("decision_summary")
-        )
         companies = validate_companies(
-            model_output,
+            result.output.model_dump(mode="json"),
             max_companies,
             intent_details_policy=icp.get("intent_details_policy"),
         )
         companies = _filter_explicit_stage_conflicts(icp, companies)
         companies = _harden_output(icp, companies)
+        companies = _clean_stage_evidence(icp, companies)
         report: list[str] = []
         companies = evidence.verify_companies(
             icp,

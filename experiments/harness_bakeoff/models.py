@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import re
 import unicodedata
 from copy import deepcopy
 from datetime import date as ISODate
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from pydantic import (
@@ -394,6 +393,20 @@ class CompanyResult(_CompanyFields):
         return [_public_http_url(value) for value in values]
 
 
+class StageEvidence(BaseModel):
+    """One source passage for the judge's stage research (Arena v6 company_stage_evidence)."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    url: str = Field(max_length=2_048)
+    quote: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        return _public_http_url(value)
+
+
 class IntentDetailsCompanyResult(_CompanyFields):
     intent_details: str = Field(
         min_length=1,
@@ -404,6 +417,16 @@ class IntentDetailsCompanyResult(_CompanyFields):
         ),
     )
     intent_signals: list[IntentDetailsSignal] = Field(min_length=1)
+    # v6 has no fit_evidence_urls: without this field every stage proof the
+    # agent found was dropped and the judge had to rediscover the stage.
+    company_stage_evidence: list[StageEvidence] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "Up to three {url, quote} passages from fetched pages proving the company's "
+            "current stage: latest round announcement, exchange listing, or PE acquisition."
+        ),
+    )
     required_attribute: Optional[RequiredAttributeEvidence] = None
 
     @field_validator("intent_details", mode="before")
@@ -432,61 +455,14 @@ class IntentDetailsContactCompanyResult(IntentDetailsCompanyResult):
     contact: Optional[ContactResult] = None
 
 
-class DecisionSummary(BaseModel):
-    """One concise model-authored decision for the private Arena trajectory."""
-
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    objective: str = Field(min_length=1, max_length=500)
-    evidence: list[str] = Field(min_length=0, max_length=5)
-    rationale: str = Field(min_length=1, max_length=500)
-    next_action: str = Field(min_length=1, max_length=500)
-    decision: Literal["investigate", "accept", "reject", "defer", "finish"]
-    candidate: Optional[str] = Field(default=None, min_length=1, max_length=500)
-
-    @field_validator("evidence")
-    @classmethod
-    def validate_evidence(cls, values: list[str]) -> list[str]:
-        normalized: list[str] = []
-        for value in values:
-            if not isinstance(value, str):
-                raise ValueError("decision evidence must contain strings")
-            item = value.strip()
-            if not item or len(item) > 500:
-                raise ValueError("decision evidence must contain 1-500 characters")
-            normalized.append(item)
-        return normalized
-
-    @model_validator(mode="after")
-    def validate_encoded_size(self) -> "DecisionSummary":
-        # Leave room for the host helper's control and schema-version fields.
-        encoded = json.dumps(
-            self.model_dump(mode="json", exclude_none=True),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        if len(encoded) > 4_000:
-            raise ValueError("decision summary exceeds the Arena frame limit")
-        return self
-
-
-class FinalDecisionSummary(DecisionSummary):
-    """The final model-authored decision attached to submit_companies."""
-
-    decision: Literal["finish"]
-
-
 class CompaniesResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     companies: list[CompanyResult] = Field(default_factory=list)
-    decision_summary: FinalDecisionSummary
 
 
 class IntentDetailsCompaniesResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     companies: list[IntentDetailsCompanyResult] = Field(default_factory=list)
-    decision_summary: FinalDecisionSummary
 
 
 def companies_result_model(intent_details_policy: Any = None) -> type[BaseModel]:

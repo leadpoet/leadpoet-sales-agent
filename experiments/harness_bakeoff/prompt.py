@@ -12,10 +12,8 @@ from .models import normalize_icp, uses_intent_details
 
 SYSTEM_PROMPT = """You are a rigorous B2B account researcher. Find companies that fit the supplied ICP and have the REQUIRED recent intent. Use only the provided tools. Never rely on memory for a factual claim. Verify company fit, company stage, every required attribute, and each intent against public source content. Preserve exact source URLs and reject stale, ambiguous, homepage-only, or wrong-company evidence. Prefer direct company, job, regulatory, filing, or reputable news pages. Return at most the requested number, ranked best first. Explain fit and why-now in plain language useful to a salesperson. Do not invent missing facts. Call submit_companies exactly once when done.
 
-Every research tool call includes decision_summary. Write a concise disclosed audit summary, not private chain-of-thought. State the immediate objective, the decision (investigate, accept, reject, or defer), a short evidence-based rationale, and the next action represented by the tool call. Evidence must contain only short facts or public URLs already returned by tools; use an empty list before evidence exists and never invent support. Candidate is optional. The final submit_companies output includes one decision_summary with decision finish, the evidence that supports stopping, and no new factual claim.
-
 How the judge scores, which shapes every decision:
-1. Fit earns no points. It is a pass/fail gate: an independent web verifier must itself find the company's name and website, employee band, industry, HQ country, the required stage, and the required attribute. Anything it cannot find publicly scores 0; a proven contradiction (wrong country, wrong band, a different stage, an excluded company, a false required attribute) costs 10. So prefer companies with a LinkedIn company page, press coverage naming the funding round, and an obvious industry, and never state a band, stage, or country you did not read.
+1. Fit earns no points but gates everything, and it is where nine in ten companies now fail. An independent investigator with only three page reads must quote a fetched page proving that the company itself sells the ICP's exact product: the sub-industry, the product/service and every clause of the required attribute, including business-model and customer words (for example 'subscription or transaction-based', 'used by businesses', 'physical hardware with connected software'). An adjacent business fails: consumer rent rewards is not lending, and a homebuilder is not commercial real estate. Job posts, customer stories, partner or integration pages, directories and news roundups do not prove what a company sells. It must also find the employee band, HQ country and the required stage stated outright. Anything it cannot prove scores 0; a proven contradiction (wrong country, band or stage, an excluded company, a false required attribute) costs 10. So pick companies whose own site plainly describes the exact product, and never state a band, stage, or country you did not read.
 2. Points come only from verified intent signals: about 60 for one, 80 for two on different websites, 88 for three. A second source for a company you already verified costs one or two calls; a new company costs many and qualifies half the time. So once a company's index-0 event verifies, fetch one independent page on another domain reporting that same event and attach it as a second index-0 signal before moving on. If either source verifies, the company still scores.
 3. Signals on the same website count once. Any event inside the ICP's max_age_days is creditable; prefer recent evidence, but an extra verified company is worth far more than a fresher event on one you already have.
 4. The judge re-fetches every URL and checks that the company name appears on the page, that the snippet is verbatim page text (12 to 40 consecutive words), and that the event words in the description are on the page. Copy the snippet from the fetched article body; never paraphrase it.
@@ -91,6 +89,8 @@ def build_prompt(icp: dict[str, Any], max_companies: int | None = None) -> str:
         else ""
     )
     required_attribute = str(normalized.get("required_attribute") or "").strip()
+    required_sub_industry = str(normalized.get("sub_industry") or "").strip()
+    required_product = str(normalized.get("product_service") or "").strip()
     target_roles = [
         str(role).strip()
         for role in (normalized.get("target_roles") or [])
@@ -214,6 +214,21 @@ def build_prompt(icp: dict[str, Any], max_companies: int | None = None) -> str:
         if example_company
         else ""
     )
+    fit_evidence_guidance = (
+        "- company_stage_evidence: one or two {url, quote} entries from pages you fetched, each a verbatim "
+        "sentence naming the company. Series stages: its latest completed round ('Acme raised $20 million in "
+        "Series A funding') from its own newsroom or blog, a newswire release, or news coverage; Series C+ "
+        "means Series C or later. Public: the first sentence of a recent issuer press release naming it with "
+        "its ticker ('Acme Inc. (NASDAQ: ACME) today announced'); search '<name> NYSE OR Nasdaq press "
+        "release' when you have none. Private Equity: current ownership, such as the firm's portfolio page or "
+        "the company's own page naming its owner; an old deal announcement alone is not current. The judge "
+        "cannot read cbinsights, crunchbase, pitchbook, linkedin, tracxn or zoominfo; never cite them. Prefer "
+        "HTML pages to PDFs.\n"
+        if intent_details_enabled
+        else "- fit_evidence_urls, in this order: the page stating the headcount or band, then the page naming "
+        "the current stage (round announcement, exchange listing, or controlling PE owner), then the "
+        "page stating HQ. The verifier reads only the first three and rejects an unprovable band.\n"
+    )
     explanation_guidance = (
         "- Write intent_details as one concise, natural paragraph that covers every distinct "
         "supported signal in intent_signals. The judge checks every factual clause (amount, date, "
@@ -264,6 +279,9 @@ def build_prompt(icp: dict[str, Any], max_companies: int | None = None) -> str:
         "Required fit:\n"
         f"- Geography: {required_geography or 'not specified'}\n"
         f"- Company stage: {required_stage or 'not specified'}\n"
+        f"- Industry: {normalized.get('industry') or 'not specified'}; sub-industry: "
+        f"{required_sub_industry or 'not specified'}\n"
+        f"- Product/service the company must sell: {required_product or 'not specified'}\n"
         f"- Required attribute: {required_attribute or 'not specified'}\n"
         f"{certification_guidance}"
         f"{hiring_guidance}"
@@ -293,10 +311,25 @@ def build_prompt(icp: dict[str, Any], max_companies: int | None = None) -> str:
         "linkedin_profile_evidence Company size label; a headcount stated in the fetched primary article or a "
         "dated press release from the last 12 months ('employs about 180 people' supports 51-200); a current "
         "company page stating team size. One such source is enough; do not spend more than one extra call on it.\n"
-        "- If required_attribute exists, return its literal text, passed=true, direct evidence URL, quote, "
-        "and explanation; omit the company if that evidence cannot be verified. With no requirement, no "
-        "required_attribute object is needed.\n\n"
+        "- Fit proof, before any intent work on a candidate: fetch its own homepage, product, about or pricing "
+        "page (or the About paragraph of its own press release) and find one verbatim sentence stating what the "
+        "company sells and to whom. Check it clause by clause against the sub-industry, product_service and "
+        "required attribute; every clause, including business model and customer type, must be stated or "
+        "plainly equivalent. If one is missing, read at most one more first-party page (pricing or product); "
+        "if it is still missing, or the company only serves, uses or neighbours that market, drop it and take "
+        "the next candidate. The judge is literal: each key word of the attribute and sub-industry (for example "
+        "'subscription', 'transaction-based', 'hardware', 'commercial', 'lending') must appear in your quote "
+        "or as an exact synonym; a pricing table without the word subscription does not prove a subscription "
+        "model. When the sub-industry names a service business (consulting, brokerage, lending, clinics, "
+        "manufacturing), the company must be that business; a software vendor to it fails unless the "
+        "sub-industry or attribute itself names software or a platform.\n"
+        "- If required_attribute exists, return its literal text, passed=true, that first-party page as "
+        "evidence_url, the verbatim 12-40 word sentence naming the company (or 'we') as evidence_quote, and "
+        "an explanation mapping each clause to the quote. Never cite a job post, customer story, partner page, "
+        "directory or third-party article there. With no requirement, no required_attribute object is needed.\n\n"
         "Research order and limits:\n"
+        "00f. Fit first: a roundup or news hit only names candidates. Before verifying a candidate's event, spend "
+        "one fetch_page on its own site to pass the fit proof above, and drop adjacent businesses at once.\n"
         "00. Yield: the score is the sum over five slots, so aim for three to five verified companies per ICP. "
         "The fastest source is a dated roundup (weekly funding roundups, launch or expansion digests, lists of new "
         "facilities or hires) that names several companies with the required event: one fetch_page can seed several "
@@ -367,9 +400,7 @@ def build_prompt(icp: dict[str, Any], max_companies: int | None = None) -> str:
         "- For index 0 attach the fetched primary event with the article's own date, its exact URL, and a verbatim "
         "12-40 word quote from the article body. A second index-0 signal is worth more only on a different website "
         "(for example the company's own announcement plus a news article); never attach two URLs from one site.\n"
-        "- fit_evidence_urls, in this order: the page stating the headcount or band, then the page naming "
-        "the current stage (round announcement, exchange listing, or controlling PE owner), then the "
-        "page stating HQ. The verifier reads only the first three and rejects an unprovable band.\n"
+        f"{fit_evidence_guidance}"
         "- company_name must be the name exactly as the company writes it on its own site, not a legal-entity form. "
         "Leave company_linkedin empty.\n"
         f"{explanation_guidance}"

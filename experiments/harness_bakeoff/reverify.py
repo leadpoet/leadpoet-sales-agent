@@ -102,6 +102,23 @@ def _parse_json(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+_EXCHANGE_TICKER_RE = re.compile(r"\((?:nasdaq|nyse|nyse american|tsx|lse|asx)\s*:\s*[a-z0-9.]+\)", re.I)
+
+
+def _stage_evidence_names(company: Mapping[str, Any], required_stage: str) -> bool:
+    """True when a fetched company_stage_evidence quote itself names the required stage."""
+
+    for item in company.get("company_stage_evidence") or []:
+        quote = str((item or {}).get("quote") or "") if isinstance(item, Mapping) else ""
+        if not quote:
+            continue
+        if normalize_stage(quote) == required_stage:
+            return True
+        if required_stage == "public" and _EXCHANGE_TICKER_RE.search(quote):
+            return True
+    return False
+
+
 def decide(verdict: Mapping[str, Any], company: Mapping[str, Any], icp: Mapping[str, Any]) -> tuple[str, str]:
     """Return ("keep" | "drop" | "unknown", reason). Drop only on a sourced contradiction."""
 
@@ -123,7 +140,10 @@ def decide(verdict: Mapping[str, Any], company: Mapping[str, Any], icp: Mapping[
     required_stage = normalize_stage(icp.get("company_stage"))
     observed_stage = normalize_stage(verdict.get("observed_stage"))
     if required_stage and observed_stage and observed_stage != required_stage:
-        if sourced:
+        # A fetched round announcement naming the required stage outranks a
+        # search model's summary (arena 09-27: Mesta's own $5.5M seed release
+        # was dropped as 'bootstrapped'); keep the company, ranked unconfirmed.
+        if sourced and not _stage_evidence_names(company, required_stage):
             return "drop", f"stage {observed_stage!r} contradicts required {required_stage!r}"
         reasons.append("stage unconfirmed")
 
@@ -190,6 +210,13 @@ async def rerank(
             unknown.append(company)
             continue
         decision, reason = decide(verdict, company, icp)
+        # The judge investigates stage, HQ and band itself with fetched quotes;
+        # this search model's summary was wrong for two of three drops on the
+        # 09-27 ICPs (Mesta 'bootstrapped', UltraSight 'Israel', which qualified
+        # in production). A lost company costs far more than a -10 contradiction,
+        # so only a name/website mismatch still drops; other conflicts rank last.
+        if decision == "drop" and not reason.startswith("verifier says the name and website"):
+            decision, reason = "unknown", f"flagged, kept: {reason}"
         log.append(f"{name}: {decision} ({reason})")
         if decision == "drop":
             continue

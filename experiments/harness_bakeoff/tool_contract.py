@@ -37,31 +37,6 @@ PREDICTLEADS_JOB_CATEGORIES = (
 )
 _PREDICTLEADS_JOB_CATEGORY_SET = frozenset(PREDICTLEADS_JOB_CATEGORIES)
 
-_DECISION_SUMMARY_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "description": (
-        "A concise disclosed research decision based only on evidence already observed. "
-        "This is an audit summary, not hidden reasoning."
-    ),
-    "properties": {
-        "objective": {"type": "string", "minLength": 1, "maxLength": 500},
-        "evidence": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1, "maxLength": 500},
-            "maxItems": 5,
-        },
-        "rationale": {"type": "string", "minLength": 1, "maxLength": 500},
-        "next_action": {"type": "string", "minLength": 1, "maxLength": 500},
-        "decision": {
-            "type": "string",
-            "enum": ["investigate", "accept", "reject", "defer", "finish"],
-        },
-        "candidate": {"type": "string", "minLength": 1, "maxLength": 500},
-    },
-    "required": ["objective", "evidence", "rationale", "next_action", "decision"],
-    "additionalProperties": False,
-}
-
 
 TOOL_DESCRIPTIONS = {
     "search_companies": (
@@ -175,15 +150,12 @@ def validate_job_category(value: Any) -> str | None:
 
 
 def tool_input_schema(name: str) -> dict[str, Any]:
-    """Return an isolated schema with one model-authored decision summary."""
+    """Return an isolated copy so framework adapters cannot mutate the contract."""
 
     try:
-        schema = deepcopy(_INPUT_SCHEMAS[name])
+        return deepcopy(_INPUT_SCHEMAS[name])
     except KeyError as exc:
         raise ValueError(f"no shared input schema for tool {name!r}") from exc
-    schema["properties"]["decision_summary"] = deepcopy(_DECISION_SUMMARY_SCHEMA)
-    schema["required"] = [*schema.get("required", []), "decision_summary"]
-    return schema
 
 
 __all__ = [

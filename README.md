@@ -122,27 +122,6 @@ In the Arena, reasoning uses OpenRouter and research uses Deepline, including
 Exa search and page contents through Deepline. No separate Exa or ScrapingDog
 key is required for this native path. The standalone tools below remain separate.
 
-## Private decision summaries
-
-The Arena supplies `lab_arena_checkpoint.log_decision(...)` for private,
-best-effort operator diagnostics. This baseline attaches one concise
-`decision_summary` to each existing research action and to its final output,
-then forwards the exact model-authored fields to that helper. The summary is
-removed before provider tool arguments and the scored companies document are
-built, so it adds no provider action or model turn and does not change the
-public output contract.
-
-These summaries state an objective, observed evidence, a short rationale, the
-next action, and one of `investigate`, `accept`, `reject`, `defer`, or `finish`.
-They are disclosed conclusions, not hidden chain-of-thought. Evidence must come
-from prior tool results. The helper is fail-open: an older host or unavailable
-private log never changes research, output, cost admission, or scoring.
-
-Future miner harnesses can call the same helper when it is available. A future
-promotion replaces this repository tree with the winning submission, so a
-winner must include its own model-side calls if it wants to keep these private
-decision summaries.
-
 ## Miner competition contract
 
 Miners can fork this repository and change the model, harness, prompts,
@@ -232,3 +211,4 @@ while this harness stopped research at about 26 Deepline calls and 220 s. Resear
 fit a shorter LAB_ARENA_WALL_CLOCK_SECONDS window). Spend stays bounded by the host-reported sourcing
 cost gates, raised slightly to $0.58 finalize / $0.64 no new paid research / $0.72 no optional post-run
 fetches, so one qualified company keeps an ICP under the $0.80 per-company cost rule.
+
