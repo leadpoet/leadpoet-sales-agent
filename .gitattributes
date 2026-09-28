@@ -1,2 +1,3 @@
 # Unit-test examples are not part of the submitted research model.
 tests export-ignore
+.gitattributes export-ignore
