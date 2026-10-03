@@ -108,6 +108,9 @@ MIN_CONTACT_USD = 0.02
 MAX_PAIRS = 5
 REVERIFY_EST_USD = 0.016
 PARAGRAPH_MAX_USD = 0.06
+ATS_BONUS = _strategy_number("ats_bonus", 1, 0, 1) >= 1
+ATS_PICK_MODEL = str(_STRATEGY.get("ats_pick_model") or "google/gemini-2.5-flash")
+ATS_BONUS_SECONDS = _strategy_number("ats_bonus_seconds", 150.0, 10.0, 400.0)
 RESERVE_DRAFTS = int(_strategy_number("reserve_drafts", 0, 0, 5))
 REVERIFY_MAX_COMPANIES = 8
 RESERVE_CHECKED = 3
@@ -1135,6 +1138,33 @@ def run_icp(icp: dict) -> list[dict]:
                  "contact": "complete" if c.get("contact") else "missing",
                  "state": "awaiting_paragraph" if c.get("contact") else "incomplete_no_contact"}
                 for c in companies]
+        if companies and ATS_BONUS and time.monotonic() < phase_deadline - 60.0:
+            try:
+                try:
+                    from . import ats_bonus as _ats
+                except ImportError:
+                    _ats = importlib.import_module(f"{os.path.basename(_HERE)}.ats_bonus")
+                try:
+                    from . import scout as _scout_llm
+                except ImportError:
+                    _scout_llm = importlib.import_module(f"{os.path.basename(_HERE)}.scout")
+                _factory = _http_client_factory()
+
+                def _pick_llm(prompt: str, deadline: float) -> Any:
+                    return _scout_llm.llm_json(prompt, http_client_factory=_factory, max_tokens=200,
+                                               model=ATS_PICK_MODEL, deadline=deadline)
+
+                LAST_REPORT["ats_bonus"] = _ats.attach_hiring_signals(
+                    companies, icp, report.evidence, sm.company_name_key, today=sm.evaluation_date(),
+                    deadline=min(phase_deadline - 45.0, time.monotonic() + ATS_BONUS_SECONDS), llm_json=_pick_llm)
+                for c in companies:
+                    key = sm.company_name_key(str(c.get("company_name") or ""))
+                    if paragraph_on and key in report.evidence:
+                        c["intent_details"] = details_module.fallback_paragraph(
+                            company_name=str(c.get("company_name") or ""), icp=icp, signals=report.evidence[key])
+                checkpoint(companies, schema=schema, limit=limit)
+            except Exception as exc:
+                LAST_REPORT["ats_bonus"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
         release_holdback(tools)
         if companies and paragraph_on:
             remaining_short = phase_deadline - time.monotonic()

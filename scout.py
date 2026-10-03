@@ -33,9 +33,9 @@ FREE_ROWS_PER_QUERY = 10
 EXA_ENOUGH_ROWS = 20
 MAX_CANDIDATES = int(STRATEGY.get("scout_candidates") or 12)
 BUDGET_USD = float(STRATEGY.get("scout_budget_usd") or 0.30)
-LLM_TIMEOUT = 60.0
+LLM_TIMEOUT = 100.0  # v1: gemini extraction on 16k-char batches can exceed 60 s; the broker bounds chat at 120 s
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-LLM_STATUS_RETRIES = 2
+LLM_STATUS_RETRIES = 3
 BACKOFF_S = (2.0, 5.0)
 SLEEP = time.sleep
 RUN_DEADLINE: Optional[float] = None
@@ -259,7 +259,9 @@ def salvage_json(content: str) -> Optional[Any]:
 def llm_json(prompt: str, *, http_client_factory=None, max_tokens: int = 2000, model: Optional[str] = None,
              deadline: Optional[float] = None) -> Optional[Any]:
     limit = deadline if deadline is not None else RUN_DEADLINE
-    transport_left, status_left, timeout = 1, LLM_STATUS_RETRIES, LLM_TIMEOUT
+    transport_left, status_left, timeout = 3, LLM_STATUS_RETRIES, LLM_TIMEOUT
+    if limit is not None:
+        timeout = max(15.0, min(LLM_TIMEOUT, limit - time.monotonic()))
     while True:
         try:
             return asyncio.run(_ask(prompt, http_client_factory=http_client_factory, max_tokens=max_tokens,
@@ -276,7 +278,10 @@ def llm_json(prompt: str, *, http_client_factory=None, max_tokens: int = 2000, m
             LAST.setdefault("llm_errors", []).append(f"{type(exc).__name__}: {str(exc)[:80]}")
             if transport_left <= 0 or ("Transport" not in type(exc).__name__ and "Timeout" not in type(exc).__name__):
                 return None
-            transport_left -= 1
+            room = LLM_TIMEOUT if limit is None else limit - time.monotonic()
+            if room < 20.0:
+                return None
+            transport_left, timeout = transport_left - 1, min(LLM_TIMEOUT, room)
 
 
 def _icp_brief(icp: Mapping[str, Any]) -> dict[str, Any]:
