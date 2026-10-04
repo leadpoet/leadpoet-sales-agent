@@ -1,17 +1,4 @@
-"""Loop 20260923T0503Z s8 "roster": company-first discovery beside scout's event-first search.
-
-Why (d7: s7 on the 09-23 ICPs under the company-only judge, upstream 52562079):
-  * event-first search returned companies on 4 of 10 ICPs; the others found no in-bucket subject of an event;
-  * the platform's contextdev_post_news_search is a per-COMPANY lookup (x3): one domain's dated primary stories
-    (title, excerpt, url, published_at) at $0 -- e.g. Moov's Business Wire launch dated the day before the round;
-  * every ICP names one excluded company, the exemplar the ICP was written from (atturra.com for the Sydney
-    consulting ICP, finexio.com for the payments one), so its peers are the pool to search.
-
-Roster asks one strong model for up to ROSTER_SIZE real companies inside the ICP's hard buckets (the exemplar's
-peers first), reads each company's dated news for free, keeps the in-window primary stories whose headline or
-excerpt carries the ICP's intent category, lets one cheap model call confirm which story reports the company's
-own qualifying event, and hands those companies to scout's resolve -> fits -> stage -> draft path.
-"""
+"""S8 "roster": company-first discovery beside scout's event-first search."""
 
 from __future__ import annotations
 
@@ -68,22 +55,38 @@ def roster_prompt(icp: Mapping[str, Any]) -> str:
         "or city means the headquarters is there -- an office there is not enough); their LinkedIn employee count is "
         "inside employee_count; their stage is company_stage (Seed / Series A / Series B = the latest priced round, so "
         "young startups; Series C+ = raised Series C or later and still private and venture-backed; Private Equity = "
-        "owned by a private-equity firm; Public = listed on a stock exchange). %sPrefer companies likely to have shown "
+        "owned by a private-equity firm; Public = listed on a stock exchange). %s"
+        "When required_attribute says the company operates or runs a business (a school, carrier, lender, clinic, "
+        "energy producer, payments processor, consultancy), list only companies that ARE that business: a software "
+        "or service vendor selling to such businesses does not qualify unless product_service or required_attribute "
+        "itself asks for software or a platform. Prefer companies likely to have shown "
         "the intent signal within intent_max_age_days before %s. Every company is verified afterwards, so include "
-        "likely fits rather than stopping early, but never invent a company. Give each company's primary website "
-        "domain exactly (e.g. acme.com). Return {\"companies\": [{\"name\": \"...\", \"domain\": \"...\"}]}."
+        "likely fits rather than stopping early, but never invent a company, and list only companies operating today "
+        "under that name. Give each company's primary website domain exactly (e.g. acme.com), its current stock "
+        "ticker as EXCHANGE: SYMBOL (\"\" when not listed), and core = false when its main business is not "
+        "sub_industry (an adjacent business, e.g. a residential brokerage for a commercial real estate profile). "
+        "Return {\"companies\": [{\"name\": \"...\", \"domain\": \"...\", \"ticker\": \"...\", \"core\": true}]}."
         "\n\nICP: %s" % (ROSTER_SIZE, seed, sm.evaluation_date().isoformat(), json.dumps(brief, default=str)[:3000]))
 
 
-def roster(icp: Mapping[str, Any], *, llm_json, http_client_factory=None) -> list[dict[str, Any]]:
-    parsed = llm_json(roster_prompt(icp), http_client_factory=http_client_factory, max_tokens=2500, model=ROSTER_MODEL)
+def roster(icp: Mapping[str, Any], *, llm_json, http_client_factory=None, notes: Optional[dict] = None) -> list[dict[str, Any]]:
+    """The model's peer list.  Every roster company costs a news lookup from the per-ICP Deepline call quota, so an
+    entry the model marks off-core, or (for a Public ICP, once the model gives tickers at all) one without a ticker,
+    is skipped before any lookup."""
+
+    parsed = llm_json(roster_prompt(icp), http_client_factory=http_client_factory, max_tokens=3000, model=ROSTER_MODEL)
     raw = parsed.get("companies") if isinstance(parsed, dict) else (parsed if isinstance(parsed, list) else [])
+    raw = [item for item in (raw if isinstance(raw, list) else []) if isinstance(item, dict)]
     excluded = [str(x).strip().lower() for x in icp.get("excluded_companies") or [] if str(x).strip()]
     banned = {sm.company_name_key(x) for x in excluded} | {_domain(x) for x in excluded if "." in x}
+    public = sm.normalize_stage(icp.get("company_stage")) == "public"
+    tickers = any(str(item.get("ticker") or "").strip() for item in raw)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in raw if isinstance(raw, list) else []:
-        if not isinstance(item, dict):
+    for item in raw:
+        if item.get("core") is False or (public and tickers and not str(item.get("ticker") or "").strip()):
+            if notes is not None:
+                notes.setdefault("skipped", []).append(str(item.get("name") or "")[:60])
             continue
         name = " ".join(str(item.get("name") or item.get("company_name") or "").split())[:120]
         domain = _domain(str(item.get("domain") or ""))
@@ -103,7 +106,7 @@ _NOT_COMPANY_HOSTS = ("linktr.ee", "linkedin.", "facebook.", "crunchbase.", "wik
 
 
 def company_search_queries(icp: Mapping[str, Any]) -> list[str]:
-    """Two Exa company-category queries (x4: they return in-region company homepages, recent startups included)."""
+    """Two Exa company-category queries."""
 
     from .scout import region_places
 
@@ -193,8 +196,7 @@ def story_rows(icp: Mapping[str, Any], companies: list[dict[str, Any]], news: Ma
 
 
 def short_feed(stories: list[Mapping[str, Any]], window: int, *, age_days) -> bool:
-    """True when the free lookup is saturated (>= SATURATED_ROWS dated stories) and its oldest story is younger than
-    half the ICP's window: the company's own events inside the window are mostly out of its reach."""
+    """True when the free lookup is saturated (>= SATURATED_ROWS dated stories) and its oldest story is younger than."""
 
     ages = [a for a in (age_days(s.get("published_date")) for s in stories or []) if a is not None]
     return len(ages) >= SATURATED_ROWS and max(ages) < max(30, int(window or 365) // 2)
@@ -203,10 +205,7 @@ def short_feed(stories: list[Mapping[str, Any]], window: int, *, age_days) -> bo
 def searched_rows(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, Any]], news: Mapping[str, list[dict[str, Any]]],
                   rows: list[dict[str, Any]], category: str, *, age_days, deadline: float, clock,
                   tried: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    """Story rows from one Exa event search per short-feed company, in roster order, capped at EVENT_COMPANIES.
-
-    Loop s27 (d25): a feed row that only matched the category words ('CrowdStrike Named a Leader in ...') no longer
-    exempts a company -- CrowdStrike, Fortinet and N-able were never searched although their releases qualified."""
+    """Story rows from one Exa event search per short-feed company, in roster order, capped at EVENT_COMPANIES."""
 
     if not EVENT_SEARCH or category not in CATEGORY_WORDS or category == "HIRING":
         return []
@@ -228,7 +227,8 @@ def classify_prompts(icp: Mapping[str, Any], rows: list[dict[str, Any]]) -> list
         if batches[-1] and len(json.dumps(batches[-1] + [item])) > CLASSIFY_BATCH_CHARS:
             batches.append([])
         batches[-1].append(item)
-    signal = " ".join(str(s) for s in icp.get("intent_signals") or [icp.get("intent_signal") or ""])
+    from .scout import primary_signal
+    signal = primary_signal(icp)
     return [(
         "Each row is a dated news story about the named company. Keep only the rows that report that THIS company "
         "itself did what the intent signal describes -- the event itself (e.g. its own funding round, its own "
@@ -287,9 +287,13 @@ def run_roster(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_d
                http_client_factory=None, last: dict[str, Any], event_companies=(), max_companies: int = MAX_ROSTER,
                search_companies: bool = True) -> list[dict[str, Any]]:
     category = intent_category(icp, kind)
-    listed = roster(icp, llm_json=llm_json, http_client_factory=http_client_factory)
+    notes: dict[str, Any] = {}
+    listed = roster(icp, llm_json=llm_json, http_client_factory=http_client_factory, notes=notes)
+    # Exa's company category returns small private firms with no stage signal: for a Public ICP each would only spend
+    # a news lookup before resolution drops it as privately held.
+    public = sm.normalize_stage(icp.get("company_stage")) == "public"
     try:
-        searched = company_search(tools, icp) if COMPANY_SEARCH and search_companies else []
+        searched = company_search(tools, icp) if COMPANY_SEARCH and search_companies and not public else []
     except BudgetExhausted:
         searched = []
     companies, seen = [], set()
@@ -324,7 +328,7 @@ def run_roster(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_d
             rows.append(dict(row, id=len(rows)))
     cands = pick_events(icp, rows, llm_json=llm_json, http_client_factory=http_client_factory) if rows else []
     last["roster"] = {"category": category, "companies": [c["company_name"] for c in companies],
-                      "listed": len(listed), "searched": len(searched),
+                      "listed": len(listed), "searched": len(searched), "skipped": notes.get("skipped", []),
                       "with_news": sum(1 for c in companies if news.get(c["domain"])), "story_rows": len(rows),
                       "event_search_tried": tried, "event_search_rows": len(extra),
                       "event_search_companies": sorted({r["company"] for r in extra}),

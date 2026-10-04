@@ -1,1 +1,1 @@
-"""Our Lab Arena submission source. Entry: harness.run_icp."""
+"""Our Lab Arena submission source."""

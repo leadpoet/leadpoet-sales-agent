@@ -1,16 +1,4 @@
-"""Loop s22: proof-source admissibility and press-release datelines, written from the judge's stated rules.
-
-1. The judge keeps an explicit proof-source qualifier of the ICP's intent signal (upstream 5fc93688, prompts/_common.py
-   PART A): when the signal asks for "a press release, product page, or company announcement", an independent article is
-   not one of those sources.  d19 (09-25 bank) ICP 008 asked for "a press release, investor post, or product update" and
-   Feldera's FinSMEs article came back contradicted: an unverified primary costs 10 raw points (-2 per ICP).
-2. A press release is dated by its body dateline ("San Francisco, CA - April 22, 2025 - ..."), not by page metadata.
-   d19 Deck: datePublished 2026-02-27 in the page head, dateline 2025-04-22 in the body -> outside the 365-day window,
-   contradicted, -2 per ICP.
-
-Only a KNOWN independent publisher is excluded: unknown hosts (a partner's page, an investor's post, a trade body) stay,
-because a wrong exclusion loses a company while a wrong inclusion costs the same penalty the s19 build already risked.
-"""
+"""Proof-source admissibility and press-release datelines, written from the judge's stated rules."""
 
 from __future__ import annotations
 
@@ -141,8 +129,7 @@ def source_kind(url: Any, company_domain: Any = "", company_name: Any = "") -> s
 
 
 def admissible(url: Any, company_domain: Any, company_name: Any, signal: Any) -> bool:
-    """False only when the ICP names its proof sources, independent coverage is not among them, and the URL is a known
-    independent publisher (or a LinkedIn page that is not the company's own)."""
+    """False only when the ICP names its proof sources, independent coverage is not among them, and the URL is a known."""
 
     kinds = allowed_kinds(signal)
     if kinds is None:
@@ -156,8 +143,7 @@ def admissible(url: Any, company_domain: Any, company_name: Any, signal: Any) ->
 
 
 def prefer_own_source(url: Any, company_domain: Any, company_name: Any, signal: Any) -> bool:
-    """Loop s23 (d20 Starcloud: a unite.ai article while its Business Wire release was in hand): on a source-restricted
-    ICP an unrecognised third-party host is worth one swap attempt for the company's own release or a wire copy."""
+    """On a source-restricted."""
 
     return allowed_kinds(signal) is not None and source_kind(url, company_domain, company_name) == "unknown"
 
@@ -179,20 +165,20 @@ _EVENT_WORDS = {"FUNDING": "raises funding round", "PRODUCT_LAUNCH": "launches",
 
 
 def first_party_row(tools: Any, name: str, domain: str, category: str, *, window_days: int,
-                    category_pattern: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """One bounded search on the company's own domain plus the press wires for the same kind of event; the first row
-    that names the company and the event words is returned (None on any failure)."""
+                    category_pattern: Optional[str] = None, own_only: bool = False) -> Optional[dict[str, Any]]:
+    """One bounded search on the company's own domain plus the press wires for the same kind of event; the first row.
+    ``own_only`` searches (and accepts) the company's own domain alone."""
 
     key = _name_key(name)
     if not key or not domain:
         return None
     query = f"{name} {_EVENT_WORDS.get(category, 'announces')}"
     data = tools.search_web(query, recency_days=max(30, int(window_days)), limit=4,
-                            include_domains=[domain] + list(WIRE_HOSTS[:10]), category="")
+                            include_domains=[domain] + ([] if own_only else list(WIRE_HOSTS[:10])), category="")
     pattern = re.compile(category_pattern, re.I) if category_pattern else None
     for row in (data or {}).get("results") or []:
         url = str(row.get("url") or "")
-        if source_kind(url, domain, name) not in ("first_party", "wire"):
+        if source_kind(url, domain, name) not in (("first_party",) if own_only else ("first_party", "wire")):
             continue
         text = f"{row.get('title') or ''} {row.get('text') or row.get('excerpt') or ''}"
         if key not in _name_key(text[:3000]):

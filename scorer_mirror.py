@@ -1,20 +1,4 @@
-"""Deterministic mirrors of the Arena scorer's pre-LLM gates and contracts.
-
-Every rule here is transcribed from the platform at repo HEAD (LAB-LOG #191):
-  qualification/scoring/verification_helpers.py   text/snippet/grounding checks
-  qualification/scoring/intent_signal_gate.py     URL structure, anti-bot, freshness
-  qualification/scoring/lead_scorer.py            stage, untrusted TLDs, negation,
-                                                  source multipliers, intent caps
-  qualification/scoring/competition.py            source inference, ICP normalization
-  qualification/employee_buckets.py               LinkedIn buckets
-  qualification/competition_models.py             the output contract
-  qualification/scoring/company_fit_decision.py   identity name/domain/slug keys
-
-The point of mirroring is that a harness can apply the scorer's own rejection
-rules to its own output BEFORE submitting, instead of hoping the LLM got it
-right.  tests/test_mirror_parity.py asserts these functions agree with the
-platform code, so drift shows up as a failing test rather than a zero score.
-"""
+"""Deterministic mirrors of the Arena scorer's pre-LLM gates and contracts."""
 
 from __future__ import annotations
 
@@ -25,7 +9,6 @@ from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-
 
 
 def normalize_text(text: str) -> str:
@@ -108,7 +91,6 @@ def signal_word_grounding(text: str, content: str) -> tuple[int, int, list[str]]
         return 0, 0, []
     grounded = words & content_words
     return len(grounded), len(words), sorted(words - content_words)
-
 
 
 _INVALID_URL_RE = re.compile(
@@ -196,27 +178,11 @@ def parse_signal_date(value: Any) -> Optional[date]:
     return parsed.date()
 
 
-def freshness_reason(claim_text: str, signal_date: Any, buyer_cap_days: Optional[int], today: date) -> Optional[str]:
-    """Mirror of check_evidence_freshness with the Arena's deterministic cap."""
-
-    max_age = buyer_cap_days if buyer_cap_days is not None else claim_max_age_days(claim_text)
-    if max_age is None:
-        return None
-    parsed = parse_signal_date(signal_date)
-    if parsed is None:
-        return f"buyer requires evidence within {max_age} days but the signal has no valid date"
-    age = (today - parsed).days
-    if age > max_age:
-        return f"evidence is {age} days old; cap is {max_age} days"
-    return None
-
-
 def future_date_reason(signal_date: Any, today: date) -> Optional[str]:
     parsed = parse_signal_date(signal_date)
     if parsed is not None and parsed > today:
         return f"signal date {parsed.isoformat()} is in the future"
     return None
-
 
 
 FABRICATED_TLDS = frozenset(
@@ -237,12 +203,7 @@ def registrable_host(url: str) -> str:
 
 
 def extract_domain(url: str) -> str:
-    """lead_scorer.py::_extract_domain — the LAST TWO labels of the host.
-
-    The scorer dedups a company's signals and exempts company-owned evidence
-    by this key, so ``blog.acme.com`` and ``acme.com`` are the SAME domain to
-    it (and ``acme.co.uk`` collapses to ``co.uk``, faithfully).
-    """
+    """Lead_scorer.py::_extract_domain — the LAST TWO labels of the host."""
 
     try:
         clean = str(url or "").strip()
@@ -303,8 +264,7 @@ SOURCE_MULTIPLIERS = {
 
 
 def evidence_source(url: str, company_website: str) -> str:
-    """competition.py::_evidence_source — the scorer's source class from the URL."""
-
+    """Competition.py::_evidence_source — the scorer's source class from the URL."""
     hostname = (urlsplit(str(url)).hostname or "").lower().removeprefix("www.")
     company_hostname = (urlsplit(str(company_website)).hostname or "").lower().removeprefix("www.")
     path = (urlsplit(str(url)).path or "").lower()
@@ -332,7 +292,6 @@ def intent_total(per_signal_scores: Iterable[float]) -> float:
 
 def company_score_estimate(fit_estimate: float, per_signal_scores: Iterable[float]) -> float:
     return max(0.0, min(100.0, min(fit_estimate, MAX_FIT) + intent_total(per_signal_scores)))
-
 
 
 LINKEDIN_BUCKETS = ("0-1", "2-10", "11-50", "51-200", "201-500", "501-1,000",
@@ -415,7 +374,6 @@ def icp_buckets(icp: Mapping[str, Any]) -> list[str]:
     return out
 
 
-
 _SERIES_C_PLUS = frozenset({"series c+", "series c", "series d", "series e", "series f", "series g", "series h"})
 
 
@@ -430,7 +388,6 @@ def normalize_stage(value: Any) -> str:
 
 def stage_matches(observed: str, requested: str) -> bool:
     return observed == requested or (requested == "series c+" and observed in _SERIES_C_PLUS)
-
 
 
 _LEGAL_SUFFIXES = frozenset(
@@ -466,32 +423,6 @@ def canonical_domain(value: Any) -> str:
         return host.encode("idna").decode("ascii")
     except UnicodeError:
         return ""
-
-
-def canonical_linkedin(value: Any) -> str:
-    raw = str(value or "").strip()
-    if raw.startswith("//"):
-        raw = f"https:{raw}"
-    if raw and "://" not in raw:
-        raw = f"https://{raw}"
-    try:
-        parsed = urlsplit(raw)
-    except ValueError:
-        return ""
-    host = str(parsed.hostname or "").casefold().removeprefix("www.")
-    parts = [p for p in parsed.path.split("/") if p]
-    if (
-        parsed.scheme.casefold() not in {"http", "https"}
-        or parsed.username is not None or parsed.password is not None
-        or not (host == "linkedin.com" or host.endswith(".linkedin.com"))
-        or len(parts) < 2 or parts[0].casefold() != "company"
-    ):
-        return ""
-    slug = parts[1].casefold()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._%+-]{0,99}", slug):
-        return ""
-    return f"https://www.linkedin.com/company/{slug}"
-
 
 
 import unicodedata
@@ -575,23 +506,7 @@ def contains_prompt_control(text: Any) -> bool:
 
 
 def strip_gateway_controls(text: Any) -> str:
-    """Drop every character `validate_candidate_prompt_text` refuses.
-
-    ⛳️ LAB-LOG #237.  A scraped page can carry SOFT HYPHENS (U+00AD, category
-    Cf) inside words -- Endpoints News hyphenates that way -- and `best_window`
-    re-cuts the snippet straight out of the page text, AFTER the one
-    `strip_prompt_controls` pass, so they reached the wire.  Upstream ff17a8df
-    now turns a company the judge model cannot parse into a zero breakdown
-    (`failure_class model_contract_incompatible`, competition.py:307-311)
-    instead of letting the ValidationError escape: no -10, but the breakdown is
-    APPENDED, so the company occupies one of the five slots and scores nothing.
-    Exactly one of the 133 companies we have ever emitted was rejected this way.
-
-    A control that is also whitespace becomes a space, so removing it cannot
-    weld two words together; everything else (the soft hyphen included) is simply
-    dropped, which is what un-hyphenates ``sit\xadu\xada\xadtion`` back into
-    ``situation``.  Callers collapse whitespace afterwards.
-    """
+    """Drop every character `validate_candidate_prompt_text` refuses."""
 
     out = []
     for character in str(text or ""):
@@ -600,7 +515,6 @@ def strip_gateway_controls(text: Any) -> str:
         elif character.isspace():
             out.append(" ")
     return "".join(out)
-
 
 
 _COUNTRY_ALIASES = {
@@ -655,8 +569,6 @@ def allowed_countries(icp_geography: Any) -> tuple[frozenset[str], dict[str, str
     if not allowed and deferred:
         return frozenset(), {}
     return frozenset(allowed), allowed
-
-
 
 
 def _text(value: Any) -> str:
@@ -745,8 +657,6 @@ def evaluation_date() -> date:
     return datetime.now(timezone.utc).date()
 
 
-
-
 def public_http_url(value: Any, *, allow_empty: bool = False) -> str:
     text = str(value or "").strip()
     if not text and allow_empty:
@@ -783,13 +693,7 @@ GATEWAY_CLAIM_TEXT_MAX = 2000
 
 
 def _reject_prompt_controls(value: str, field_name: str) -> str:
-    """gateway/qualification/models.py:244-252 `validate_candidate_prompt_text`.
-
-    LAB-LOG #237: the platform raises here, the ValidationError is caught at
-    competition.py:309, and the company becomes a zero breakdown that still
-    spends one of the five slots.  Catching it locally is the difference between
-    one company repaired before we submit and one slot silently forfeited.
-    """
+    """Gateway/qualification/models.py:244-252 `validate_candidate_prompt_text`."""
 
     if contains_prompt_control(value):
         raise ValueError("%s contains control or format characters" % field_name)
@@ -886,7 +790,7 @@ STAGE_EVIDENCE_MAX = 3
 
 
 def validate_intent_details_text(value: Any) -> str:
-    """qualification/intent_details.py: one plain prose paragraph, <= 2000 chars."""
+    """Qualification/intent_details.py: one plain prose paragraph, <= 2000 chars."""
 
     if not isinstance(value, str) or not value.strip():
         raise ValueError("intent_details must be a non-empty paragraph")

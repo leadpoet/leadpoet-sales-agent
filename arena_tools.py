@@ -1,21 +1,4 @@
-"""Deepline-only sourcing tools over the Arena worker socket.
-
-Miner-funded runs hold two credentials: OpenRouter and Deepline
-(lab_arena/credentials.py RUNTIME_PROVIDERS).  The public baseline routes
-search_web and fetch_page through api.scrapingdog.com, which a miner run
-cannot use -- so here every tool is a Deepline integration:
-
-  search_companies     hunter_discover
-  get_company_profile  free_simple_company_search
-  get_company_events   predictleads_company_{job_openings,financing_events,news_events}
-  search_web           exa_search  (with text, so results already carry page text)
-  fetch_page           exa_contents, then contextdev_get_web_scrape_markdown
-                       (free, fixed price), then firecrawl_scrape as last resort
-
-Every page fetched is cached by URL so the verification pass never spends a
-second call on the same evidence, and a hard call budget keeps the run under
-the Arena's 30-call Deepline quota per ICP.
-"""
+"""Deepline-only sourcing tools over the Arena worker socket."""
 
 from __future__ import annotations
 
@@ -24,7 +7,7 @@ import os
 import re
 import threading
 import time
-from datetime import date, timedelta
+from datetime import timedelta
 from html.parser import HTMLParser
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlsplit
@@ -32,8 +15,10 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from . import diagnostics
+from . import gates
+from . import governor
 from . import scorer_mirror as sm
-from .arena_transport import arena_socket_path
+from .arena_transport import socket_client
 
 DEEPLINE_QUOTA_PER_ICP = 200
 DEFAULT_CALL_BUDGET = 27
@@ -56,10 +41,25 @@ _DEEPLINE_FIXED_CREDITS = {
 FIXED_PRICES_USD = {tool: round(float(credits) * DEEPLINE_USD_PER_CREDIT, 6)
                     for tool, credits in _DEEPLINE_FIXED_CREDITS.items()}
 DYNAMIC_PRICE_ESTIMATE_USD = 0.02
-SETTLED_MARGIN_USD = 0.02
-SPEND_REFRESH_SECONDS = 10.0
-PERIODIC_REFRESH_SECONDS = 45.0
-SNAPSHOT_STALE_SECONDS = 5.0
+DEEPLINE_CLIENT_TIMEOUT_S = 290.0
+# Web egress: the sandbox's HTTP proxy to the public web (free, outside the Deepline call quota).  The host allows 32
+# concurrent and 512 total connections and 256 MB per run and blocks the paid providers' hosts.
+EGRESS_PROXY_ENV = "LAB_ARENA_WEB_PROXY_URL"
+EGRESS_MAX_FETCHES = 400
+# Board APIs whose JSON the hiring lane parses; through egress their text is flattened exactly as the Deepline
+# scrape path flattens it (see _contextdev_page).
+EGRESS_JSON_HOSTS = ("boards-api.greenhouse.io", "api.ashbyhq.com", "api.lever.co")
+# An origin's own "not found" through egress is final: the page is not fetched again through Deepline.
+EGRESS_MISSING_STATUSES = (404, 410)
+EGRESS_MAX_TOTAL_BYTES = 160 * 1024 * 1024
+EGRESS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+EGRESS_TIMEOUT_S = 15.0
+EGRESS_PAID_SUFFIXES = ("deepline.com", "exa.ai", "openrouter.ai", "scrapingdog.com")
+EGRESS_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/128.0 Safari/537.36",
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "en-US,en;q=0.9"}
+_TITLE_RE = re.compile(r"<title[^>]*>([\s\S]{0,600}?)</title>", re.I)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -79,7 +79,7 @@ STRATEGY = load_strategy()
 
 
 def paced(key: str, default: int, low: int, high: int, env: str = "") -> int:
-    """strategy.json[key], overridable by ``env`` for local runs, clamped to [low, high]."""
+    """Strategy.json[key], overridable by ``env`` for local runs, clamped to [low, high]."""
 
     value = STRATEGY.get(key)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -150,19 +150,7 @@ _HUNTER_HEADCOUNT = {
 
 
 class BudgetExhausted(RuntimeError):
-    """A refused call.  ``calls_left`` is what the model should be told remains.
-
-    The TIME deadline and the CALL ceiling are two separate budgets, and only
-    the call ceiling is what ``ArenaTools.remaining()`` counts.  When the
-    deadline trips, remaining() still reports whatever the call budget had
-    left, so the model was handed {"error": "time budget exhausted",
-    "calls_left": 19} and read it, correctly, as a contradiction -- ICP 016,
-    in its own words: "the tool's message is a bit strange since it says there
-    are still 19 calls left but is marked as exhausted" (LAB-LOG #283).
-    No later call can succeed once the deadline has passed, so the deadline
-    raise carries an explicit 0 and the call-ceiling raise leaves this None to
-    fall back to the live counter.
-    """
+    """A refused call. ``calls_left`` is what the model should be told remains."""
 
     def __init__(self, message, *, calls_left=None):
         super().__init__(message)
@@ -228,9 +216,8 @@ def _domain(value: Any) -> str:
     return host if host and "." in host and len(host) <= 253 else ""
 
 
-UNFETCHABLE_HOSTS = ("reuters.com", "bloomberg.com", "wsj.com", "ft.com", "nytimes.com", "forbes.com",
-                     "businessinsider.com", "barrons.com", "economist.com", "seekingalpha.com", "washingtonpost.com",
-                     "morningstar.com", "marketscreener.com", "streetinsider.com")
+UNFETCHABLE_HOSTS = ("reuters.com", "bloomberg.com", "wsj.com", "ft.com", "nytimes.com", "barrons.com", "economist.com",
+                     "washingtonpost.com")
 
 
 def fetchable(url: Any) -> bool:
@@ -262,12 +249,7 @@ def _result_data(payload: Any) -> dict[str, Any]:
 
 
 def _result_list(payload: Any) -> list[Any]:
-    """The list a Deepline tool returned, whatever envelope it came in.
-
-    contextdev_post_news_search answers with a BARE list under result.data, which
-    ``_result_data`` (dict-only) turns into {} -- so a list has to be unwrapped on
-    its own (LAB-LOG #306).
-    """
+    """The list a Deepline tool returned, whatever envelope it came in."""
 
     if isinstance(payload, list):
         return payload
@@ -364,13 +346,15 @@ def _evidence_url(value: Any, *, base_url: str = "") -> str:
 
 
 class Page:
-    __slots__ = ("url", "final_url", "title", "text", "source", "ok", "error", "links")
+    __slots__ = ("url", "final_url", "title", "text", "source", "ok", "error", "links", "published")
 
     def __init__(self, url: str, *, final_url: str = "", title: str = "", text: str = "",
                  source: str = "", ok: bool = False, error: str = "") -> None:
         self.url, self.final_url, self.title, self.text = url, final_url or url, title, text
         self.source, self.ok, self.error = source, ok, error
         self.links: list[str] = []
+        # The publication date the judge reads from the page's own metadata (read from HTML; '' when unknown).
+        self.published = ""
 
     def has_linkedin_company_link(self) -> bool:
         return any("linkedin.com/company/" in link.lower() for link in self.links)
@@ -403,22 +387,126 @@ class ArenaTools:
         self.spend_cap_usd: float | None = None
         self.external_spend_usd = 0.0
         self._confirmed_spend: tuple[float, float] | None = None
-        self.spend_refresh: Optional[Callable[[], Any]] = None
-        self._last_spend_refresh = 0.0
-        self._ledger_log: list[tuple[float, float]] = []
-        self._last_host: Optional[tuple[float, float]] = None
         self.spend_refusals = 0
+        self.egress: dict[str, int] = {"fetches": 0, "pages": 0, "fallbacks": 0, "errors": 0, "bytes": 0,
+                                       "missing": 0, "json": 0}
+        self.egress_missing: set[str] = set()
+        self._egress_client: httpx.Client | None = None
+        # Tests replace the proxy client with a callable returning an httpx.Client.
+        self._egress_factory: Optional[Callable[[], httpx.Client]] = None
         self._owns_client = client is None and post is None
         self._client = client if client is not None else (
-            None if post is not None else httpx.Client(
-                transport=httpx.HTTPTransport(uds=arena_socket_path()),
-                timeout=httpx.Timeout(self.timeout), follow_redirects=False, trust_env=False,
-            )
+            None if post is not None else socket_client(self.timeout)
         )
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:
             self._client.close()
+        if self._egress_client is not None:
+            try:
+                self._egress_client.close()
+            except Exception:
+                pass
+
+    def _egress_http(self) -> Optional[httpx.Client]:
+        with self._lock:
+            if self._egress_client is None:
+                if self._egress_factory is not None:
+                    self._egress_client = self._egress_factory()
+                else:
+                    proxy = str(os.environ.get(EGRESS_PROXY_ENV) or "").strip()
+                    if not proxy.startswith("http://"):
+                        return None
+                    self._egress_client = httpx.Client(
+                        proxy=proxy, trust_env=False, follow_redirects=True, max_redirects=5, headers=EGRESS_HEADERS,
+                        timeout=httpx.Timeout(EGRESS_TIMEOUT_S, connect=8.0),
+                        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4))
+            return self._egress_client
+
+    def egress_get(self, url: str) -> Optional[dict[str, Any]]:
+        """GET one public URL through web egress: {status, final_url, content_type, body}, or None when egress is not
+        offered, the URL is a paid provider's, a limit or the phase deadline is reached, or the request failed."""
+
+        try:
+            parts = urlsplit(str(url or ""))
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return None
+        if parts.scheme not in ("http", "https") or not host or any(
+                host == suffix or host.endswith("." + suffix) for suffix in EGRESS_PAID_SUFFIXES):
+            return None
+        if self._egress_factory is None and not str(os.environ.get(EGRESS_PROXY_ENV) or "").strip():
+            return None
+        started = time.monotonic()
+        with self._lock:
+            if self.egress["fetches"] >= EGRESS_MAX_FETCHES or self.egress["bytes"] >= EGRESS_MAX_TOTAL_BYTES:
+                return None
+            if self.deadline is not None and started + EGRESS_TIMEOUT_S > self.deadline:
+                return None
+            self.egress["fetches"] += 1
+        size = 0
+        try:
+            client = self._egress_http()
+            if client is None:
+                return None
+            with client.stream("GET", url) as response:
+                chunks: list[bytes] = []
+                for chunk in response.iter_bytes():
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= EGRESS_MAX_RESPONSE_BYTES or time.monotonic() - started > 2 * EGRESS_TIMEOUT_S:
+                        break
+                body = b"".join(chunks)[:EGRESS_MAX_RESPONSE_BYTES].decode(response.encoding or "utf-8", "replace")
+                return {"status": response.status_code, "final_url": str(response.url),
+                        "content_type": str(response.headers.get("content-type") or "").lower(), "body": body}
+        except Exception:
+            with self._lock:
+                self.egress["errors"] += 1
+            return None
+        finally:
+            with self._lock:
+                self.egress["bytes"] += size
+
+    def _egress_page(self, url: str, cache_chars: int) -> Optional[Page]:
+        """An HTML page through web egress as the judge's visible text and links, else None (the caller falls back
+        to the Deepline scrape): non-200, non-HTML (board APIs, documents), an anti-bot wall, or under 200 characters
+        of visible text."""
+
+        got = self.egress_get(url)
+        if got is not None and got["status"] in EGRESS_MISSING_STATUSES:
+            with self._lock:
+                self.egress["missing"] += 1
+                self.egress_missing.add(url)
+            return None
+        if got is not None and got["status"] == 200 and "json" in got["content_type"] and \
+                (urlsplit(str(got["final_url"] or url)).hostname or "").lower() in EGRESS_JSON_HOSTS and \
+                got["body"].lstrip()[:1] in ("{", "["):
+            text = " ".join(re.sub(r"[#*_>`\[\]()]", " ", got["body"]).split())
+            with self._lock:
+                self.egress["json"] += 1
+            return Page(url, final_url=str(got["final_url"] or url), text=text[:cache_chars], source="egress-json",
+                        ok=True)
+        if not got or got["status"] != 200 or "html" not in got["content_type"]:
+            if got is not None:
+                self.egress["fallbacks"] += 1
+            return None
+        html = got["body"]
+        wall = gates.antibot(html)
+        text = gates.visible_text(html)
+        if wall is None or wall or not text or len(text.strip()) < 200:
+            self.egress["fallbacks"] += 1
+            return None
+        final_url = got["final_url"] or url
+        title = _TITLE_RE.search(html)
+        page = Page(url, final_url=final_url, title=" ".join((title.group(1) if title else "").split())[:300],
+                    text=" ".join(text.split())[:cache_chars], source="egress", ok=True)
+        page.links = list(dict.fromkeys(
+            link for raw in (gates.visible_links(html) or [])[:800]
+            if (link := _evidence_url(raw, base_url=final_url))
+        ))[:400]
+        page.published = gates.published_date(html, final_url) or ""
+        self.egress["pages"] += 1
+        return page
 
     def set_icp(self, icp: Any) -> None:
         """Remember the ICP's exact buckets so discovery can flag off-bucket domains."""
@@ -436,13 +524,7 @@ class ArenaTools:
 
 
     def snapshot(self) -> dict[str, Any]:
-        """The research state at one instant, JSON-safe, for a paired replay (#317 addendum).
-
-        Everything a second chance could read: the trace, the page cache with its
-        full text, the call counters and the spend ledger.  The harness writes it
-        only when ARENA_EMPTY_SNAPSHOT_DIR is set (local runs); it is never an
-        input to any gate and never emitted in the sandbox.
-        """
+        """The research state at one instant, JSON-safe, for a paired replay."""
 
         deadline = self.deadline
         return {
@@ -461,56 +543,84 @@ class ArenaTools:
         }
 
     def _deepline(self, tool: str, payload: dict[str, Any], timeout: Optional[float] = None) -> dict[str, Any]:
+        """One Deepline call.  ``timeout`` plans against the phase deadline.  For a priced tool the HTTP client waits
+        up to DEEPLINE_CLIENT_TIMEOUT_S so a paid call the broker is still running is never abandoned; a free tool
+        uses ``timeout`` (no provider call starts in the last seven minutes, so an abandoned free call settles long
+        before the run ends)."""
+
         timeout = self.timeout if timeout is None else max(1.0, min(float(timeout), self.timeout))
-        price = self.tool_price_usd(tool)
-        if price > 0.0 and not self.paid_allowed(price):
-            self.maybe_refresh_spend()
-        elif price > 0.0:
-            self.maybe_refresh_spend(PERIODIC_REFRESH_SECONDS)
         with self._lock:
             if self.deadline is not None and time.monotonic() + timeout > self.deadline:
                 raise BudgetExhausted("time budget exhausted", calls_left=0)
             if self.calls >= self.call_budget:
                 raise BudgetExhausted(f"provider-call budget of {self.call_budget} exhausted")
+        gov = governor.current()
+        token = None
+        if gov is not None:
+            governor.refresh()
+            try:
+                token = gov.acquire(self.tool_cmax_usd(tool), provider="deepline")
+            except governor.Refused as exc:
+                self.spend_refusals += 1
+                raise BudgetExhausted(f"refused: {exc}", calls_left=0) from None
+        else:
             price = self.tool_price_usd(tool)
             if price > 0.0 and not self.paid_allowed(price):
                 self.spend_refusals += 1
                 raise BudgetExhausted("spend budget exhausted: %.2f of %.2f USD on this ICP; free tools still work"
                                       % (self.spend_usd(), self.spend_cap_usd or 0.0))
+        with self._lock:
             self.calls += 1
             self.calls_by_tool[tool] = self.calls_by_tool.get(tool, 0) + 1
-            self._log_ledger()
-        if self._post is not None:
-            return self._post(tool, payload)
-        assert self._client is not None
+        settled: Optional[float] = None
         try:
-            response = self._client.post(
-                f"http://code.deepline.com/api/v2/integrations/{tool}/execute",
-                json={"payload": payload}, timeout=timeout,
-            )
-        except BaseException as exc:
-            self._note_transport(exc)
-            raise
-        try:
-            body = response.json()
-        except ValueError as exc:
-            self._note_infra(response.status_code)
-            raise RuntimeError(f"Deepline {tool} returned HTTP {response.status_code} with invalid JSON") from exc
-        if not response.is_success:
-            code = (body.get("error") or {}).get("code") if isinstance(body, dict) and isinstance(body.get("error"), dict) else ""
-            if code != "provider_request_refused":
-                self._note_infra(response.status_code, code)
-            raise RuntimeError(str(code or f"Deepline {tool} returned HTTP {response.status_code}"))
-        return body if isinstance(body, dict) else {}
+            if self._post is not None:
+                result = self._post(tool, payload)
+                settled = self.tool_cmax_usd(tool)
+                return result
+            assert self._client is not None
+            try:
+                client_timeout = DEEPLINE_CLIENT_TIMEOUT_S if self.tool_cmax_usd(tool) > 0 else max(timeout, 30.0)
+                response = self._client.post(
+                    f"http://code.deepline.com/api/v2/integrations/{tool}/execute",
+                    json={"payload": payload}, timeout=client_timeout,
+                )
+            except BaseException as exc:
+                self._note_transport(exc)
+                raise
+            if not response.is_success:
+                settled = 0.0
+            else:
+                settled = self.tool_cmax_usd(tool)
+            try:
+                body = response.json()
+            except ValueError as exc:
+                self._note_infra(response.status_code)
+                raise RuntimeError(f"Deepline {tool} returned HTTP {response.status_code} with invalid JSON") from exc
+            if not response.is_success:
+                code = governor.error_code(body)
+                request_refusal = code in governor.REQUEST_REFUSAL_CODES or (
+                    response.status_code == 403 and tool in governor.SITE_STATUS_TOOLS)
+                if not request_refusal:
+                    self._note_infra(response.status_code, code)
+                if gov is not None and governor.account_refusal(response.status_code, body, provider="deepline",
+                                                                tool=tool):
+                    gov.mark_dead("deepline")
+                raise RuntimeError(str(code or f"Deepline {tool} returned HTTP {response.status_code}"))
+            return body if isinstance(body, dict) else {}
+        finally:
+            if gov is not None and token is not None:
+                gov.release(token, settled)
+
+    def tool_cmax_usd(self, tool: str) -> float:
+        """Upper bound of one call's charge: the fixed list price, else the dynamic bound."""
+
+        if tool in FIXED_PRICES_USD:
+            return float(FIXED_PRICES_USD[tool])
+        return float(governor.DYNAMIC_CMAX_USD.get(tool, governor.DEFAULT_DYNAMIC_CMAX_USD))
 
     def _note_transport(self, exc: BaseException) -> None:
-        """A call that never produced a status; never let the note fail the call.
-
-        NOT an infra fault: no status came back, so nothing proves the host has an
-        infrastructure row, and `_no_companies` must keep its round-safe raise
-        (model_error, which cannot cancel the round and earns the confirmation
-        attempt).  What this buys is a readable record instead of silence.
-        """
+        """A call that never produced a status; never let the note fail the call."""
 
         try:
             diagnostics.record_transport_error(channel="deepline", detail=type(exc).__name__)
@@ -689,73 +799,37 @@ class ArenaTools:
         return number
 
     def note_external_spend(self, usd: Any) -> None:
-        """Model-side charges the Deepline ledger cannot see (agent meter, paragraph, sonar)."""
+        """Model-side charges the Deepline ledger cannot see; the governor already counts them when installed."""
 
+        if governor.current() is not None:
+            return
         number = self._usd(usd)
         if number:
             self.external_spend_usd += number
-            self._log_ledger()
-
-    def _log_ledger(self) -> None:
-        self._ledger_log.append((time.monotonic(), self._local_ledger_usd()))
-        if len(self._ledger_log) > 4000:
-            del self._ledger_log[:2000]
 
     def _local_ledger_usd(self) -> float:
         return self.estimated_spend_usd() + self.external_spend_usd
 
-    def set_confirmed_spend(self, usd: Any, *, settled: bool = False, as_of: Optional[float] = None) -> bool:
-        """Re-base the planning ledger on the host's sourcing_cost -- never downward, unless SETTLED.
-
-        s32 C1: ``settled`` = the snapshot showed zero inflight and zero success-unresolved calls, so
-        its number is the whole ICP spend (every attempt, SQL 319) up to the read.  Then the ledger
-        may move DOWN to it plus SETTLED_MARGIN_USD: across 147 saved runs the local price-mirror
-        estimate never ran below the host (median $0.56 vs $0.34), and keeping that over-estimate
-        would stop research at ~2/3 of the real ceiling.
-
-        LAB-LOG #315 (independent review of #314): a snapshot may be cached for a
-        second and may carry successful-but-unresolved calls at zero dollars, so
-        "the host says $0.75" does not prove that the $0.03 we estimated a moment
-        ago is inside that $0.75.  The watermark therefore moves to
-        max(host number, what we were already planning against): a local estimate
-        stays until the host's number has visibly grown past it.  This is
-        CONSERVATIVE PACING, not exact settlement -- an over-estimate is kept until
-        settlement overtakes it, never silently dropped.
-        """
+    def set_confirmed_spend(self, usd: Any) -> bool:
+        """Re-base the planning ledger on the host's sourcing_cost -- never downward."""
 
         number = self._usd(usd)
         if number is None:
             return False
+        gov = governor.current()
+        if gov is not None:
+            gov.note_snapshot(number)
+            return True
         planned = self.spend_usd()
-        cutoff_in = time.monotonic() - SNAPSHOT_STALE_SECONDS if as_of is None else min(float(as_of), time.monotonic() - 1.0)
-        if self._last_host is not None and abs(self._last_host[0] - number) < 1e-9:
-            cutoff_in = min(cutoff_in, self._last_host[1])
-        self._last_host = (number, cutoff_in)
-        if settled:
-            cutoff = cutoff_in
-            older = [value for at, value in self._ledger_log if at <= cutoff]
-            self._confirmed_spend = (number + SETTLED_MARGIN_USD, older[-1] if older else 0.0)
-        else:
-            self._confirmed_spend = (max(number, planned), self._local_ledger_usd())
-        return True
-
-    def maybe_refresh_spend(self, min_interval: float = SPEND_REFRESH_SECONDS) -> bool:
-        """Run the harness's host re-read if one is installed and the last one is old enough."""
-
-        hook = self.spend_refresh
-        now = time.monotonic()
-        if not callable(hook) or now - self._last_spend_refresh < float(min_interval):
-            return False
-        self._last_spend_refresh = now
-        try:
-            hook()
-        except Exception:
-            return False
+        self._confirmed_spend = (max(number, planned), self._local_ledger_usd())
         return True
 
     def spend_usd(self) -> float:
-        """What this ICP has spent: the host's last number plus our estimate of what followed."""
+        """What this ICP has spent: the governor's committed spend, else the host's last number plus our estimate."""
 
+        gov = governor.current()
+        if gov is not None:
+            return round(gov.committed(), 4)
         ledger = self._local_ledger_usd()
         if self._confirmed_spend is None:
             return round(ledger, 4)
@@ -763,13 +837,11 @@ class ArenaTools:
         return round(confirmed + max(0.0, ledger - at_read), 4)
 
     def paid_allowed(self, estimate_usd: float = 0.0) -> bool:
-        """May a call that will charge about ``estimate_usd`` start now?  No cap = yes.
+        """May a call that will charge about ``estimate_usd`` start now?"""
 
-        With an estimate the call must FIT: spend + estimate <= cap.  Without one
-        the question is "is there room for any priced call at all", which at
-        exactly the cap is no -- every priced call costs more than nothing.
-        """
-
+        gov = governor.current()
+        if gov is not None:
+            return gov.headroom() >= max(0.0, float(estimate_usd or 0.0)) and gov.headroom() > 0.0
         if self.spend_cap_usd is None:
             return True
         cap = float(self.spend_cap_usd)
@@ -779,14 +851,7 @@ class ArenaTools:
         return self.spend_usd() + estimate <= cap + 1e-9
 
     def adopt_quota(self, snapshot: Any, *, reserve: int = 2) -> dict[str, Any]:
-        """Replace the hard-coded call ceiling with the round's real Deepline quota.
-
-        ``snapshot`` is a lab_arena_checkpoint.quota_usage() document.  The round
-        may allow 30 or 200 Deepline calls per ICP (three quota profiles coexist,
-        contracts.EXECUTION_CALL_QUOTA_PROFILES) and a constant is wrong on one of
-        them; this reads the real number.  Never raises: an unreadable snapshot
-        leaves the ceiling where it was.
-        """
+        """Replace the hard-coded call ceiling with the round's real Deepline quota."""
 
         try:
             providers = snapshot.get("providers") if isinstance(snapshot, dict) else None
@@ -804,12 +869,7 @@ class ArenaTools:
                 "call_budget_before": before, "call_budget": new_budget}
 
     def search_news(self, query: str, *, limit: int = 5, company_website: str = "") -> dict[str, Any]:
-        """Dated news results at zero cost (contextdev_post_news_search, Decimal("0")).
-
-        Replaces the $0.56 predictleads_* calls for FUNDING / HIRING / NEWS discovery
-        wherever a headline and a URL are enough; the page still has to be fetched
-        (free branch first) before anything on it can be cited.
-        """
+        """Dated news results at zero cost (contextdev_post_news_search, Decimal("0"))."""
 
         query = str(query or "").strip()
         if not query:
@@ -850,13 +910,7 @@ class ArenaTools:
         return {"results": rows, "count": len(rows), "entity": entity}
 
     def validate_email(self, email: str) -> str:
-        """'valid' | 'catch_all' | 'invalid' | 'unknown' from one zerobounce_validate call ($0.028).
-
-        The judge validates the submitted email with the same provider and zeroes the
-        pair on an invalid verdict (2 of 5 accepted contacts in #317/e5).  The reading
-        mirrors contact_verification._email_status: unsafe flags and invalid statuses
-        first, then catch-all, then valid; anything else is unknown.
-        """
+        """'valid' | 'catch_all' | 'invalid' | 'unknown' from one zerobounce_validate call ($0.028)."""
 
         data = _result_data(self._deepline("zerobounce_validate", {"email": str(email or "").strip()}))
         records = [r for r in (data, data.get("result") if isinstance(data, dict) else None) if isinstance(r, dict)]
@@ -878,12 +932,7 @@ class ArenaTools:
 
     def search_company_people(self, company_linkedin: str, roles: list[str] | None = None, *,
                               title_filter: bool = True) -> list[dict[str, str]]:
-        """CURRENT employees of one LinkedIn company ($0.07, one page of up to 25; from autopilot c8, e12).
-
-        Web people-search returns name matches -- in loop d1 most rejections were "no current position at this
-        company".  LinkedIn's own search filtered by the company page returns current employees with their
-        current title, so a paid profile lookup goes only to someone who is there.
-        """
+        """CURRENT employees of one LinkedIn company ($0.07, one page of up to 25; from autopilot c8, e12)."""
 
         url = str(company_linkedin or "").strip()
         if "linkedin.com/company/" not in url.lower():
@@ -910,13 +959,7 @@ class ArenaTools:
 
     def find_people(self, company_name: str, domain: str, roles: list[str] | None = None, *,
                     limit: int = 6, allow_paid: bool = True, company_linkedin: str = "") -> list[dict[str, str]]:
-        """LinkedIn person URLs at the company: free web search first, then the company-filtered LinkedIn search
-        when the company's page is known (loop s3), then paid web search as the last fallback.
-
-        Returns [{"linkedin_url", "title"}].  The result titles are search-engine
-        titles ("Name - Role - Company | LinkedIn"), useful for ranking and never
-        for attribution; only harvestapi_get_profile proves a person.
-        """
+        """LinkedIn person URLs at the company: free web search first, then the company-filtered LinkedIn search."""
 
         company_name = " ".join(str(company_name or "").split())
         domain = _domain(domain)
@@ -986,12 +1029,7 @@ class ArenaTools:
         return found[:limit]
 
     def get_person_profile(self, linkedin_url: str) -> dict[str, Any]:
-        """One harvestapi_get_profile call with findEmail, returned RAW.
-
-        Raw on purpose: contacts.py mirrors the verifier's own candidate walk
-        (qualification/scoring/contact_verification._profile_candidates) over the
-        same envelope, so what we accept is what the judge will re-fetch and read.
-        """
+        """One harvestapi_get_profile call with findEmail, returned RAW."""
 
         match = _LINKEDIN_PERSON_RE.search(str(linkedin_url or ""))
         if not match:
@@ -1083,8 +1121,14 @@ class ArenaTools:
         return {"results": rows, "count": len(rows)}
 
     def _contextdev_page(self, url: str, cache_chars: int) -> Page:
-        """The free fixed-price scrape as a Page; never raises except on the call ceiling."""
+        """The page through web egress when it serves readable HTML, else the free fixed-price Deepline scrape, as a
+        Page; never raises except on the call ceiling."""
 
+        page = self._egress_page(url, cache_chars)
+        if page is not None:
+            return page
+        if url in self.egress_missing:
+            return Page(url, error="http 404 through web egress")
         try:
             data = _result_data(self._deepline(CONTEXTDEV_TOOL, {"url": url}))
             markdown = data.get("markdown")
@@ -1184,6 +1228,8 @@ class ArenaTools:
                         page = Page(url, error="firecrawl: too little text")
                 else:
                     page = Page(url, error="firecrawl: empty")
+                if page.ok and isinstance(raw_html, str) and raw_html.strip():
+                    page.published = gates.published_date(raw_html, str(metadata.get("url") or url)) or ""
                 if page.ok and isinstance(raw_html, str):
                     parser = _TextExtractor()
                     parser.feed(raw_html)
