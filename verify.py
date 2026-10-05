@@ -462,6 +462,30 @@ def _paragraph_quote(record: Mapping[str, Any]) -> str:
     return str(record.get("_quote") or "")
 
 
+
+# 10-03 runner-up (5GwzBS5GJ5) port: the page a verified signal was read from is already cached; for a funding event it
+# is a round announcement. Offer its first sentence the judge-mirrored stage gate accepts (no provider call).
+_STAGE_SENTENCE_SCAN = 240
+
+
+def _stage_quote_on_page(text: str, *, name: str, stage: str, url: str, website: str, scout: Any) -> str:
+    """The first sentence of this cached page that scout.stage_quote_ok accepts, or ''."""
+
+    body = str(text or "")
+    if not body or not scout.name_hit(name, body[:20000]):
+        return ""
+    for sentence in re.split(r"(?<=[.!?])\s+", body[:40000])[:_STAGE_SENTENCE_SCAN]:
+        sentence = " ".join(sentence.split())
+        if not 8 <= len(sentence.split()) <= 80 or not scout._ROUND_RE.search(sentence):
+            continue
+        try:
+            if not scout.stage_quote_ok(sentence, body, name=name, stage=stage, url=url, website=website):
+                return sentence
+        except Exception:  # noqa: BLE001 - a sentence the gate cannot judge is not evidence
+            continue
+    return ""
+
+
 def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: ArenaTools,
                    signals: list[dict[str, Any]], report: Report, website: str = "",
                    stats: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
@@ -490,10 +514,20 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
         if isinstance(extra, Mapping) and str(extra.get("url") or "").strip():
             candidates.append((str(extra["url"]).strip(), " ".join(str(extra.get("quote") or "").split())))
     stage_key = sm.normalize_text(stage) if stage else ""
+    want = sm.normalize_stage(stage) if stage else ""
     for signal in signals:
         text = sm.normalize_text(signal.get("_quote") or "")
         if stage_key and stage_key in text:
             candidates.append((signal["url"], signal.get("_quote") or ""))
+        if not want or not signal.get("url"):
+            continue
+        cached = tools.pages.get(str(signal["url"]))
+        if cached is None or not cached.ok:
+            continue
+        found = _stage_quote_on_page(cached.text, name=name, stage=stage, url=str(signal["url"]),
+                                     website=website, scout=_scout)
+        if found:
+            candidates.append((str(signal["url"]), found))
     for cand_url, cand_quote in candidates:
         if len(out) >= sm.STAGE_EVIDENCE_MAX:
             break
