@@ -43,7 +43,13 @@ def leadpoet_taxonomy_match(
     candidate_industry: Any,
     candidate_subindustry: Any,
 ) -> tuple[Optional[bool], dict[str, Any]]:
-    """Return an authoritative decision when exact Leadpoet labels are present."""
+    """Return an authoritative decision when exact Leadpoet labels are present.
+
+    The repository taxonomy is stricter than semantic aliases: adjacent parent
+    categories such as Payments and Financial Services remain distinct unless
+    the exact subindustry is explicitly assigned to both. ``None`` delegates
+    provider-specific labels to the bounded semantic matcher below.
+    """
 
     requested_key = normalized_industry_text(requested)
     requested_parent = LEADPOET_PARENT_INDUSTRIES.get(requested_key)

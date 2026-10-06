@@ -1,4 +1,20 @@
-"""S10 "hiring": open ATS postings as the evidence for HIRING ICPs."""
+"""Loop 20260923T0503Z s10 "hiring": open ATS postings as the evidence for HIRING ICPs.
+
+Why:
+  * d7: the only hiring evidence the event lane found were job-board mirrors (jobs.a16z.com, revopscareers.com);
+    the judge rejected Moov's "Senior Software Engineer" as outside "platform, integration, or payments-operations
+    roles" and could not read a posting date from the mirror;
+  * the judge fetches single ATS postings through their own APIs (intent_verification_three_stage.py: Greenhouse
+    boards-api with first_published as the freshness anchor, Ashby, Workable, Workday) and binds the ATS tenant to
+    the company ("exact hiring employer binding");
+  * the free page fetch reads those board APIs (x5/x6): Greenhouse jobs with title and first_published, Ashby jobs
+    with title, publishedAt and jobUrl, Lever postings with text, createdAt and hostedUrl.
+
+For each in-ICP company (the roster), find its board (a link on its homepage or careers page, else the domain
+label as the board name), list the open postings, let one cheap model call pick at most one posting per company
+whose TITLE is inside the role categories the ICP's signal names, and hand the posting to scout as a candidate
+(url = the single-posting page, date = first publication).
+"""
 
 from __future__ import annotations
 
@@ -15,14 +31,12 @@ GH_DEPARTMENTS = bool(STRATEGY.get("hiring_gh_departments", 1))
 API = {"greenhouse": "https://boards-api.greenhouse.io/v1/boards/{slug}/" + ("departments" if GH_DEPARTMENTS else "jobs"),
        "ashby": "https://api.ashbyhq.com/posting-api/job-board/{slug}",
        "lever": "https://api.lever.co/v0/postings/{slug}?mode=json",
-       "teamtailor": "https://{slug}.teamtailor.com/jobs.rss",
-       "workable": "https://apply.workable.com/api/v1/widget/accounts/{slug}"}
+       "teamtailor": "https://{slug}.teamtailor.com/jobs.rss"}
 BOARD_RES = (("greenhouse", re.compile(r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/(?:embed/job_board\?for=)?"
                                        r"([A-Za-z0-9_-]{2,60})", re.I)),
              ("ashby", re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9._-]{2,60})", re.I)),
              ("lever", re.compile(r"jobs\.(?:eu\.)?lever\.co/([A-Za-z0-9._-]{2,60})", re.I)),
-             ("teamtailor", re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9-]{1,80})\.teamtailor\.com", re.I)),
-             ("workable", re.compile(r"apply\.workable\.com/(?!api/|j/)([A-Za-z0-9][A-Za-z0-9-]{1,60})", re.I)))
+             ("teamtailor", re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9-]{1,80})\.teamtailor\.com", re.I)))
 _NOT_SLUGS = {"embed", "jobs", "job", "careers", "api", "v1", "boards", "posting-api", "users", "sign_in", "sign-in",
               "www", "app", "status", "support", "help", "blog", "docs", "career"}
 BOARD_SEARCH = bool(STRATEGY.get("hiring_board_search", 1))
@@ -41,10 +55,7 @@ _GH_DEPT_RE = re.compile(r'"id"\s*:\s*\d+\s*,\s*"name"\s*:\s*"([^"]{1,300})"\s*,
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _NATIVE_RES = (re.compile(r"https://(?:boards|job-boards(?:\.[a-z0-9-]+)?)\.greenhouse\.io/([A-Za-z0-9_-]{1,100})/jobs/"
                           r"(\d{5,20})/?(?:\?gh_jid=\2)?", re.I),
-               re.compile(r"https://jobs\.ashbyhq\.com/([A-Za-z0-9_-]{1,100})/" + _UUID + "/?", re.I),
-               re.compile(r"https://jobs(?:\.eu)?\.lever\.co/([A-Za-z0-9._-]{1,100})/[0-9a-f-]{16,64}/?", re.I),
-               re.compile(r"https://apply\.workable\.com/([a-z0-9-]{1,100})/j/[A-Za-z0-9]{6,64}/?", re.I),
-               re.compile(r"https://([A-Za-z0-9-]{1,80}?)(?:-\d+)?\.teamtailor\.com/jobs/\d+[A-Za-z0-9._~%-]*", re.I))
+               re.compile(r"https://jobs\.ashbyhq\.com/([A-Za-z0-9_-]{1,100})/" + _UUID + "/?", re.I))
 _MIRROR_HOST_RE = re.compile(r"(?:^|\.)(?:getro\.com|consider\.com|accel\.com|a16z\.com|sequoiacap\.com|greylock\.com|"
                              r"indexventures\.com|lsvp\.com|bvp\.com|kleinerperkins\.com|generalcatalyst\.com|"
                              r"foundersfund\.com|insightpartners\.com|gv\.com|redpoint\.com|felicis\.com|iconiqcapital\.com|"
@@ -117,7 +128,7 @@ def searched_boards(tools: Any, company: Mapping[str, Any]) -> list[tuple[str, s
     if not BOARD_SEARCH or not name:
         return []
     try:
-        rows = tools._free_search(f"{name} jobs teamtailor workable")
+        rows = tools._free_search(f"{name} jobs teamtailor")
     except BudgetExhausted:
         raise
     except Exception:
@@ -188,7 +199,9 @@ def _place(piece: str) -> tuple[set[str], str]:
 
 
 def posting_in_geo(location: Any, icp: Mapping[str, Any]) -> Optional[bool]:
-    """True when a place the posting names is inside the ICP geography (a US region."""
+    """Loop s22 (teardown-0925 #6): True when a place the posting names is inside the ICP geography (a US region
+    needs its state when one is named), False when it names only places outside it or a bare 'Remote' (09-25
+    OneTrust's Madrid posting on a US ICP left required_attribute unavailable), None when it names no known place."""
 
     try:
         allowed, _ = sm.allowed_countries(str(icp.get("country") or icp.get("geography") or ""))
@@ -209,7 +222,10 @@ def posting_in_geo(location: Any, icp: Mapping[str, Any]) -> Optional[bool]:
 
 
 def posting_tier(url: Any, domain: Any = "", name: Any = "") -> int:
-    """0 a native Greenhouse / Ashby posting whose tenant is the company, 1 another native one, 2 any."""
+    """Loop s22 (#6): 0 a native Greenhouse / Ashby posting whose tenant is the company, 1 another native one, 2 any
+    other source, 3 a Greenhouse job on the company's own careers wrapper ('?gh_jid=': the judge's API route needs the
+    returned absolute_url to be the same greenhouse.io posting, so it scrapes a JS page -- both 09-25 Abnormal AI
+    paragraphs failed on it), 4 a VC portfolio / Getro mirror."""
 
     text = str(url or "").strip()
     try:
@@ -232,7 +248,8 @@ def posting_tier(url: Any, domain: Any = "", name: Any = "") -> int:
 
 
 def rank_sources(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """HIRING candidates in judge-readable order -- by tier, then an in-geography posting before one."""
+    """Loop s22 (#6): HIRING candidates in judge-readable order -- by tier, then an in-geography posting before one
+    whose place is unknown; stable, so each lane's own order (freshest first) survives inside a tier."""
 
     try:
         return sorted(cands, key=lambda c: (posting_tier(c.get("url"), c.get("domain"), c.get("company_name")),
@@ -242,7 +259,8 @@ def rank_sources(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def ashby_listed(tools: Any, url: Any) -> Optional[bool]:
-    """Is this exact Ashby posting still on its board?"""
+    """Loop s22 (#6, upstream ab3a1e33): is this exact Ashby posting still on its board?  A fresh read of the board
+    API (the posting page is a JS shell); None when the read failed or the listing may be cut short.  Never raises."""
 
     try:
         match = _NATIVE_RES[1].fullmatch(str(url or "").strip())
@@ -268,8 +286,37 @@ def ashby_listed(tools: Any, url: Any) -> Optional[bool]:
         return None
 
 
+def recheck_ashby(rows: list[Mapping[str, Any]], tools: Any, *, deadline: float, clock: Any = None,
+                  max_fetches: int = 6) -> list[Mapping[str, Any]]:
+    """Loop s22 (#6): the rows whose Ashby intent posting left its board since research (upstream ab3a1e33 scores such
+    a posting a company-local zero, so its slot is worth a verified reserve row).  Bounded, free, never raises."""
+
+    import time as _time
+    clock = clock or _time.monotonic
+    gone: list[Mapping[str, Any]] = []
+    verdicts: dict[str, Optional[bool]] = {}
+    try:
+        for row in rows:
+            for signal in row.get("intent_signals") or []:
+                url = str((signal or {}).get("url") or "") if isinstance(signal, Mapping) else ""
+                if not _NATIVE_RES[1].fullmatch(url):
+                    continue
+                if url not in verdicts:
+                    left = tools.remaining() if callable(getattr(tools, "remaining", None)) else 99
+                    if len(verdicts) >= max_fetches or clock() >= deadline or left < 2:
+                        continue
+                    verdicts[url] = ashby_listed(tools, url)
+                if verdicts[url] is False:
+                    gone.append(row)
+                    break
+    except Exception:
+        pass
+    return gone
+
+
 def _plain(value: Any) -> str:
-    """A board field with its JSON escapes decoded ('R\\u0026D Engineering' -> 'R&D Engineering', as the judge."""
+    """Loop s22: a board field with its JSON escapes decoded ('R\\u0026D Engineering' -> 'R&D Engineering', as the judge
+    and the posting page show it), whitespace collapsed."""
 
     text = str(value or "")
     try:
@@ -342,50 +389,8 @@ def parse_postings(ats: str, text: str) -> list[dict[str, Any]]:
     return unique
 
 
-def workable_postings(tools: Any, slug: str) -> list[dict[str, Any]]:
-    """Open postings from Workable's public widget API (raw JSON through web egress, else the free HTTP tool); the
-    posting URL is the exact form the judge reads, https://apply.workable.com/<account>/j/<shortcode>."""
-
-    from .identity import _reply
-    url = API["workable"].format(slug=slug)
-    try:
-        egress = getattr(tools, "egress_get", None)
-        got = egress(url) if callable(egress) else None
-        if isinstance(got, dict) and got.get("status") in (404, 410):
-            return []
-        if isinstance(got, dict) and got.get("status") == 200 and str(got.get("body") or "").lstrip()[:1] == "{":
-            body = str(got["body"])
-        else:
-            body = _reply(tools._deepline("generic_http_request", {"url": url, "method": "GET", "follow_redirects": True,
-                                                                   "timeout_ms": 8000}, timeout=15.0))["body"]
-        document = json.loads(body) if body else {}
-    except BudgetExhausted:
-        raise
-    except Exception:  # noqa: BLE001 - an unreadable board has no postings
-        return []
-    out = []
-    for job in (document.get("jobs") if isinstance(document, dict) else None) or []:
-        if not isinstance(job, dict):
-            continue
-        code = str(job.get("shortcode") or "").strip()
-        title = " ".join(str(job.get("title") or "").split())
-        if not re.fullmatch(r"[A-Za-z0-9]{6,64}", code) or not title:
-            continue
-        place = ", ".join(p for p in (str(job.get("city") or "").strip(), str(job.get("state") or "").strip(),
-                                      str(job.get("country") or "").strip()) if p)
-        out.append({"title": title[:200], "url": f"https://apply.workable.com/{slug}/j/{code}",
-                    "date": _day(job.get("published_on") or job.get("created_at")), "location": place[:120],
-                    "department": " ".join(str(job.get("department") or "").split())[:120]})
-    return out
-
-
 def board_postings(tools: Any, company: Mapping[str, Any]) -> tuple[str, str, list[dict[str, Any]]]:
     for ats, slug in find_boards(tools, company):
-        if ats == "workable":
-            rows = workable_postings(tools, slug)
-            if rows:
-                return ats, slug, rows
-            continue
         page = _fetch(tools, API[ats].format(slug=slug), API_CHARS)
         text = str(getattr(page, "text", "") or "")
         rows = parse_postings(ats, text) if text else []
@@ -408,7 +413,7 @@ def match_prompts(icp: Mapping[str, Any], boards: list[dict[str, Any]]) -> list[
     return [(
         "The hiring signal below names ROLE CATEGORIES. For each company, pick at most one open posting whose TITLE "
         "clearly belongs to one of those categories (a senior or lead role in it is fine; a role outside them is not, "
-        "even at the same company), or whose department \"d\" itself names one of them. Prefer a title that names the function itself; never pick a generic engineering, sales or support title only because the company works in that field -- the verifier reads the posting's own duties, and a generic role at a platform company is not a platform role. Skip a company when none fits. Return {\"hits\": [{\"c\": <company>, \"p\": "
+        "even at the same company), or whose department \"d\" itself names one of them. Prefer a title that names the function itself. When the signal names broad platform, product or engineering roles, an engineering title may be picked when the company builds that platform (its duties are checked in the posting body afterwards); never pick a sales, support or other title for a function it does not name. Skip a company when none fits. Return {\"hits\": [{\"c\": <company>, \"p\": "
         "<posting>, \"category\": \"<which category, max 6 words>\"}]}.\n\nHIRING SIGNAL: %s\n\nCOMPANIES: %s"
         % (signal[:600], json.dumps(batch))) for batch in batches if batch]
 
@@ -417,7 +422,9 @@ _ROLE_STOP = {"actively", "hiring", "roles", "role", "current", "postings", "pos
 
 
 def by_relevance(postings: list[dict[str, Any]], icp: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The matcher sees MAX_TITLES postings per board, and both board lists are alphabetical (09-26 live:"""
+    """Loop s22 (#6): the matcher sees MAX_TITLES postings per board, and both board lists are alphabetical (09-26 live:
+    OneTrust 92, Anthropic 619 postings), so postings sharing a word stem with the signal's role categories go first,
+    then the newest; nothing is dropped."""
 
     def stems(text: str) -> set[str]:
         return {w[:6] for w in re.findall(r"[a-z]{4,}", text.casefold())} - {w[:6] for w in _ROLE_STOP}
@@ -477,8 +484,38 @@ def run_hiring(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, Any
     return cands
 
 
-def confirm_posting(tools: Any, cand: dict[str, Any]) -> bool:
-    """The single posting must be readable and carry its title; the snippet becomes ~30 verbatim words from the."""
+_DUTY_RE = re.compile(r"\b(?:you will|you'll|responsible for|responsibilities include|build|develop|design|own|maintain|"
+                      r"operate|improve|lead|manage|drive|deliver|support|work (?:directly|closely) with)\b", re.I)
+_ROLE_LIST_RE = re.compile(r"\bfor\s+(.{3,160}?)\s+(?:roles|positions|jobs|talent)\b", re.I)
+
+
+def role_words(signal_text: Any) -> set[str]:
+    """The role categories a HIRING criterion names ('platform, infrastructure, or revenue operations roles')."""
+
+    match = _ROLE_LIST_RE.search(str(signal_text or ""))
+    return {w for w in re.findall(r"[a-z]{4,}", match.group(1).casefold()) if w not in {"with", "evidence", "current"}} if match else set()
+
+
+def duty_sentence(text: str, start: int, words: set[str]) -> str:
+    """Loop s29 (x14 + 16d7f6fc _common.py:418: headings are not evidence): the first body sentence after the title
+    that assigns direct duties (8-45 words, no pay, no link); one naming a role word wins."""
+
+    body = str(text or "")[max(0, start):start + 8000]
+    first = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", body):
+        tokens = sentence.split()
+        if not 8 <= len(tokens) <= 45 or _PAY_CUT_RE.search(sentence) or re.search(r"https?://", sentence) or \
+                not _DUTY_RE.search(sentence):
+            continue
+        if words and any(w in sentence.casefold() for w in words):
+            return " ".join(tokens)
+        first = first or " ".join(tokens)
+    return first
+
+
+def confirm_posting(tools: Any, cand: dict[str, Any], signal_text: Any = "") -> bool:
+    """The single posting must be readable and carry its title; the snippet becomes ~30 verbatim words from the
+    title on (verify.py re-cuts anything shorter than its minimum and needs page text either way)."""
 
     page = _fetch(tools, cand["url"], 12_000)
     text = str(getattr(page, "text", "") or "")
@@ -489,6 +526,12 @@ def confirm_posting(tools: Any, cand: dict[str, Any]) -> bool:
     if index < 0:
         return False
     cand["snippet"] = " ".join(text[index:].split()[:30])
+    words = role_words(signal_text)
+    duty = duty_sentence(text, index + len(title), words)
+    if words and not any(w in title.casefold() for w in words) and not (duty and any(w in duty.casefold() for w in words)):
+        return False
+    if duty:
+        cand["duty"] = duty
     pay = _PAY_CUT_RE.search(cand["snippet"])
     if pay and len(cand["snippet"][:pay.start()].split()) >= 8:
         cand["snippet"] = cand["snippet"][:pay.start()].rstrip(" -,;:(")
@@ -499,5 +542,5 @@ def confirm_posting(tools: Any, cand: dict[str, Any]) -> bool:
     return True
 
 
-__all__ = ["run_hiring", "parse_postings", "boards_from_links", "find_boards", "searched_boards", "match_prompts", "confirm_posting", "API",
-           "posting_in_geo", "posting_tier", "rank_sources", "ashby_listed", "by_relevance", "LATE_ROUND_DAYS"]
+__all__ = ["run_hiring", "parse_postings", "boards_from_links", "find_boards", "searched_boards", "role_words", "duty_sentence", "match_prompts", "confirm_posting", "API",
+           "posting_in_geo", "posting_tier", "rank_sources", "ashby_listed", "recheck_ashby", "by_relevance", "LATE_ROUND_DAYS"]

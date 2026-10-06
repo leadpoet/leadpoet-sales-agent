@@ -1,4 +1,22 @@
-"""S15 "stage-first": companies found through their OWN funding-round announcement at the."""
+"""Loop 20260923T0503Z s15 "stage-first": companies found through their OWN funding-round announcement at the
+ICP's stage, so the stage quote is a press-release headline and never a guess.
+
+Why (official arena-2026-09-24 field + our d13 dress rehearsal of the same ICPs):
+  * every company that qualified anywhere in the field carried a company_stage_evidence quote that was a funding
+    press-release headline ("Levanta Raises $22M Series B.", "Rundoo Raises $30M Series B ..."); "stage:
+    unavailable" was the field's most common failure (9 companies) and ours (Bombas via startupintros, Faith
+    Technologies via a quiz site, RealPage via a "to be acquired" announcement);
+  * our event-first lanes reach the stage step with companies of any stage: d13 ICP 001 dropped 12 of 32
+    candidates as later-stage, ICP 003 seven, and drafted one wrong-stage company per ICP;
+  * probe x11 (09-22 bank) showed funding queries return 1-7 stage-matched companies per venture ICP but its
+    event side (the free per-company news lookup + one classifier call) found zero events.
+
+Stage-first = funding queries for the ICP's exact round in its region and sub-industry (paid Exa, news category,
+15 months back) -> the extraction call names the companies that announced their own round -> keep those whose
+LATEST named round IS the ICP's stage -> the event: the funding article itself for FUNDING criteria, else the
+free per-company news PLUS one recency-filtered Exa search per company for the ICP's event kind, one classifier
+call -> scout's resolve -> fits -> stage (the round article is the stage hint) -> draft path.
+"""
 
 from __future__ import annotations
 
@@ -57,7 +75,7 @@ def venture_stage(icp: Mapping[str, Any]) -> bool:
 
 
 def latest_round(text: str) -> str:
-    """The latest priced round the text names ('' when none): 'seed ..."""
+    """The latest priced round the text names ('' when none): 'seed ... now a Series A' -> 'series a'."""
 
     labels = [_label(m.group(1)) for m in _ROUND_RE.finditer(str(text or ""))]
     labels = [label for label in labels if label in _ORDER]
@@ -69,7 +87,8 @@ def round_accepted(label: str, icp: Mapping[str, Any]) -> bool:
 
 
 def funding_queries(icp: Mapping[str, Any]) -> list[str]:
-    """Up to MAX_QUERIES news queries for funding rounds of the ICP's own stage in its region and sub-industry;."""
+    """Up to MAX_QUERIES news queries for funding rounds of the ICP's own stage in its region and sub-industry;
+    [] for Public / Private Equity / no stage."""
 
     from .scout import region_places
 
@@ -134,7 +153,8 @@ def stage_hint(company: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def round_news_row(company: Mapping[str, Any]) -> dict[str, Any]:
-    """The funding article as a company-news row: the round press release often narrates the ICP's event too."""
+    """The funding article as a company-news row: the round press release often narrates the ICP's event too
+    (09-24 field: Medici Brands' launch clause sat inside its Series B release), and news_stage quotes it for stage."""
 
     snippet = str(company.get("round_snippet") or "")
     return {"url": str(company.get("round_url") or "").split("#")[0], "title": snippet[:200],
@@ -155,7 +175,8 @@ def seed_round_news(tools: Any, news: dict[str, list[dict[str, Any]]], companies
 
 
 def later_round_in_news(company: Mapping[str, Any], rows: list[Mapping[str, Any]], icp: Mapping[str, Any]) -> str:
-    """The later round a company-news HEADLINE names ('' when none): 'Senra Systems Raises $65M in Series B' for a."""
+    """The later round a company-news HEADLINE names ('' when none): 'Senra Systems Raises $65M in Series B' for a
+    company kept as Series A (x11 critique).  Headlines only -- excerpts mention other companies' rounds."""
 
     from .scout import name_hit
 
@@ -179,7 +200,8 @@ def event_query(icp: Mapping[str, Any], category: str, name: str) -> str:
 def company_events(tools: Any, companies: list[Mapping[str, Any]], icp: Mapping[str, Any], category: str, *,
                    age_days: Callable[[Any], Optional[int]], deadline: float, clock: Callable[[], float],
                    over_budget: Callable[[], bool], limit: Optional[int] = None) -> list[dict[str, Any]]:
-    """Story rows (roster.story_rows shape) from one recency-filtered Exa search per company; the page text."""
+    """Story rows (roster.story_rows shape) from one recency-filtered Exa search per company; the page text
+    lands in tools.pages, so confirm_on_page later checks the sentence without another fetch."""
 
     from .roster import CATEGORY_WORDS
 
@@ -220,7 +242,8 @@ def company_events(tools: Any, companies: list[Mapping[str, Any]], icp: Mapping[
 def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_days, deadline: float, clock,
                     http_client_factory=None, last: dict[str, Any], started_spend: float = 0.0,
                     over_budget: Optional[Callable[[], bool]] = None) -> list[dict[str, Any]]:
-    """Candidates in the roster lane's shape (company_name, domain, event, date, url, snippet, source) plus a."""
+    """Candidates in the roster lane's shape (company_name, domain, event, date, url, snippet, source) plus a
+    stage_hint {round, url, date, snippet}; [] for Public / Private Equity ICPs."""
 
     from . import roster, scout
 
