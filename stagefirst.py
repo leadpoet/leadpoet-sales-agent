@@ -22,14 +22,27 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from typing import Any, Callable, Mapping, Optional
 
 from . import scorer_mirror as sm
-from .arena_tools import STRATEGY, BudgetExhausted, fetchable
+from .arena_tools import STRATEGY, BudgetExhausted, fetchable, paced
 
 RECENCY_DAYS = int(STRATEGY.get("stage_first_recency_days") or 365)
 MAX_QUERIES = int(STRATEGY.get("stage_first_queries") or 6)
 MAX_COMPANIES = int(STRATEGY.get("stage_first_companies") or 8)
+# Loop s33: how far back the company's round may lie depends on the stage class.  A company that raised a Series C
+# three years ago is still Series C+ (the judge accepted a 2018 round release as stage proof, 10-01 ICP 3), while one
+# 365-day window for every stage left six of ten 10-03 ICPs (Series B / C+, non-funding intent) without a single
+# right-stage company in the whole field.  Days per class, one strategy key each; 0 = the single window above.
+# The INTENT event window (intent_max_age_days) is not touched: a FUNDING criterion still caps the lane at it.
+_RECENCY_KEYS = {"seed": ("stage_first_recency_seed", 365), "series a": ("stage_first_recency_a", 540),
+                 "series b": ("stage_first_recency_b", 730), "series c+": ("stage_first_recency_c", 1460)}
+# ... and Series B / C+ ICPs get a few more funding queries (earlier years named) and event searches; the calls come
+# from the page reads the direct fetch takes off the Deepline quota.  0 = the two caps above.
+_LATE_STAGES = ("series b", "series c+")
+LATE_QUERIES = paced("stage_first_queries_late", 9, 0, 12)
+LATE_COMPANIES = paced("stage_first_companies_late", 12, 0, 16)
 EVENT_WORKERS = 4
 _STAGE_PHRASES = {"seed": ("seed round", "seed funding"), "series a": ("Series A",), "series b": ("Series B",),
                   "series c+": ("Series C", "Series D")}
@@ -86,9 +99,27 @@ def round_accepted(label: str, icp: Mapping[str, Any]) -> bool:
     return bool(label) and label in _ACCEPT.get(stage_key(icp), set())
 
 
-def funding_queries(icp: Mapping[str, Any]) -> list[str]:
+def recency_days(icp: Mapping[str, Any]) -> int:
+    """Loop s33: the age limit, in days, of a funding round the stage-first lane accepts for this ICP's stage class
+    (Seed 365, Series A 540, Series B 730, Series C+ 1460 by default; RECENCY_DAYS when the class key is 0)."""
+
+    key, default = _RECENCY_KEYS.get(stage_key(icp), ("", 0))
+    return (paced(key, default, 0, 3650) if key else 0) or RECENCY_DAYS
+
+
+def lane_caps(icp: Mapping[str, Any]) -> tuple[int, int]:
+    """(funding queries, companies searched for their event): the late-stage caps for Series B / C+, else v1's."""
+
+    if stage_key(icp) in _LATE_STAGES:
+        return max(MAX_QUERIES, LATE_QUERIES), max(MAX_COMPANIES, LATE_COMPANIES)
+    return MAX_QUERIES, MAX_COMPANIES
+
+
+def funding_queries(icp: Mapping[str, Any], late: bool = True) -> list[str]:
     """Up to MAX_QUERIES news queries for funding rounds of the ICP's own stage in its region and sub-industry;
-    [] for Public / Private Equity / no stage."""
+    [] for Public / Private Equity / no stage.  Loop s33: when the stage's window reaches into earlier calendar
+    years, the queries past MAX_QUERIES (lane_caps) name those years, newest first, so the wider window is searched
+    and not only allowed."""
 
     from .scout import region_places
 
@@ -110,7 +141,24 @@ def funding_queries(icp: Mapping[str, Any]) -> list[str]:
             query = re.sub(r"\b(\w+)(?:\s+\1\b)+", r"\1", " ".join(query.split()), flags=re.I)[:200]
             if query.lower() not in {q.lower() for q in out}:
                 out.append(query)
-    return out[:MAX_QUERIES]
+    cap = lane_caps(icp)[0] if late else MAX_QUERIES
+    if cap <= MAX_QUERIES:
+        return out[:MAX_QUERIES]
+    base, spare = out[:MAX_QUERIES], out[MAX_QUERIES:]
+    try:
+        today = sm.evaluation_date()
+        oldest = (today - timedelta(days=recency_days(icp))).year
+        years = range(today.year - 1, max(oldest, today.year - 6) - 1, -1)
+        for template in ("{piece} company raises {phrase} {year} {place}", "{place} {piece} {phrase} funding announced {year}"):
+            for year in years:
+                for phrase in phrases:
+                    query = template.format(piece=pieces[0], phrase=phrase, year=year, place=places[0])
+                    query = re.sub(r"\b(\w+)(?:\s+\1\b)+", r"\1", " ".join(query.split()), flags=re.I)[:200]
+                    if query.lower() not in {q.lower() for q in base}:
+                        base.append(query)
+    except Exception:
+        pass
+    return (base + spare)[:cap]
 
 
 def funded_companies(cands: list[Mapping[str, Any]], icp: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -256,15 +304,27 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
     over = over_budget or (lambda: False)
     category = roster.intent_category(icp, kind)
     window = int(icp.get("intent_max_age_days") or 365)
-    recency = min(RECENCY_DAYS, window) if category == "FUNDING" else RECENCY_DAYS
+    if category == "FUNDING" and len(queries) > MAX_QUERIES:
+        # the search below is date-filtered to the intent window, so the year-named late-stage queries find nothing
+        queries = funding_queries(icp, late=False)
+        feed["queries"] = queries
+    try:
+        stage_days, company_cap = recency_days(icp), lane_caps(icp)[1]
+    except Exception:
+        stage_days, company_cap = RECENCY_DAYS, MAX_COMPANIES
+    recency = min(stage_days, window) if category == "FUNDING" else stage_days
     rows = scout.harvest(tools, queries, recency_days=recency, kind="funding", deadline=deadline, started_spend=started_spend)
     funding_icp = dict(icp, intent_signals=[f"Announced its own {icp.get('company_stage')} funding round"],
                        intent_max_age_days=recency)
     cands = scout.extract(tools, rows, funding_icp, http_client_factory=http_client_factory)
     kept, dropped = funded_companies(cands, icp)
     kept.sort(key=lambda k: str(k.get("round_date") or ""), reverse=True)
+    if company_cap > MAX_COMPANIES and category != "FUNDING":
+        for company in kept[company_cap + 4:]:
+            dropped[company["company_name"]] = "beyond the lane's company cap (older round)"
+        kept = kept[:company_cap + 4]
     feed.update(rows=len(rows), extracted=[c.get("company_name") for c in cands], kept=[dict(k) for k in kept],
-                dropped=dropped, category=category)
+                dropped=dropped, category=category, recency_days=recency, company_cap=company_cap)
     by_key = {sm.company_name_key(k["company_name"]): k for k in kept}
     if category == "FUNDING":
         events = []
@@ -308,7 +368,7 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
             seed_round_news(tools, news, kept)
             story = roster.story_rows(icp, companies, news, category, age_days=age_days)
             searched = company_events(tools, companies, icp, category, age_days=age_days, deadline=deadline, clock=clock,
-                                      over_budget=over)
+                                      over_budget=over, limit=company_cap)
             seen = {r["url"] for r in story}
             for row in searched:
                 if row["url"] in seen:
@@ -333,4 +393,4 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
 
 __all__ = ["run_stage_first", "funding_queries", "funded_companies", "latest_round", "round_accepted", "venture_stage",
            "company_events", "event_query", "stage_hint", "stage_key", "round_news_row", "seed_round_news",
-           "later_round_in_news", "RECENCY_DAYS", "MAX_COMPANIES"]
+           "later_round_in_news", "RECENCY_DAYS", "MAX_COMPANIES", "recency_days", "lane_caps"]

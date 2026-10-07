@@ -26,6 +26,18 @@ from typing import Any, Mapping, Optional
 from . import scorer_mirror as sm
 from .arena_tools import STRATEGY, BudgetExhausted, _domain, _result_data, fetchable
 
+try:
+    from . import precision as px
+except ImportError:
+    try:
+        import importlib as _importlib
+        import os as _os
+        px = _importlib.import_module(f"{_os.path.basename(_os.path.dirname(_os.path.abspath(__file__)))}.precision")
+    except Exception:
+        px = None
+except Exception:
+    px = None
+
 MODEL = str(STRATEGY.get("scout_model") or "google/gemini-2.5-flash")
 QUERY_COUNT = int(STRATEGY.get("scout_queries") or 8)
 RESULTS_PER_QUERY = 6
@@ -45,6 +57,26 @@ class RetryableStatus(Exception):
     """A 429 / 5xx chat reply (loop s22 #8)."""
 EXTRACT_BATCH_CHARS = 16_000
 LAST: dict[str, Any] = {}
+
+
+def _on(knob: str) -> bool:
+    """Loop v5: one evidence-precision knob of precision.py (strategy.json, default 1); off when the module is absent."""
+
+    return bool(getattr(px, knob, 0))
+
+
+def _px(fn: str, default: Any, *args: Any, **kwargs: Any) -> Any:
+    """Loop v5: one precision.py step (pure text work on cached pages); any failure returns the pre-v5 value."""
+
+    try:
+        return getattr(px, fn)(*args, **kwargs)
+    except BudgetExhausted:
+        raise
+    except Exception as exc:
+        errors = LAST.setdefault("precision_errors", [])
+        if len(errors) < 20:
+            errors.append(f"{fn}: {type(exc).__name__}: {str(exc)[:80]}")
+        return default
 
 _KINDS = (
     ("leadership", r"leadership|appoint|named|new (?:ceo|cto|cfo|coo|cro|cmo|chief)|executive|c-suite|management change"),
@@ -993,6 +1025,17 @@ _UNCERTAIN_RE = re.compile(r"\b(?:not|never|no|without|unconfirmed|rumou?red|pla
                            r"seeks?|expects?|targets?|pending|might|could|would|will|may|formerly|previously|once)\b", re.I)
 
 
+def _verb_before(pattern: "re.Pattern", sentence: str, at: int, window: int) -> bool:
+    """A completion verb within `window` characters before position `at`.  Loop v5 (stage_gate_strict): on 10-03 a row
+    was 'proven' Series A by '<adviser> advised AI secured-lending automation platform <company> on its Series A
+    fundraise' -- 'secured' there is an adjective and the round is the adviser's mandate; precision.round_verb skips both."""
+
+    found = bool(pattern.search(sentence[max(0, at - window):at]))
+    if found and _on("STAGE_GATE_STRICT"):
+        return bool(_px("round_verb", True, sentence, at, window, pattern))
+    return found
+
+
 def affirmed_round(sentence: str, match: re.Match) -> bool:
     """Loop s16 (upstream ae192863, lead_scorer _series_stage_statement_patterns): a round is proven only by a
     completion verb bound to its label -- within 60 characters before it ("today announced it has raised $22 million
@@ -1005,7 +1048,7 @@ def affirmed_round(sentence: str, match: re.Match) -> bool:
     if _UNCERTAIN_RE.search(six):
         return False
     after = sentence[match.end():match.end() + 40]
-    return bool(_ROUND_VERB_RE.search(before) or
+    return bool(_verb_before(_ROUND_VERB_RE, sentence, match.start(), window) or
                 re.match(r"\s*(?:round|financing|funding)?\s*(?:has\s+)?(?:raised|closed)\b", after, re.I) or
                 re.match(r"\s+company\b", after) and re.search(r"\bis an?\s*$", before, re.I))
 
@@ -1091,7 +1134,7 @@ def judge_form(sentence: str, match: re.Match) -> bool:
     'Secures'/'closes'/'lands' headlines stay affirmed but rank lower: the judge's regex rejects them (09-26 probe)."""
 
     window = 40 if "seed" in match.group(0).lower() else 60
-    if _JUDGE_VERB_RE.search(sentence[max(0, match.start() - window):match.start()]) or \
+    if _verb_before(_JUDGE_VERB_RE, sentence, match.start(), window) or \
             _RAISES_TAIL_RE.search(sentence[max(0, match.start() - 80):match.start()]):
         return True
     return bool(re.match(r"\s*(?:(?:funding|financing)\s+)?round\s+(?:has\s+)?(?:just\s+)?(?:raised|closed|secured|completed)\b",
@@ -1112,6 +1155,26 @@ def own_round(sentence: str, match: re.Match) -> bool:
     return bool(_OWN_ROUND_RE.search(sentence[max(0, match.start() - 50):match.start()]))
 
 
+_TARGET_VERB_RE = re.compile(r"\b(?:led|leads|co-led|co-leads|closed|completed)\b", re.I)
+_TARGET_OPEN_RE = re.compile(r"\b(?:talks?|offers?|intention|intends?|term sheet|in on|to lead|bid|fell through)\b", re.I)
+
+
+def round_target(sentence: str, match: re.Match, name: str) -> bool:
+    """Loop v5 (stage_gate_agree): an investor's announcement names the company AFTER the label, as the target of the
+    completed round -- '<Investor> ... has led a Series A investment in <Company>'.  On 10-03 scout proved a stage with
+    such a sentence (_stage_sentence takes it), the emit gate refused it ('no affirmed round naming the company') and
+    the row went out with no evidence.  Both gates now read it the same way."""
+
+    six = " ".join(sentence[:match.start()].split()[-6:])
+    if _UNCERTAIN_RE.search(six) or not _verb_before(_TARGET_VERB_RE, sentence, match.start(), 60) or \
+            _TARGET_OPEN_RE.search(sentence[max(0, match.start() - 60):match.end() + 160]):
+        return False        # 'announces its intention to lead', 'joins talks over', 'made an offer to lead': no round yet
+    source = _name_source(name)
+    return bool(source and re.match(r"(?:\s*(?:investment|funding|financing|round))*\s+(?:in|into|for|of)\s+"
+                                    r"(?:(?!(?:with|by|from|and|to|of|at|on|as|or)\b)[\w&.'’-]+\s+){0,2}?" + source,
+                                    sentence[match.end():match.end() + 120], re.I))
+
+
 def round_claims(text: str, name: str, first_party: bool = False) -> list[tuple[str, str, bool]]:
     """Loop s22 (teardown-0925 #5a): (label, sentence, judge_form) for every AFFIRMED round (on the company's own site
     also an own_round one) whose sentence names the company on a word boundary BEFORE the label -- the round's subject,
@@ -1119,6 +1182,7 @@ def round_claims(text: str, name: str, first_party: bool = False) -> list[tuple[
     facebook post on Misochain's round)."""
 
     out: list[tuple[str, str, bool]] = []
+    target = _on("STAGE_GATE_AGREE")
     for sentence in split_sentences(str(text or "")[:30000]):
         words = sentence.split()
         if not 4 <= len(words) <= 60 or _URLISH_RE.search(sentence) or _CHROME_RE.search(sentence) or \
@@ -1126,7 +1190,7 @@ def round_claims(text: str, name: str, first_party: bool = False) -> list[tuple[
             continue
         for match in _ROUND_RE.finditer(sentence):
             if (affirmed_round(sentence, match) or first_party and own_round(sentence, match)) and \
-                    names_company(name, sentence[:match.start()]):
+                    names_company(name, sentence[:match.start()]) or target and round_target(sentence, match, name):
                 out.append((round_label(match.group(1)), " ".join(words), judge_form(sentence, match)))
     return out
 
@@ -1150,13 +1214,18 @@ _CORP_TAIL_RE = re.compile(r"(?:\s+" + _CORP_WORDS + r"\.?)+$", re.I)
 
 
 _TICKER_GAP_FIX_RE = re.compile(r"(?<=[^\s(])\((?=(?:NASDAQ|Nasdaq|NYSE)\b)")
+_TICKER_CLOSE_FIX_RE = re.compile(r"(\((?:NASDAQ|Nasdaq|NYSE)\s*:\s*[A-Z][A-Z0-9.-]{0,9})\s+\)")
 
 
 def ticker_spaced(text: str) -> str:
     """Loop s29 (upstream 16d7f6fc _public_quote_has_bound_market_locator): the judge renders 'Rapid7, Inc. (NASDAQ: RPD)'
-    with a space before the bracket and binds the ticker only then; our fetcher's 'Inc.(NASDAQ' failed it."""
+    with a space before the bracket and binds the ticker only then; our fetcher's 'Inc.(NASDAQ' failed it.
+    Loop v5: a linked ticker reads '(Nasdaq: XXXX )' in page text (tag boundaries are spaces); the judge's locator
+    pattern allows no space before the closing bracket, and a quote without a bound locator loses the judge's free
+    prefetch of the submitted stage URL.  Under stage_gate_agree that gap is closed too."""
 
-    return _TICKER_GAP_FIX_RE.sub(" (", str(text or ""))
+    text = _TICKER_GAP_FIX_RE.sub(" (", str(text or ""))
+    return _TICKER_CLOSE_FIX_RE.sub(r"\1)", text) if _on("STAGE_GATE_AGREE") else text
 
 
 def own_ticker_sentence(text: str, name: str) -> str:
@@ -1195,7 +1264,8 @@ def attribute_sentence(text: str, name: str, attribute: str, product: str = "", 
         recurring = bool(re.search(r"subscription|recurring", attribute, re.I))
         for i, row in enumerate(rows):
             table = "|" in row and names_company(name, row)
-            if not (4 if table else 6) <= len(row.split()) <= 60 or _URLISH_RE.search(row) or _CHROME_RE.search(row):
+            if not (4 if table else 6) <= len(row.split()) <= 60 or _URLISH_RE.search(row) or _CHROME_RE.search(row) or \
+                    _consent_chrome(row, f"{attribute} {product}"):
                 continue
             if (not table and not _DEFINITION_RE.search(row)) or _TESTIMONIAL_RE.search(row):
                 continue
@@ -1213,7 +1283,8 @@ def attribute_sentence(text: str, name: str, attribute: str, product: str = "", 
     best, best_score = "", 1
     for sentence in split_sentences(str(text or "")[:30000]):
         words = sentence.split()
-        if not 8 <= len(words) <= 60 or _URLISH_RE.search(sentence) or _CHROME_RE.search(sentence) or not names_company(name, sentence):
+        if not 8 <= len(words) <= 60 or _URLISH_RE.search(sentence) or _CHROME_RE.search(sentence) or not names_company(name, sentence) \
+                or _consent_chrome(sentence, f"{attribute} {product}"):
             continue
         tokens = set(re.findall(r"[a-z]{4,}", sentence.casefold()))
         score = sum(1 for f in focus if any(t.startswith(f[:6]) for t in tokens))
@@ -1233,6 +1304,18 @@ _DEFINITION_RE = re.compile(r"\b(?:is|are)\s+(?:a|an|the)\b|\b(?:offers|provides
                             r"makes|manufactures|produces|operates|sells|designs|powers|serves|specializes|specialises)\b", re.I)
 
 
+def _offering_text(icp: Mapping[str, Any]) -> str:
+    return " ".join(str(icp.get(k) or "") for k in ("required_attribute", "product_service", "sub_industry", "industry"))
+
+
+def _consent_chrome(sentence: str, offering: str = "") -> bool:
+    """Loop v5 (capability_chrome_guard): cookie / consent / tracking / privacy-banner wording is never the capability
+    sentence.  _CHROME_RE's \\bcookie\\b missed 'cookies', and 10-03 rows quoted 'these cookies support core
+    functionalities like ... consent management' as the required attribute; the judge confirmed it for none of them."""
+
+    return _on("CAPABILITY_CHROME_GUARD") and bool(_px("consent_text", False, sentence, offering))
+
+
 def capability_sentence(text: str, name: str, icp: Mapping[str, Any], *, first_party: bool = False) -> tuple[str, int]:
     """Loop s29c: prefer named own-domain sentences; unnamed ones are a fallback.
     Third-party sentences must name the company. Keep 8-60 verbatim words and >= 2 ICP focus matches."""
@@ -1241,10 +1324,11 @@ def capability_sentence(text: str, name: str, icp: Mapping[str, Any], *, first_p
                                                             ("required_attribute", "product_service", "sub_industry")).casefold())
              if w not in _ATTR_STOP}
     best, best_score, best_named = "", 0, False
+    offering = _offering_text(icp)
     for sentence in split_sentences(str(text or "")[:30000]):
         words = sentence.split()
         if not 8 <= len(words) <= 60 or _URLISH_RE.search(sentence) or _CHROME_RE.search(sentence) or \
-                (not first_party and not names_company(name, sentence)):
+                (not first_party and not names_company(name, sentence)) or _consent_chrome(sentence, offering):
             continue
         tokens = set(re.findall(r"[a-z]{4,}", sentence.casefold()))
         score = sum(1 for f in focus if any(t.startswith(f[:6]) for t in tokens))
@@ -1441,6 +1525,21 @@ def _span(value: Any) -> str:
     return " ".join(unicodedata.normalize("NFKC", html.unescape(str(value or ""))).split()).casefold()
 
 
+_PAGE_SPAN: dict[str, str] = {}
+
+
+def _page_span(text: str) -> str:
+    """_span() of a page text, remembered for the last few pages: the v5 cached-page scan asks the gate about several
+    sentences of the same page."""
+
+    held = _PAGE_SPAN.get(text)
+    if held is None:
+        if len(_PAGE_SPAN) >= 8:
+            _PAGE_SPAN.clear()
+        held = _PAGE_SPAN[text] = _span(text)
+    return held
+
+
 def stage_quote_ok(quote: str, page_text: str, *, name: str, stage: str, url: str, website: str = "") -> str:
     """Loop s22 (teardown-0925 #5b): '' when a company_stage_evidence item may be emitted, else why not.  The quote is
     verbatim page text (no re-cut), sits on a first-party or fetchable news host (never tier 3), names the company on
@@ -1451,7 +1550,7 @@ def stage_quote_ok(quote: str, page_text: str, *, name: str, stage: str, url: st
     if sm.normalize_stage(stage) == "public":
         quote, page_text = ticker_spaced(quote), ticker_spaced(page_text)
     span = _span(quote)
-    if not 8 <= len(span) <= 2000 or span not in _span(page_text):
+    if not 8 <= len(span) <= 2000 or span not in _page_span(str(page_text or "")):
         return "quote not verbatim on the page"
     tier = _stage_host_tier(url, sm.registrable_host(website) if website else "")
     if tier >= 3 or not fetchable(url):
@@ -1460,13 +1559,20 @@ def stage_quote_ok(quote: str, page_text: str, *, name: str, stage: str, url: st
         return "page chrome in the quote"
     if not names_company(name, quote):
         return "quote does not name the company"
+    strict = tier != 0 and _on("STAGE_GATE_STRICT")
+    if strict and not _px("page_binds", True, name, page_text, url, website):
+        return "namesake: the page carries neither the company's full name nor its domain"
     want = sm.normalize_stage(stage)
     if want == "public":
         return "" if own_ticker_sentence(quote, name) else "no company-bound '(NASDAQ|NYSE: X)' sentence"
     if "equity" in want:
         return "" if pe_sentence(quote, name) else "no PE-control sentence"
+    if strict and _px("deal_page_refused", False, quote, name, url, website):
+        return "deal listing: the company is not the subject of a completed round"
+    target = _on("STAGE_GATE_AGREE")
     labels = [round_label(m.group(1)) for m in _ROUND_RE.finditer(quote)
-              if (affirmed_round(quote, m) or tier == 0 and own_round(quote, m)) and names_company(name, quote[:m.start()])]
+              if (affirmed_round(quote, m) or tier == 0 and own_round(quote, m)) and names_company(name, quote[:m.start()])
+              or target and round_target(quote, m, name)]
     labels = [label for label in labels if label in _ORDER]
     if not labels:
         return "no affirmed round naming the company"
@@ -1776,13 +1882,20 @@ def news_stage(tools: Any, name: str, domain: str, icp: Mapping[str, Any], *, de
         round_date = latest[0] or None
     hits.sort(key=lambda r: (_stage_host_tier(r[1], domain), -int(r[0].replace("-", "")) if r[0][:4].isdigit() else 0))
     evidence: list[dict[str, str]] = []
+    agree = _on("STAGE_GATE_AGREE")
+    emitted: list[dict[str, str]] = []
     for _date, url, _blob in hits[:5]:
-        if len(evidence) >= 3 or time.monotonic() >= deadline:
+        if (len(emitted) + len(evidence) >= 3 and (emitted or not agree)) or time.monotonic() >= deadline:
             break
         text = _fetch_text(tools, url)
         quote = quote_of(text, name) if quote_of else _stage_sentence(text, name, pattern)
-        if quote:
+        # Loop v5 (stage_gate_agree): the sentence verify's emit gate accepts leads; a page it refuses stays as proof only.
+        better = _px("emit_quote", "", text, name, str(icp.get("company_stage") or ""), url, domain) if agree and text else ""
+        if better:
+            emitted.append({"url": url, "quote": better[:2000]})
+        elif quote:
             evidence.append({"url": url, "quote": quote[:2000]})
+    evidence = (emitted + evidence)[:3]
     if not evidence:
         return None
     PROOF_DATE[key] = round_date
@@ -1791,9 +1904,10 @@ def news_stage(tools: Any, name: str, domain: str, icp: Mapping[str, Any], *, de
     return str(icp.get("company_stage")), evidence[0]["url"], evidence[0]["quote"]
 
 
-def hint_proof(tools: Any, name: str, hint: Mapping[str, Any], icp: Mapping[str, Any]) -> tuple[str, str, str]:
+def hint_proof(tools: Any, name: str, hint: Mapping[str, Any], icp: Mapping[str, Any], website: str = "") -> tuple[str, str, str]:
     """Loop s15: a stage-first candidate's own funding article (the round named in its headline), quoted verbatim,
-    when the company's dated news is silent about its stage (a later round there already returned a mismatch)."""
+    when the company's dated news is silent about its stage (a later round there already returned a mismatch).
+    Loop v5 (stage_gate_agree): the sentence the emit gate accepts is quoted when the page has one."""
 
     want = sm.normalize_stage(icp.get("company_stage"))
     label = str(hint.get("round") or "")
@@ -1805,10 +1919,13 @@ def hint_proof(tools: Any, name: str, hint: Mapping[str, Any], icp: Mapping[str,
         return "", "", ""
     pattern = label_pattern(label)
     quote = _stage_sentence(text, name, pattern)
+    if _on("STAGE_GATE_AGREE"):
+        quote = _px("emit_quote", "", text, name, str(icp.get("company_stage") or ""), url, website) or quote
     if not quote:
         for match in pattern.finditer(text[:20000]):
             window = _window(text, match)
-            if name_hit(name, window) and _ROUND_VERB_RE.search(window[:window.lower().find(label.split()[0])]):
+            at = window.lower().find(label.split()[0])
+            if name_hit(name, window) and _verb_before(_ROUND_VERB_RE, window, at, at):
                 quote = window
                 break
     if not quote:
@@ -1860,7 +1977,7 @@ def stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str
             PROOF_DATE.pop(sm.company_name_key(name), None)
             LAST["stage_from_intent_ticker"] = LAST.get("stage_from_intent_ticker", 0) + 1
             return str(icp.get("company_stage")), intent_url, quote
-    found = stage_proof_found(tools, name, prof, icp, deadline=deadline, hint=hint)
+    found = stage_proof_found(tools, name, prof, icp, deadline=deadline, hint=hint, intent_url=intent_url)
     if found[0] and found[1]:
         try:
             later = later_round_on_page(tools, found[1], sm.normalize_stage(icp.get("company_stage")))
@@ -1872,12 +1989,38 @@ def stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str
     return found
 
 
+def cached_stage(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any], urls: Any = ()) -> Optional[dict[str, Any]]:
+    """Loop v5 (stage_cache_scan): a stage proof read from pages this run already holds -- the intent page, the
+    required-attribute page, the homepage and about pages, the stage-hint article, news rows and search-result pages
+    naming the company -- with the emit gate as the selector.  No provider call.  None when the cache says nothing or
+    affirms a later round for the company (then the search below decides, as before)."""
+
+    if not _on("STAGE_CACHE_SCAN"):
+        return None
+    got = _px("cache_proof", None, tools, name, prof, icp, [u for u in urls if u])
+    if got and got.get("later"):
+        LAST.setdefault("stage_cache_later", []).append(f"{name}: {got['later']}")
+        return None
+    return got if got and got.get("url") and got.get("quote") else None
+
+
+def use_cached_stage(name: str, icp: Mapping[str, Any], got: Mapping[str, Any]) -> tuple[str, str, str]:
+    key = sm.company_name_key(name)
+    PROOF_DATE[key] = got.get("date")
+    STAGE_EXTRA[key] = [dict(e) for e in got.get("extras") or []]
+    LAST["stage_from_cache"] = LAST.get("stage_from_cache", 0) + 1
+    return str(icp.get("company_stage")), str(got["url"]), str(got["quote"])
+
+
 def stage_proof_found(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any], *, deadline: float,
-                      hint: Optional[Mapping[str, Any]] = None) -> tuple[str, str, str]:
+                      hint: Optional[Mapping[str, Any]] = None, intent_url: str = "") -> tuple[str, str, str]:
     """(stage label, evidence url, verbatim quote) proving the ICP's stage, or ('', '', '') -- never a guess.
 
     Loop s9: the company's own dated news first (free); the search path below only when the news is silent.
-    Loop s15: between the two, the funding article a stage-first candidate was found through (hint)."""
+    Loop s15: between the two, the funding article a stage-first candidate was found through (hint).
+    Loop v5: before the search, the pages already cached for this company (cached_stage).  For a venture stage only a
+    fresh round on the candidate's own event page replaces the search (the search is how a later round or an
+    acquisition is found); any other cached sentence is used when the search comes back silent."""
 
     want = sm.normalize_stage(icp.get("company_stage"))
     if not want:
@@ -1894,18 +2037,31 @@ def stage_proof_found(tools: Any, name: str, prof: Mapping[str, Any], icp: Mappi
     except Exception as exc:
         LAST.setdefault("stage_errors", []).append(f"{name}: {type(exc).__name__}")
         found = None
+    website = str(prof.get("website") or "")
     if found is not None and found[0] and hint and _stage_host_tier(found[1], str(prof.get("domain") or "")) >= 3:
-        proven = hint_proof(tools, name, hint, icp)
+        proven = hint_proof(tools, name, hint, icp, website)
         if proven[0]:
             LAST["stage_hint_over_weak_news"] = LAST.get("stage_hint_over_weak_news", 0) + 1
             return proven
     if found is not None:
         return found
     if hint:
-        proven = hint_proof(tools, name, hint, icp)
+        proven = hint_proof(tools, name, hint, icp, website)
         if proven[0]:
             return proven
-    return _search_stage_proof(tools, name, prof, icp, deadline=deadline)
+    listed = [u for u in (intent_url, (hint or {}).get("url")) if u]
+    cached = cached_stage(tools, name, prof, icp, listed)
+    if cached:
+        # the search below is also where an acquisition or a later round is found, so for every venture stage only a
+        # fresh round on the candidate's own event page replaces it (the date is set for a page about the round only)
+        age = event_age_days(cached.get("date"))
+        if want == "public" or "equity" in want or \
+                (cached["url"] in listed and age is not None and 0 <= age <= FRESH_ROUND_DAYS):
+            return use_cached_stage(name, icp, cached)
+    found = _search_stage_proof(tools, name, prof, icp, deadline=deadline)
+    if cached and not (found[0] and found[2]) and not stage_contradiction(name):
+        return use_cached_stage(name, icp, cached)
+    return found
 
 
 def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any], *,
@@ -1933,20 +2089,20 @@ def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Map
     best_round, best, best_date = "", ("", ""), None
     order = ["pre seed", "seed"] + [f"series {c}" for c in "abcdefgh"]
     owned = ""
-    # Every page that affirms the same round, not only the last one scanned.
-    # This path already reads up to seven pages and then keeps one sentence;
-    # the rest are the cheapest stage evidence there is, because they are
-    # already fetched.  Measured over the 192 companies submitted to
-    # arena-2026-10-02, a company carrying one stage source qualified 10 times
-    # in 57 (18%) and one carrying two or three qualified 12 times in 15 (80%):
-    # the judge's investigator reads up to three submitted sources for free
-    # before it spends any of its own three fetches.
+    # Loop v5: every page affirming a round is kept per label (the stage search reads up to seven pages and used to
+    # keep one sentence), and a listing / PE sentence the emit gate refuses waits in `weak` while later pages are read.
     claims: dict[str, list[tuple[str, str]]] = {}
+    weak: list[tuple[str, str, str]] = []
+    stage_text, website = str(icp.get("company_stage") or ""), str(prof.get("website") or domain)
+    agree, strict = _on("STAGE_GATE_AGREE"), _on("STAGE_GATE_STRICT")
 
     def scan(url: str, text: str, date: Optional[str] = None) -> Optional[tuple[str, str, str]]:
         """A listing / PE sentence returns at once; affirmed rounds update the latest one seen."""
         nonlocal best_round, best, best_date, owned
         if not text or not name_hit(name, text[:20000]):
+            return None
+        if strict and not _px("page_binds", True, name, text, url, website):
+            LAST["stage_namesake_skips"] = LAST.get("stage_namesake_skips", 0) + 1
             return None
         if want != "public" and "equity" not in want and not owned:
             for sentence in re.split(r"(?<=[.!?])\s+", text[:20000]):
@@ -1958,6 +2114,13 @@ def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Map
             return None
         if want == "public" or "equity" in want:
             quote = ticker_sentence(text, name) if want == "public" else pe_sentence(text, name)
+            if agree:
+                better = _px("emit_quote", "", text, name, stage_text, url, website)
+                if better:
+                    return stage_text, url, better
+                if quote:
+                    weak.append((stage_text, url, quote))
+                return None
             return (str(icp.get("company_stage")), url, quote) if quote else None
         for label, sentence, _judge in round_claims(text, name, first_party=_stage_host_tier(url, domain) == 0):
             if label not in order:
@@ -2004,7 +2167,7 @@ def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Map
         hit = scan(url, str(getattr(page, "text", "") or ""))
         if hit:
             return hit
-    for query in (queries[:1] if not best_round else []):
+    for query in (queries[:1] if not best_round and not weak else []):
         if best_round or time.monotonic() >= deadline:
             break
         try:
@@ -2018,18 +2181,23 @@ def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Map
             hit = scan(url, _page_text(tools, url, str(row.get("excerpt") or "")), str(row.get("published_date") or "")[:10] or None)
             if hit:
                 return hit
+    if weak:
+        return weak[0]
     if owned:
         LAST.setdefault("stage_mismatch", []).append(f"{name}: ownership change ({owned[:80]})")
         return "", "", ""
     if best_round and sm.stage_matches(best_round, want):
         PROOF_DATE[key] = best_date
-        # Hand the judge the corroborating pages too, the way news_stage does.
-        # STAGE_EVIDENCE_MAX is 3, so two extras; build_draft takes [:2].
-        extras = [{"url": url, "quote": sentence[:2000]}
-                  for url, sentence in claims.get(best_round, []) if url != best[0]]
-        if extras:
-            STAGE_EXTRA[key] = extras[:2]
-            LAST["stage_search_extras"] = LAST.get("stage_search_extras", 0) + len(extras[:2])
+        others = [claim for claim in claims.get(best_round, []) if claim[0] != best[0]]
+        if agree:
+            # the proof the emit gate accepts leads (a weak-host or refused sentence stays as proof only when nothing better)
+            ranked = _px("rank_claims", None, tools, [best] + others, name, stage_text, website)
+            if ranked and ranked[0][2]:
+                best, others = ranked[0][:2], [claim[:2] for claim in ranked[1:] if claim[2]]
+        keep = int(getattr(px, "STAGE_EXTRA_SOURCES", 0) or 0)
+        if keep and others:
+            STAGE_EXTRA[key] = [{"url": url, "quote": sentence[:2000]} for url, sentence in others[:keep]]
+            LAST["stage_search_extras"] = LAST.get("stage_search_extras", 0) + len(others[:keep])
         return str(icp.get("company_stage")), best[0], best[1]
     if best_round:
         LAST.setdefault("stage_mismatch", []).append(f"{name}: {best_round}")
@@ -2270,6 +2438,71 @@ def _swap_first_party(tools: Any, cand: dict[str, Any], prof: Mapping[str, Any],
     return True
 
 
+def own_source(tools, cand, prof, icp, window, deadline):
+    """v6 intent_first_party: on an ICP naming its proof sources, cite the company's own page on the SAME event: a proper
+    noun of the article's event is in that page's URL slug and quoted sentence, the dates within 45 days (free GETs)."""
+
+    from urllib.parse import urlsplit
+    from .sourcetype import _MONTHS, allowed_kinds, body_dateline, source_kind
+    name, home, pages = cand["company_name"], str(prof.get("website") or ""), getattr(tools, "pages", {})
+    site, kinds = sm.registrable_host(home), allowed_kinds(icp["intent_signals"][0]) or ()
+    said, art = f"{cand.get('snippet') or ''} {cand.get('event') or ''}", pages.get(cand.get("url"))
+    low = set(re.findall(r"\b[a-z]{3,}\b", said + " " + str(getattr(art, "text", "")))) | set(_MONTHS)
+    keys = {w for w in re.findall(r"\b[A-Z][\w&]{2,}", said)
+            if w.lower() not in name.lower() and w.lower() not in low and not _EVENT_WORDS.match(w)}
+    if not keys or source_kind(cand.get("url"), site, name) not in ("news", "unknown") or "ats" in kinds or \
+            "first_party" not in kinds or LAST.get("own_tried", 0) > 7:
+        return False
+    LAST["own_tried"] = LAST.get("own_tried", 0) + 1
+    stop, want, got = min(deadline - 60, time.monotonic() + 20), sm.normalize_stage(icp.get("company_stage")), {}
+
+    def read(url):
+        page = pages.get(url) or got.get(url)
+        if page is None and time.monotonic() < stop:
+            page = got[url] = tools._direct_page(url, 12000)
+        return page if getattr(page, "ok", False) else None
+
+    def own(page):
+        return [u for u in dict.fromkeys(str(u).split("#")[0] for u in getattr(page, "links", page) or ())
+                if source_kind(u, site, name) == "first_party"]
+
+    def slug(url):
+        words = re.findall(r"[a-z0-9]+", urlsplit(url).path.lower())
+        return {k for k in keys if k.lower() in words}
+
+    links = own(art) + own(read(home))
+    index = sorted({u.rstrip("/"): u for u in links if re.search(r"/(?:news|press|media|blog|invest)", u)}.values(), key=len)
+    for url in list(dict.fromkeys([u for u in index if re.search(r"/(?:news|press)", u)][:1] + index))[:2]:
+        links += own(read(url))
+    if not any(map(slug, links)) and not getattr(art, "links", 0) and time.monotonic() < stop:
+        links += own(tools._direct_page(cand["url"], 12000))   # a search-result page carries no links
+    links = list(dict.fromkeys(own(list(pages)) + links))
+    seen = [k for last in {urlsplit(u).path.rstrip("/").rsplit("/", 1)[-1] for u in links} for k in slug(last)]
+    keys = {k for k in keys if seen.count(k) < 3}
+    fresh = sorted((u for u in links if u not in pages and slug(u)), key=lambda u: (-len(slug(u)), -len(u)))[:3]
+    for url in [u for u in links if u in pages] + fresh:
+        text = str(getattr(read(url), "text", "") if slug(url) else "")
+        for s in split_sentences(text):
+            cut = re.sub(r"^\W+", "", " ".join(s.split()[:40]))
+            if 8 <= len(s.split()) <= 60 and name_hit(name, s) and any(k in cut for k in slug(url)) and \
+                    primary_event_shown(icp, {"snippet": cut, "url": url}, text):
+                break
+        else:
+            continue
+        at = text.find(s)
+        when = find_date(re.sub(r"(\d)(?:st|nd|rd|th)\b", r"\1", text[max(0, at - 120):at + 400]), url) or \
+            body_dateline(text) or find_date(text)
+        age, was = event_age_days(when), event_age_days(cand.get("date"))
+        if age is None or not 0 <= age <= window or abs(age - was) > 45 or \
+                (want in _VENTURE and slug_conflict(name, [url], want)):
+            continue
+        cand.update(url=url, snippet=cut, date=when)
+        pages[url] = read(url)
+        LAST["own_source"] = url
+        return True
+    return False
+
+
 def primary_icp(icp: Mapping[str, Any]) -> dict[str, Any]:
     """Loop s29b (09-27 official: Realty Income's property ACQUISITION went out as the 'opened a new office' criterion and
     ObvioHealth's partnership as 'regulatory clearance' -- discovery saw both criteria, the judge scores index 0 as the
@@ -2314,8 +2547,10 @@ _OPENED_RE = re.compile(r"\b(?:open(?:s|ed|ing)?|expand(?:s|ed)?|entered|enters|
 _NOT_A_PRODUCT_RE = re.compile(r"\bnew (?:web ?site|website|blog|podcast|newsletter|logo|brand(?:ing)?|look)\b", re.I)
 
 
-def primary_event_shown(icp: Mapping[str, Any], cand: Mapping[str, Any]) -> bool:
-    """The candidate's own event text states a COMPLETED event of the primary criterion's category."""
+def primary_event_shown(icp: Mapping[str, Any], cand: Mapping[str, Any], page_text: str = "") -> bool:
+    """The candidate's own event text states a COMPLETED event of the primary criterion's category.
+    Loop v5 (funding_label_guard): a FUNDING criterion that names a round needs that round label in the event text,
+    its URL or the opening of its page (`page_text`); a plain 'secured funding from <investor>' no longer shows it."""
 
     from .roster import intent_category
     category = intent_category(icp, intent_kind(" ".join(str(x) for x in icp.get("intent_signals") or [])))
@@ -2324,6 +2559,10 @@ def primary_event_shown(icp: Mapping[str, Any], cand: Mapping[str, Any]) -> bool
         return True
     text = " ".join(str(cand.get(k) or "") for k in ("snippet", "event", "title"))
     if not re.search(pattern, text, re.I):
+        return False
+    if category == "FUNDING" and _on("FUNDING_LABEL_GUARD") and not _px(
+            "funding_label_ok", True, (icp.get("intent_signals") or [icp.get("intent_signal") or ""])[0],
+            " ".join([text, re.sub(r"[-_/]+", " ", str(cand.get("url") or "")), str(page_text or "")[:2500]])):
         return False
     if category == "PRODUCT_LAUNCH" and _NOT_A_PRODUCT_RE.search(text):
         return False
@@ -2399,8 +2638,13 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
     capability_pending: list[dict[str, Any]] = []
     want = sm.normalize_stage(icp.get("company_stage"))
     for cand in cands:
-        if len(drafts) >= limit or time.monotonic() >= deadline or _over_budget(tools, started_spend):
-            LAST["resolve_stopped"] = "limit" if len(drafts) >= limit else ("deadline" if time.monotonic() >= deadline else "budget")
+        # Loop v5 (proven_only_stop): stage-unproven drafts do not count toward the limit, so an ICP that is producing
+        # keeps resolving candidates for its open slots while calls stay above the reserve (precision.resolve_full).
+        full = len(drafts) >= limit
+        if full and _on("PROVEN_ONLY_STOP"):
+            full = bool(_px("resolve_full", True, drafts, limit))
+        if full or time.monotonic() >= deadline or _over_budget(tools, started_spend):
+            LAST["resolve_stopped"] = "limit" if full else ("deadline" if time.monotonic() >= deadline else "budget")
             break
         try:
             left = int(tools.remaining())
@@ -2443,7 +2687,7 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
                 if slug:
                     drops[cand["company_name"]] = slug
                     continue
-                if cand.get("source") != "ats" and not primary_event_shown(icp, cand):
+                if cand.get("source") != "ats" and not primary_event_shown(icp, cand, _page_text(tools, cand["url"], "")):
                     drops[cand["company_name"]] = ("event text does not show the primary criterion: "
                                                    + " ".join(str(cand.get("snippet") or cand.get("event") or "").split())[:100])
                     continue
@@ -2455,6 +2699,12 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
             if why:
                 drops[cand["company_name"]] = why
                 continue
+            if _on("INTENT_FIRST_PARTY") and cand.get("source") != "ats" and kind != "hiring" and \
+                    str(icp.get("intent_category") or "").upper() != "HIRING":
+                try:
+                    own_source(tools, cand, prof, icp, window, deadline)
+                except Exception as exc:
+                    LAST["own_error"] = type(exc).__name__
             from .sourcetype import admissible, prefer_own_source
             signal = (icp.get("intent_signals") or [""])[0]
             site = sm.registrable_host(prof.get("website") or "")
@@ -2480,6 +2730,15 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
             if disputed:
                 drops[cand["company_name"]] = disputed
                 continue
+            if unproven:
+                # Loop v5 (stage_cache_scan): the current-stage search just cached up to five result pages in the
+                # judge's own query form; a stage sentence on one of them (or on any page read since) proves the draft.
+                try:
+                    rescued = cached_stage(tools, cand["company_name"], prof, icp, [cand.get("url")])
+                    if rescued and not later_round_on_page(tools, rescued["url"], want):
+                        stage, unproven = use_cached_stage(cand["company_name"], icp, rescued), False
+                except Exception as exc:
+                    LAST.setdefault("candidate_errors", []).append(f"{cand['company_name']}: cached stage {type(exc).__name__}")
             draft = build_draft(icp, cand, prof, stage, tools=tools)
             if unproven:
                 draft["_stage_unproven"] = True
@@ -2512,7 +2771,7 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
     drafts.sort(key=draft_rank)
     if SECOND_SIGNAL and drafts and len(sm.icp_signals(full_icp)) >= 2:
         found: list[str] = []
-        for draft in drafts:
+        for draft in drafts[:limit]:   # v5: proven_only_stop can return more drafts; the first `limit` are the proven ones
             if time.monotonic() >= deadline - 20 or _over_budget(tools, started_spend):
                 break
             try:

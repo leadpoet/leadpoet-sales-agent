@@ -35,6 +35,13 @@ from . import diagnostics
 from . import scorer_mirror as sm
 from .arena_transport import arena_socket_path
 
+try:
+    from . import webfetch
+except ImportError:
+    import importlib as _importlib
+
+    webfetch = _importlib.import_module(f"{os.path.basename(os.path.dirname(os.path.abspath(__file__)))}.webfetch")
+
 DEEPLINE_QUOTA_PER_ICP = 200
 DEFAULT_CALL_BUDGET = 27
 
@@ -101,7 +108,28 @@ PACING = {
     "fetch_page_max_chars": paced("fetch_page_max_chars", 3500, 1000, 6000, "ARENA_FETCH_PAGE_MAX_CHARS"),
     "free_fetch_first": paced("free_fetch_first", 1, 0, 1, "ARENA_FREE_FETCH_FIRST"),
     "free_search_first": paced("free_search_first", 0, 0, 1, "ARENA_FREE_SEARCH_FIRST"),
+    # Loop s33: page reads by a direct GET over the free web-egress bridge before the Deepline scrape (webfetch.py);
+    # direct_fetch_local allows the same GET without the bridge (local runs and tests only).
+    "direct_fetch": paced("direct_fetch", 1, 0, 1, "ARENA_DIRECT_FETCH"),
+    "direct_fetch_local": paced("direct_fetch_local", 0, 0, 1, "ARENA_DIRECT_FETCH_LOCAL"),
+    "direct_fetch_timeout": paced("direct_fetch_timeout", 8, 2, 30, "ARENA_DIRECT_FETCH_TIMEOUT"),
+    "direct_fetch_max": paced("direct_fetch_max", 200, 0, 280, "ARENA_DIRECT_FETCH_MAX"),
+    "direct_fetch_json": paced("direct_fetch_json", 1, 0, 1, "ARENA_DIRECT_FETCH_JSON"),
+    # Loop s37: 0 keeps research page reads on the provider scrape while the free reader still serves the homepage
+    # name probe, the own-announcement lookup and the evidence check.  On 10-06 the three entries that read research
+    # pages directly ran one ICP to the research timer (823-886 s, 145-181 calls) and found no company there; the
+    # two that scraped finished in 475-560 s at the call ceiling and each qualified one.
+    "direct_fetch_pages": paced("direct_fetch_pages", 1, 0, 1, "ARENA_DIRECT_FETCH_PAGES"),
+    "markdown_clean": paced("markdown_clean", 1, 0, 1, "ARENA_MARKDOWN_CLEAN"),
+    "weak_evidence_hosts": paced("weak_evidence_hosts", 1, 0, 1, "ARENA_WEAK_EVIDENCE_HOSTS"),
+    "tool_breaker": paced("tool_breaker", 1, 0, 1, "ARENA_TOOL_BREAKER"),
 }
+# Loop s33 circuit breaker: local ledgers (56 ICP runs) show a tool that answers 5xx four times in a row never
+# recovering inside that ICP (free_simple_company_search: runs of 14-33 failed calls); transient 502s come in runs
+# of at most two or three.  An open tool gets one trial call after BREAKER_RETRY_SECONDS, then after twice that, ...
+BREAKER_FAILURES = 4
+BREAKER_RETRY_SECONDS = 20.0
+DIRECT_MISSING = "direct: http 4"
 
 _EVENT_TOOLS = {
     "HIRING": "predictleads_company_job_openings", "JOBS": "predictleads_company_job_openings",
@@ -238,6 +266,34 @@ def fetchable(url: Any) -> bool:
 
     host = _domain(url)
     return bool(host) and not any(host == h or host.endswith("." + h) for h in UNFETCHABLE_HOSTS)
+
+
+# Loop s33: hosts a rendered scrape reads but the judge's plain GET does not.  Stage evidence on businesswire.com
+# passed 16 of 37 (43%) against 96% on prnewswire.com and globenewswire.com (rounds 24-1003).  Such a page is still
+# read for discovery (it is NOT in UNFETCHABLE_HOSTS); it is only never preferred as an evidence URL.
+WEAK_EVIDENCE_HOSTS = ("businesswire.com",)
+
+
+def weak_evidence_host(url: Any) -> bool:
+    """True for an evidence URL on a host the judge's own fetch usually fails on (see WEAK_EVIDENCE_HOSTS)."""
+
+    if not PACING.get("weak_evidence_hosts"):
+        return False
+    host = _domain(url)
+    return bool(host) and any(host == h or host.endswith("." + h) for h in WEAK_EVIDENCE_HOSTS)
+
+
+def _markdown_text(url: Any, markdown: str) -> str:
+    """A scraped page's markdown as the text the selectors read.  Loop s33 (markdown_clean): link targets are dropped
+    and parentheses kept (webfetch.markdown_text); a board API / JSON / feed document keeps the earlier flattening
+    the hiring parsers were written against, and so does everything when the knob is 0."""
+
+    try:
+        if PACING.get("markdown_clean") and not webfetch.structured(url, markdown):
+            return webfetch.markdown_text(markdown)
+    except Exception:
+        pass
+    return " ".join(re.sub(r"[#*_>`\[\]()]", " ", markdown).split())
 
 
 def _sql_literal(value: str) -> str:
@@ -408,6 +464,16 @@ class ArenaTools:
         self._ledger_log: list[tuple[float, float]] = []
         self._last_host: Optional[tuple[float, float]] = None
         self.spend_refusals = 0
+        self._breaker: dict[str, dict[str, Any]] = {}
+        self.breaker_skips: dict[str, int] = {}
+        try:
+            self._direct = webfetch.Direct(
+                enabled=bool(PACING["direct_fetch"]), local=bool(PACING["direct_fetch_local"]),
+                timeout=float(PACING["direct_fetch_timeout"]), max_fetches=int(PACING["direct_fetch_max"]),
+                json_hosts=bool(PACING["direct_fetch_json"]),
+                skip_hosts=WEAK_EVIDENCE_HOSTS if PACING["weak_evidence_hosts"] else ())
+        except Exception:
+            self._direct = webfetch.Direct(enabled=False)
         self._owns_client = client is None and post is None
         self._client = client if client is not None else (
             None if post is not None else httpx.Client(
@@ -417,8 +483,104 @@ class ArenaTools:
         )
 
     def close(self) -> None:
+        try:
+            self._direct.close()
+        except Exception:
+            pass
         if self._owns_client and self._client is not None:
             self._client.close()
+
+    def direct_ok(self, url: Any) -> Optional[bool]:
+        """Loop s33: did a plain GET by a library client -- the judge's own kind of fetch for stage and
+        required-attribute evidence -- read this URL as a page in this run?  True; False (tried and refused, timed
+        out, a wall, too thin or missing; read only with the browser User-Agent; or on a WEAK_EVIDENCE_HOSTS host);
+        None (never tried, e.g. a page known only from a search result or one skipped because its host was refusing)."""
+
+        try:
+            return self._direct.outcome.get(str(url or "").strip().split("#")[0])
+        except Exception:
+            return None
+
+    def direct_check(self, url: Any) -> Optional[bool]:
+        """direct_ok, making the free direct GET first when this URL was never tried (a page that came from a search
+        result's cached text, say).  No provider call, no spend; the page cache is left alone.  Never raises."""
+
+        known = self.direct_ok(url)
+        if known is not None:
+            return known
+        try:
+            self._direct.read(url, 24_000, deadline=self.deadline)
+        except Exception:
+            return None
+        return self.direct_ok(url)
+
+    def weak_evidence_host(self, url: Any) -> bool:
+        return weak_evidence_host(url)
+
+    def direct_stats(self) -> dict[str, Any]:
+        try:
+            return dict(self._direct.stats, hosts_refusing=sum(
+                1 for strikes in self._direct.strikes.values() if strikes >= webfetch.HOST_STRIKES),
+                breaker_skips=dict(self.breaker_skips))
+        except Exception:
+            return {}
+
+    def _direct_page(self, url: str, cache_chars: int) -> Optional[Page]:
+        """Loop s33: the page by a direct plain GET over the web-egress bridge -- free: it is not a provider call, it
+        is not counted in ``calls`` and it costs nothing.  None when no direct read was made or it did not read as a
+        page (blocked, wall, thin, not HTML): the caller then uses the Deepline scrape exactly as before.  An origin's
+        own 404 / 410 is final and comes back as a failed Page.  Never raises."""
+
+        try:
+            got = self._direct.read(url, cache_chars, deadline=self.deadline)
+            if not got:
+                return None
+            if not got.get("ok"):
+                return Page(url, error=str(got.get("error") or "direct: failed")) if got.get("final") else None
+            source = "direct_json" if got.get("kind") == "json" else "direct" if got.get("plain") else "direct_ua"
+            page = Page(url, final_url=str(got.get("final_url") or url), title=str(got.get("title") or "")[:300],
+                        text=str(got.get("text") or "")[:cache_chars], source=source, ok=True)
+            page.links = list(dict.fromkeys(
+                link for raw in got.get("links") or []
+                if (link := _evidence_url(raw, base_url=page.final_url))
+            ))[:400]
+            return page
+        except Exception:
+            return None
+
+    def _breaker_refusal(self, tool: str) -> str:
+        """'' when ``tool`` may be called; else why not (it failed BREAKER_FAILURES times in a row and its retry
+        interval has not passed).  Called under the lock, before the call is counted."""
+
+        try:
+            state = self._breaker.get(tool)
+            if not PACING.get("tool_breaker") or not state or state["failures"] < BREAKER_FAILURES:
+                return ""
+            now = time.monotonic()
+            if now - state["at"] >= BREAKER_RETRY_SECONDS * 2 ** min(int(state["probes"]), 4):
+                state["at"] = now
+                state["probes"] += 1
+                return ""
+            self.breaker_skips[tool] = self.breaker_skips.get(tool, 0) + 1
+            what = f"returned HTTP {state['status']}" if state["status"] else "had no response"
+            return f"Deepline {tool} {what} {state['failures']} times in a row; not called again for now"
+        except Exception:
+            return ""
+
+    def _breaker_note(self, tool: str, failed: bool, status: Any = None) -> None:
+        """One call's outcome: a 5xx or a transport failure counts, anything else closes the tool's breaker."""
+
+        try:
+            with self._lock:
+                if not failed:
+                    self._breaker.pop(tool, None)
+                    return
+                state = self._breaker.setdefault(tool, {"failures": 0, "at": 0.0, "status": None, "probes": 0})
+                state["failures"] += 1
+                state["at"] = time.monotonic()
+                state["status"] = status
+        except Exception:
+            pass
 
     def set_icp(self, icp: Any) -> None:
         """Remember the ICP's exact buckets so discovery can flag off-bucket domains."""
@@ -454,6 +616,7 @@ class ArenaTools:
                              if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) else None),
             "spend_usd": round(float(self.spend_usd()), 4),
             "spend_cap_usd": self.spend_cap_usd,
+            "direct": self.direct_stats(),
             "trace": [dict(entry) for entry in self.trace],
             "pages": {url: {"final_url": page.final_url, "title": page.title, "text": page.text,
                             "source": page.source, "ok": page.ok, "error": page.error}
@@ -477,6 +640,9 @@ class ArenaTools:
                 self.spend_refusals += 1
                 raise BudgetExhausted("spend budget exhausted: %.2f of %.2f USD on this ICP; free tools still work"
                                       % (self.spend_usd(), self.spend_cap_usd or 0.0))
+            refused = self._breaker_refusal(tool)
+            if refused:
+                raise RuntimeError(refused)
             self.calls += 1
             self.calls_by_tool[tool] = self.calls_by_tool.get(tool, 0) + 1
             self._log_ledger()
@@ -490,7 +656,10 @@ class ArenaTools:
             )
         except BaseException as exc:
             self._note_transport(exc)
+            if isinstance(exc, Exception):
+                self._breaker_note(tool, True)
             raise
+        self._breaker_note(tool, response.status_code >= 500, response.status_code)
         try:
             body = response.json()
         except ValueError as exc:
@@ -1083,13 +1252,17 @@ class ArenaTools:
         return {"results": rows, "count": len(rows)}
 
     def _contextdev_page(self, url: str, cache_chars: int) -> Page:
-        """The free fixed-price scrape as a Page; never raises except on the call ceiling."""
+        """The page by a free direct GET when it reads that way (loop s33, _direct_page), else the free fixed-price
+        scrape, as a Page; never raises except on the call ceiling."""
 
+        direct = self._direct_page(url, cache_chars) if PACING["direct_fetch_pages"] else None
+        if direct is not None:
+            return direct
         try:
             data = _result_data(self._deepline(CONTEXTDEV_TOOL, {"url": url}))
             markdown = data.get("markdown")
             if isinstance(markdown, str) and len(markdown.strip()) >= 200:
-                text = " ".join(re.sub(r"[#*_>`\[\]()]", " ", markdown).split())
+                text = _markdown_text(url, markdown)
                 page = Page(url, title=str(data.get("title") or "")[:300],
                             text=text[:cache_chars], source="contextdev", ok=True)
                 page.links = list(dict.fromkeys(
@@ -1134,7 +1307,7 @@ class ArenaTools:
             if page.ok:
                 self.pages[url] = page
                 return page
-            if page.error == "budget":
+            if page.error == "budget" or page.error.startswith(DIRECT_MISSING):
                 self.pages[url] = page
                 return page
             page = Page(url)
@@ -1171,7 +1344,7 @@ class ArenaTools:
                 metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
                 title = str(metadata.get("title") or "")[:300]
                 if isinstance(markdown, str) and len(markdown.strip()) >= 200:
-                    text = " ".join(re.sub(r"[#*_>`\[\]()]", " ", markdown).split())
+                    text = _markdown_text(url, markdown)
                     page = Page(url, final_url=str(metadata.get("url") or url), title=title, text=text[:cache_chars],
                                 source="firecrawl", ok=True)
                     page.links = re.findall(r"https?://[^\s)\]>\"']+", markdown)[:400]
@@ -1246,4 +1419,5 @@ def _project_events(payload: dict[str, Any], limit: int) -> dict[str, Any]:
     return {"items": items, "returned_count": len(items), "available_count": meta.get("count")}
 
 
-__all__ = ["ArenaTools", "BudgetExhausted", "Page", "html_to_text", "DEEPLINE_QUOTA_PER_ICP"]
+__all__ = ["ArenaTools", "BudgetExhausted", "Page", "html_to_text", "DEEPLINE_QUOTA_PER_ICP", "weak_evidence_host",
+           "WEAK_EVIDENCE_HOSTS"]

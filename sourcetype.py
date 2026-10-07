@@ -203,5 +203,46 @@ def first_party_row(tools: Any, name: str, domain: str, category: str, *, window
     return None
 
 
+# Loop v5: how stage-evidence hosts answer the judge's plain HTTPS GET (published rounds, rows whose only evidence was
+# one round-naming entry): PR Newswire 56/58 and GlobeNewswire 23/24 passed stage, the company's own announcement page
+# 155/182, Business Wire 10/29 (its pages time out); advisers' deal pages 1/16 and deal-database profiles 0/4.
+STAGE_HOSTS_FIRST = ("prnewswire.com", "globenewswire.com", "prnewswire.co.uk", "newswire.ca", "thesaasnews.com",
+                     "startupmag.co.uk", "techfundingnews.com", "techcrunch.com", "siliconangle.com", "vcaonline.com",
+                     "fintech.global")
+STAGE_HOSTS_LAST = ("businesswire.com",)
+DEAL_DATABASE_HOSTS = ("mergr.com",)
+_DEAL_PATH_RE = re.compile(r"/(?:transactions?|tombstones?|deals?|credentials|track-record|portfolio(?:-compan(?:y|ies))?|"
+                           r"our-(?:work|deals|transactions|investments))(?:/|$)", re.I)
+
+
+def deal_page(url: Any, company_domain: Any = "") -> bool:
+    """A third-party deal listing: an adviser's tombstone, an investor's portfolio entry or a deal-database profile."""
+
+    host = host_of(url)
+    domain = host_of("https://" + str(company_domain or "").strip().lstrip("/")) if company_domain else ""
+    if not host or (domain and (host == domain or host.endswith("." + domain))):
+        return False
+    try:
+        path = urlsplit(str(url)).path or ""
+    except ValueError:
+        path = ""
+    return _is(host, DEAL_DATABASE_HOSTS) or bool(_DEAL_PATH_RE.search(path))
+
+
+def stage_host_rank(url: Any, company_domain: Any = "") -> int:
+    """0 the company's own domain, 1 a wire or funding-news host that answers a plain GET, 2 any other host,
+    3 a deal listing, 4 a host whose pages time out for the judge's fetcher (always cited last)."""
+
+    host = host_of(url)
+    domain = host_of("https://" + str(company_domain or "").strip().lstrip("/")) if company_domain else ""
+    if host and domain and (host == domain or host.endswith("." + domain)):
+        return 0
+    if _is(host, STAGE_HOSTS_LAST):
+        return 4
+    if deal_page(url, company_domain):
+        return 3
+    return 1 if _is(host, STAGE_HOSTS_FIRST) else 2
+
+
 __all__ = ["allowed_kinds", "admissible", "prefer_own_source", "source_kind", "body_dateline", "first_party_row", "proof_clause",
-           "WIRE_HOSTS", "NEWS_HOSTS", "ATS_HOSTS"]
+           "WIRE_HOSTS", "NEWS_HOSTS", "ATS_HOSTS", "STAGE_HOSTS_FIRST", "STAGE_HOSTS_LAST", "deal_page", "stage_host_rank"]

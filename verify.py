@@ -41,6 +41,18 @@ except ImportError:
     _pkg = _os.path.basename(_os.path.dirname(_os.path.abspath(__file__)))
     idm, idn = (_importlib.import_module(f"{_pkg}.{m}") for m in ("intent_details", "identity"))
 
+try:
+    from . import precision as px
+except ImportError:
+    try:
+        import importlib as _importlib
+        import os as _os
+        px = _importlib.import_module(f"{_os.path.basename(_os.path.dirname(_os.path.abspath(__file__)))}.precision")
+    except Exception:
+        px = None
+except Exception:
+    px = None
+
 WINDOW_WORDS = 34
 MIN_SNIPPET_WORDS = 8
 SIGNAL_OUTPUT_CAP = 3
@@ -54,11 +66,13 @@ class Report:
         self.kept: list[dict[str, Any]] = []
         self.surplus: list[dict[str, Any]] = []
         self.evidence: dict[str, list[dict[str, Any]]] = {}
+        self.companions: list[dict[str, Any]] = []
 
     def as_dict(self) -> dict[str, Any]:
         return {"dropped_companies": self.dropped_companies, "dropped_signals": self.dropped_signals,
                 "repaired": self.repaired, "kept": [c.get("company_name") for c in self.kept],
-                "surplus": [c.get("company_name") for c in self.surplus]}
+                "surplus": [c.get("company_name") for c in self.surplus],
+                "companions_dropped": [c.get("company_name") for c in self.companions]}
 
     def counts(self) -> dict[str, Any]:
         """Bounded, reconcilable counters for stderr (LAB-LOG #248).
@@ -119,6 +133,7 @@ _COMPANY_DROP_CODES = (
     ("no index-0", "no_primary_signal"),
     ("no verifiable intent signal", "no_verifiable_signal"),
     ("(judge: identity mismatch)", "identity_redirect_or_parked"),
+    ("companion drop", "companion_drop"),
 )
 
 _SIGNAL_DROP_CODES = (
@@ -694,33 +709,6 @@ def _paragraph_quote(record: Mapping[str, Any]) -> str:
     return str(record.get("_quote") or "")
 
 
-_STAGE_SENTENCE_SCAN = 240
-
-
-def _stage_quote_on_page(text: str, *, name: str, stage: str, url: str, website: str,
-                         scout: Any) -> str:
-    """The first sentence of this page that stage_quote_ok would accept, or ''.
-
-    Pure text work on a page already in the cache -- no provider call. The
-    judge's own gate is the selector, so nothing can be emitted here that the
-    emit loop below would refuse.
-    """
-
-    body = str(text or "")
-    if not body or not scout.name_hit(name, body[:20000]):
-        return ""
-    for sentence in re.split(r"(?<=[.!?])\s+", body[:40000])[:_STAGE_SENTENCE_SCAN]:
-        sentence = " ".join(sentence.split())
-        if not 8 <= len(sentence.split()) <= 80 or not scout._ROUND_RE.search(sentence):
-            continue
-        try:
-            if not scout.stage_quote_ok(sentence, body, name=name, stage=stage, url=url, website=website):
-                return sentence
-        except Exception:  # noqa: BLE001 - a sentence the gate cannot judge is not evidence
-            continue
-    return ""
-
-
 def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: ArenaTools,
                    signals: list[dict[str, Any]], report: Report, website: str = "") -> list[dict[str, Any]]:
     """Up to three {url, quote} passages the investigator may use for stage (v5).
@@ -755,53 +743,51 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
         if isinstance(extra, Mapping) and str(extra.get("url") or "").strip():
             candidates.append((str(extra["url"]).strip(), " ".join(str(extra.get("quote") or "").split())))
     stage_key = sm.normalize_text(stage) if stage else ""
-    want = sm.normalize_stage(stage) if stage else ""
+    # Loop v5 (precision.py; each knob defaults to 1 and 0 restores the loop below exactly as it was):
+    #  * stage_cache_scan -- a signal quote naming any round the ICP stage accepts is offered (the substring test
+    #    looked for 'series c' and so never offered a Series D-H quote on a 'Series C+' ICP), and every page already
+    #    cached for this company (intent pages, the required-attribute page, homepage and about pages, the stage-hint
+    #    article, search-result pages) is asked for a sentence the gate accepts.  Cache only: no fetch, no call.
+    #  * stage_host_order -- the accepted entries go out best source first: PR Newswire / GlobeNewswire, the
+    #    company's own announcement, other hosts (one a direct GET could read first), ..., Business Wire last; one
+    #    quote per URL and one URL per quote text, a judge-form body sentence before a headline or a page title with
+    #    a site suffix.  The proof scout itself selected is never pushed out by scan results.
+    #  * stage_gate_strict -- a URL the judge's own URL check drops (not https, not ASCII, over 2000 characters) is
+    #    not offered: it would count as evidence here and as none there.
+    #  * stage_gate_agree -- a Public quote goes out with its '(EXCHANGE: TICKER)' closed up (scout.ticker_spaced).
+    scan, ordered = bool(getattr(px, "STAGE_CACHE_SCAN", 0)), bool(getattr(px, "STAGE_HOST_ORDER", 0))
+    strict, agree = bool(getattr(px, "STAGE_GATE_STRICT", 0)), bool(getattr(px, "STAGE_GATE_AGREE", 0))
+    own_url = ""
     for signal in signals:
         text = sm.normalize_text(signal.get("_quote") or "")
-        if stage_key and stage_key in text:
+        named = stage_key and stage_key in text
+        if not named and scan and stage_key:
+            try:
+                named = px.names_stage(signal.get("_quote"), stage)
+            except Exception:
+                named = False
+        if named:
             candidates.append((signal["url"], signal.get("_quote") or ""))
-            # and fall through: the snippet was re-cut by the repair pass and
-            # often no longer matches the page verbatim, so the emit loop
-            # refuses it. The page scan below offers the same URL a second,
-            # verbatim quote, which costs nothing and is what the judge wants.
-        # The signal's own page is already fetched, and for a funding event it
-        # IS a round announcement -- but the short snippet we quote often does
-        # not carry the round words, and then this company goes out with no
-        # stage evidence at all. Over the 192 companies submitted to
-        # arena-2026-10-02 that was 120 of them, and exactly one qualified
-        # (1%), against 18% carrying one source and 80% carrying two or three.
-        # Read the affirmed rounds off the page the same way the stage search
-        # does; stage_quote_ok below still has the last word.
-        #
-        # It also repairs a narrower gap: the substring test above looks for
-        # normalize_text("Series C+") == "series c", so a Series D or F round
-        # never matched, although sm.stage_matches (and the judge) accept it.
-        if not want or not signal.get("url"):
-            continue
-        # Cache only, never tools.fetch_page: verify_signal already read this
-        # page to check the snippet, so reading it again here costs nothing,
-        # and a page it could not read proves nothing anyway.
-        page = tools.pages.get(str(signal["url"]))
-        if page is None or not page.ok:
-            continue
-        # Ask the gate itself which sentence it would accept, instead of
-        # guessing. A company's own announcement writes the round in the first
-        # person -- "we have raised $150 million in Series C funding" -- which
-        # never names the company before the label, so neither the snippet test
-        # above nor round_claims can use it; the naming sentence is usually
-        # elsewhere on the same page.
-        quote = _stage_quote_on_page(page.text, name=name, stage=stage,
-                                     url=str(signal["url"]), website=website, scout=_scout)
-        if quote:
-            candidates.append((str(signal["url"]), quote))
+    if scan and stage_key:
+        try:
+            claim = raw.get("required_attribute") if isinstance(raw.get("required_attribute"), Mapping) else {}
+            listed = [c[0] for c in candidates] + [s.get("url") for s in signals] + [claim.get("evidence_url"), website]
+            candidates.extend(px.cache_scan(tools, name=name, stage=stage, website=website, urls=listed)["entries"][:8])
+        except Exception as exc:
+            report.repaired.append((name, f"stage cache scan skipped ({type(exc).__name__})"))
+    accepted: list[tuple[str, str]] = []
     for cand_url, cand_quote in candidates:
-        if len(out) >= sm.STAGE_EVIDENCE_MAX:
+        if len(accepted) >= (12 if ordered else sm.STAGE_EVIDENCE_MAX):
             break
+        first = cand_url == url and not own_url
         try:
             cand_url = sm.public_http_url(cand_url)
         except ValueError:
             continue
-        if any(item["url"] == cand_url for item in out):
+        if strict and (not cand_url.startswith("https://") or not cand_url.isascii() or len(cand_url) > 2000):
+            report.repaired.append((name, f"stage evidence withheld (not an https / ASCII url): {cand_url[:80]}"))
+            continue
+        if any(url == cand_url and (not ordered or quote == cand_quote) for url, quote in accepted):
             continue
         if stage_key == "public":
             try:
@@ -822,7 +808,29 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
         if why or sm.injection_match(cand_quote) or sm.strip_prompt_controls(cand_quote) != cand_quote:
             report.repaired.append((name, f"stage evidence withheld ({why or 'controls'}): {cand_url[:80]}"))
             continue
-        out.append({"url": cand_url, "quote": cand_quote})
+        if first:
+            own_url = cand_url
+        accepted.append((cand_url, cand_quote))
+    own_pair = next(((u, q) for u, q in accepted if u == own_url), None) if own_url else None
+    if ordered and accepted:
+        try:
+            accepted = px.order_evidence(accepted, tools=tools, stage=stage, website=website, check=True)
+        except Exception as exc:
+            report.repaired.append((name, f"stage evidence order kept ({type(exc).__name__})"))
+    for cand_url, cand_quote in accepted:
+        if len(out) < sm.STAGE_EVIDENCE_MAX and not any(item["url"] == cand_url for item in out):
+            out.append({"url": cand_url, "quote": cand_quote})
+    try:
+        if ordered and own_pair and out and not any(item["url"] == own_pair[0] for item in out) and \
+                px.same_site_quote(*own_pair) not in {px.same_site_quote(item["url"], item["quote"]) for item in out}:
+            out[-1] = {"url": own_pair[0], "quote": own_pair[1]}
+    except Exception:
+        pass
+    if agree and stage_key == "public":
+        try:
+            out = [{"url": item["url"], "quote": _scout.ticker_spaced(item["quote"])} for item in out]
+        except Exception:
+            pass
     if out:
         report.repaired.append((name, "company_stage_evidence attached (%d)" % len(out)))
     return out
@@ -1007,10 +1015,26 @@ def verify_company(raw: Mapping[str, Any], *, icp: Mapping[str, Any], tools: Are
          "date": s["date"], "url": s["url"],
          "quote": _paragraph_quote(s),
          "title": (s.get("_posting") or {}).get("title") or "",
+         "page_title": str(getattr(tools.pages.get(s["url"]), "title", "") or "")[:300],   # cached page only: no fetch
          "signal_text": s.get("_signal_text") or "",
          "date_visible": bool(s["date"]) and date_visible(s["date"], _page_for(tools, s["url"]).text)}
         for s in signals]
+    # Loop v5: the working flags the final selection reads (all "_" keys are stripped before output).  A required-
+    # attribute quote that is cookie / consent text proves no capability; _cap_own marks a quote on the company's own
+    # domain; evidence found by the cached-page scan clears a draft's stage-unproven flag.
+    capable, cap_own = bool(raw.get("_capability")), False
+    if px is not None and claim_out:
+        try:
+            capable, cap_own, note = px.capability_state(claim_out, website, icp, capable)
+            if note:
+                report.repaired.append((name, note))
+        except Exception:
+            capable, cap_own = bool(raw.get("_capability")), False
     if v5:
+        evidence = stage_evidence(raw, name=name, stage=stage, tools=tools, signals=signals, report=report, website=website)
+        unproven = bool(raw.get("_stage_unproven")) and not (evidence and getattr(px, "STAGE_CACHE_SCAN", 0))
+        if evidence and raw.get("_stage_unproven") and not unproven:
+            report.repaired.append((name, "stage proven from a cached page"))
         out: dict[str, Any] = {
             "company_name": name,
             "company_website": website,
@@ -1023,12 +1047,11 @@ def verify_company(raw: Mapping[str, Any], *, icp: Mapping[str, Any], tools: Are
             "intent_details": idm.fallback_paragraph(company_name=name, icp=icp,
                                                      signals=report.evidence[sm.company_name_key(name)]),
             "intent_signals": [signal_out(s, v5=True) for s in signals],
-            "company_stage_evidence": stage_evidence(raw, name=name, stage=stage, tools=tools,
-                                                     signals=signals, report=report, website=website),
+            "company_stage_evidence": evidence,
             "required_attribute": claim_out,
             "contact": None,
-            "_estimate": estimate, "_capability": bool(raw.get("_capability")),
-            "_stage_unproven": bool(raw.get("_stage_unproven")), "_old_round": bool(raw.get("_old_round")),
+            "_estimate": estimate, "_capability": capable, "_cap_own": cap_own,
+            "_stage_unproven": unproven, "_old_round": bool(raw.get("_old_round")),
         }
         return out
     out = {
@@ -1050,11 +1073,50 @@ def verify_company(raw: Mapping[str, Any], *, icp: Mapping[str, Any], tools: Are
     return out
 
 
+def _weak_source(row, icp):
+    """v6 intent_first_party: a third-party primary signal page on an ICP whose named proof sources exclude it (such rows
+    failed intent 24 of 26 times on 10-05): ranked last, withheld beside a strong row (precision.companion_drop)."""
+
+    try:
+        from .sourcetype import allowed_kinds, source_kind
+        url = min(row["intent_signals"], key=lambda s: s.get("matched_icp_signal") or 0)["url"]
+        site, kinds = row["company_website"], allowed_kinds(icp["intent_signals"][0])
+        kind = source_kind(url, sm.registrable_host(site), row["company_name"])
+        return bool(px.INTENT_FIRST_PARTY and kinds and "ats" not in kinds and kind not in kinds and
+                    kind in ("news", "unknown") and sm.evidence_source(url, site) == "news")
+    except Exception:
+        return False
+
+
 def announced_schema(icp: Mapping[str, Any]) -> str:
     """The output schema the round announces in the ICP (LAB-LOG #296), else v1."""
 
     value = str((icp or {}).get("output_schema_version") or "").strip()
     return value or sm.SCHEMA_V1
+
+
+def drop_companions(kept: list[dict[str, Any]], icp: Mapping[str, Any], report: Report) -> list[dict[str, Any]]:
+    """Loop v5 (companion_drop): final selection on an ICP that has a STRONG row (capability proven on the company's
+    own domain and, on a Series A / B / C+ ICP, stage evidence attached).  There a row that fails the judge's
+    required-attribute check costs a third of a qualified company, so a capability-unproven companion goes, and on
+    those three stage classes a stage-unproven one too (such rows passed stage 1 time in 137).  Seed and Public rows
+    are never dropped for missing stage evidence alone; without a strong row nothing changes (the ICP's floor is 0,
+    the rows are free).  Every drop is logged in report.dropped_companies and kept in report.companions; a dropped
+    row never enters the surplus, which the harness uses to refill slots."""
+
+    if not getattr(px, "COMPANION_DROP", 0) or len(kept) < 2:
+        return kept
+    try:
+        stay, gone = px.companion_drop(kept, icp)
+    except Exception as exc:
+        report.repaired.append(("*", f"companion drop skipped ({type(exc).__name__})"))
+        return kept
+    if not stay or not gone:
+        return kept
+    for company, reason in gone:
+        report.dropped_companies.append((str(company.get("company_name") or "?"), reason))
+        report.companions.append({k: v for k, v in company.items() if not k.startswith("_")})
+    return list(stay)
 
 
 def verify_companies(drafts: list[Mapping[str, Any]], *, icp: Mapping[str, Any], tools: ArenaTools,
@@ -1081,7 +1143,10 @@ def verify_companies(drafts: list[Mapping[str, Any]], *, icp: Mapping[str, Any],
         if company:
             kept.append(company)
     kept.sort(key=lambda c: (bool(c.get("_stage_unproven")), bool(c.get("_old_round")),
-                             -(bool(c.get("_capability")) + bool(c.get("company_stage_evidence"))), -c["_estimate"]))
+                             -(bool(c.get("_capability")) + bool(c.get("company_stage_evidence"))),
+                             c.setdefault("_weak", _weak_source(c, icp)), -c["_estimate"]))
+    kept = drop_companions(kept, icp, report)
+    kept = px.event_select(kept, icp, tools, report) if px else kept
     final: list[dict[str, Any]] = []
     consumed = 0
     for company in kept:
