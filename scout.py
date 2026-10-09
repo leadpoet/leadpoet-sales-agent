@@ -102,7 +102,10 @@ _TEMPLATES = {
     "other": ["{sub} company news", "{industry} company announcement"],
 }
 PRE_SEED = r"pre(?:\s*[-\u2010\u2011\u2012\u2013\u2014\u2212]\s*|\s+)seed"
-_ROUND_RE = re.compile(r"\b(" + PRE_SEED + r"|seed|series\s+[a-h])\b(?:\s+(?:funding|round|financing|extension))?", re.I)
+# Loop s39 (arena-2026-10-07): 'pre-Series A' is a token of its own, never a Series A round.  The judge masks it since
+# 2026-10-06; our rows whose stage quotes said pre-Series qualified 0 of 45 judged.  Its label is in no stage order.
+PRE_SERIES = r"pre(?:\s*[-\u2010-\u2015\u2212]\s*|\s+)series\s+[a-h]"
+_ROUND_RE = re.compile(r"\b(" + PRE_SEED + r"|" + PRE_SERIES + r"|seed|series\s+[a-h])\b(?:\s+(?:funding|round|financing|extension))?", re.I)
 SEED_RE = re.compile(r"(?<!pre[-\u2010\u2011\u2012\u2013\u2014\u2212 ])\bseed\b", re.I)
 
 
@@ -118,7 +121,7 @@ def label_pattern(label: str) -> "re.Pattern":
 
     if label == "seed":
         return SEED_RE
-    return re.compile(r"\b" + re.escape(label).replace(r"\ ", r"[\s-]+") + r"\b", re.I)
+    return re.compile(r"(?<!pre[-\u2010-\u2015\u2212 ])(?<!pre [-\u2010-\u2015\u2212] )\b" + re.escape(label).replace(r"\ ", r"[\s-]+") + r"\b", re.I)
 
 
 _PUBLIC_RE = re.compile(r"\b(nasdaq|nyse|lse|tsx|asx|euronext|listed on|publicly traded|ticker)\b", re.I)
@@ -549,10 +552,14 @@ def confirm_on_page(tools: Any, cand: dict[str, Any], row: Mapping[str, Any]) ->
             return False
         tools.pages[row["url"]] = page
     text = str(getattr(page, "text", "") or "")
-    if len(str(cand.get("snippet") or "").split()) >= 6 and sm.snippet_overlap(cand["snippet"], text) >= 0.8:
+    # s39: a letter-spaced wire slug ('/C O R R E C T I O N -- X/') is on the page but states no event: re-cut it
+    if len(str(cand.get("snippet") or "").split()) >= 6 and not re.search(r"(?:\b\w\b\W+){5,}", str(cand["snippet"])) and \
+            sm.snippet_overlap(cand["snippet"], text) >= 0.8:
         pass
     else:
-        cut = event_sentence(text, cand["company_name"])
+        body = re.split(r"corrected release follows:?", text, maxsplit=1, flags=re.I)[-1]   # s39: past a correction notice
+        cut = event_sentence(re.sub(r"/?(?:\b\w\b\W+){5,}[^/\n]{0,80}/", " ", body), cand["company_name"]) or \
+            event_sentence(text, cand["company_name"])
         if not cut:
             return False
         cand["snippet"] = cut

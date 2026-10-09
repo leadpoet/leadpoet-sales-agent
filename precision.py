@@ -39,6 +39,9 @@ def _knob(key: str, default: int, high: int = 1) -> int:
 
 STAGE_CACHE_SCAN = _knob("stage_cache_scan", 1)            # cached pages of the company are scanned for a stage sentence
 STAGE_EXTRA_SOURCES = _knob("stage_extra_sources", 2, 2)   # corroborating entries kept beside the best one
+# Loop s38 (arena-2026-10-07): 12 of our 87 ICP runs with companies got no judgment (others 8 of 261); on one ICP the
+# seven such runs carried 8.0 stage entries on average, the 35 judged runs 3.2.  Entries sent per company, best first.
+STAGE_EVIDENCE_KEEP = max(1, _knob("stage_evidence_keep", 3, 3))
 STAGE_HOST_ORDER = _knob("stage_host_order", 1)            # plain-GET-friendly hosts first, Business Wire last
 STAGE_GATE_AGREE = _knob("stage_gate_agree", 1)            # scout picks its proof quote with the emit gate
 STAGE_GATE_STRICT = _knob("stage_gate_strict", 1)          # 'secured-lending', advisers' deal pages, namesakes

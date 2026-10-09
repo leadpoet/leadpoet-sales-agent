@@ -50,7 +50,8 @@ _ORDER = ["pre seed", "seed"] + [f"series {c}" for c in "abcdefgh"]
 _ACCEPT = {"seed": {"seed"}, "series a": {"series a"}, "series b": {"series b"},
            "series c+": {f"series {c}" for c in "cdefgh"}}
 _PRE_SEED = r"pre(?:\s*[-\u2010\u2011\u2012\u2013\u2014\u2212]\s*|\s+)seed"
-_ROUND_RE = re.compile(r"\b(" + _PRE_SEED + r"|seed|series\s+[a-h])\b", re.I)
+_PRE_SERIES = r"pre(?:\s*[-\u2010-\u2015\u2212]\s*|\s+)series\s+[a-h]"   # s39: its own token, in no stage order
+_ROUND_RE = re.compile(r"\b(" + _PRE_SEED + r"|" + _PRE_SERIES + r"|seed|series\s+[a-h])\b", re.I)
 
 
 def _label(raw: str) -> str:

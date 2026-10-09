@@ -181,6 +181,10 @@ _PRE_SEED_STAGE_TOKEN_RE = re.compile(
     r"\bpre(?:\s*[-\u2010\u2011\u2013\u2014]\s*|\s+)seed\b",
     re.I,
 )
+_PRE_SERIES_STAGE_TOKEN_RE = re.compile(   # s39, as the judge since 8598b672
+    r"\bpre(?:\s*[-\u2010-\u2015]\s*|\s+)series\s+[a-z](?:[1-9][0-9]*)?\b\+?",
+    re.I,
+)
 _VENTURE_STAGE_STATEMENT_PATTERNS = {
     "series a": _series_stage_statement_patterns(r"series\s+a"),
     "series b": _series_stage_statement_patterns(r"series\s+b"),
@@ -571,15 +575,16 @@ def _stage_quote_supports_observation(observed: str, quote: str) -> bool:
     seed_compatible_text = _PRE_SEED_STAGE_TOKEN_RE.sub(
         "pre_seed_stage", text
     )
+    series_text = _PRE_SERIES_STAGE_TOKEN_RE.sub("pre_venture_stage", text)
     proven_venture_stages = [
         stage
         for stage, patterns in _VENTURE_STAGE_PROOF_PATTERNS.items()
         if _has_affirmed_stage_proof(
-            seed_compatible_text if stage == "seed" else text,
+            seed_compatible_text if stage == "seed" else series_text,
             patterns,
         )
         or _has_affirmed_stage_proof(
-            seed_compatible_text if stage == "seed" else text,
+            seed_compatible_text if stage == "seed" else series_text,
             _VENTURE_STAGE_STATEMENT_PATTERNS.get(stage, ()),
             reject_historical=True,
         )

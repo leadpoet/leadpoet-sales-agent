@@ -817,11 +817,12 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
             accepted = px.order_evidence(accepted, tools=tools, stage=stage, website=website, check=True)
         except Exception as exc:
             report.repaired.append((name, f"stage evidence order kept ({type(exc).__name__})"))
+    keep = min(sm.STAGE_EVIDENCE_MAX, int(getattr(px, "STAGE_EVIDENCE_KEEP", sm.STAGE_EVIDENCE_MAX)))   # s38
     for cand_url, cand_quote in accepted:
-        if len(out) < sm.STAGE_EVIDENCE_MAX and not any(item["url"] == cand_url for item in out):
+        if len(out) < keep and not any(item["url"] == cand_url for item in out):
             out.append({"url": cand_url, "quote": cand_quote})
     try:
-        if ordered and own_pair and out and not any(item["url"] == own_pair[0] for item in out) and \
+        if ordered and keep > 1 and own_pair and out and not any(item["url"] == own_pair[0] for item in out) and \
                 px.same_site_quote(*own_pair) not in {px.same_site_quote(item["url"], item["quote"]) for item in out}:
             out[-1] = {"url": own_pair[0], "quote": own_pair[1]}
     except Exception:
