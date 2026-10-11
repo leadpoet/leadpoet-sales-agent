@@ -1,26 +1,4 @@
-"""Arena entrypoint: ``run_icp(icp) -> list[dict]``.
-
-Synchronous, one positional argument, returns a list of company dicts in the
-public competition schema.  The host writes companies.json itself.
-
-Pipeline (all inside the Arena's 300 s wall clock):
-  1. read LAB_ARENA_COMPANY_LIMIT (1..5, default 5) -- a HARD cap: a list longer
-     than MAX_COMPANIES=5 is rejected whole (qualification/competition_models.py:128,
-     lab_arena/output.py:18) and the ICP scores 0
-  2. run the PydanticAI agent with Deepline-only tools (agent.py), under a
-     RESEARCH deadline that stops tool calls in time for a final answer
-  3. hand the RUN deadline back (verification_deadline) and verify and repair
-     every draft against the scorer's own rules (verify.py)
-  4. re-check every emitted company against perplexity/sonar and refill any slot
-     a MISMATCH emptied from the verified surplus (reverify.py,
-     backfill_empty_slots) -- never above the five-company cap
-  5. return the validated, ranked list; return [] for a genuinely empty search
-     OR for a run the HOST broke (the exception chain or the recorded
-     infrastructure channel says so), and RAISE only when the failure was ours
-     (see _no_companies and diagnostics.py)
-
-Nothing here spends or submits by itself; the Arena runner calls it.
-"""
+"""Arena entrypoint: ``run_icp(icp) -> list[dict]``."""
 
 from __future__ import annotations
 
@@ -57,12 +35,13 @@ except ImportError:
 
 try:
     from .arena_tools import STRATEGY as _STRATEGY
-    from .verify import announced_schema, strip_internal
+    from .verify import announced_schema, screen_stage, strip_internal
     from . import intent_details as details_module
 except ImportError:
     _STRATEGY = importlib.import_module(f"{_pkg}.arena_tools").STRATEGY
     _verify_mod = importlib.import_module(f"{_pkg}.verify")
     announced_schema, strip_internal = _verify_mod.announced_schema, _verify_mod.strip_internal
+    screen_stage = _verify_mod.screen_stage
     details_module = importlib.import_module(f"{_pkg}.intent_details")
 
 try:
@@ -111,9 +90,6 @@ PARAGRAPH_MAX_USD = 0.06
 ATS_BONUS = _strategy_number("ats_bonus", 1, 0, 1) >= 1
 ATS_PICK_MODEL = str(_STRATEGY.get("ats_pick_model") or "google/gemini-2.5-flash")
 ATS_BONUS_SECONDS = _strategy_number("ats_bonus_seconds", 150.0, 10.0, 400.0)
-# Loop s33: an operator's cost switch, OFF by default -- every ICP is researched.  Set to 1, research is not started for
-# a Private Equity ICP (no row of that stage class has qualified in the field; the research costs about $0.29 a round).
-SKIP_PRIVATE_EQUITY = _strategy_number("skip_private_equity", 0, 0, 1) >= 1
 RESERVE_DRAFTS = int(_strategy_number("reserve_drafts", 0, 0, 5))
 REVERIFY_MAX_COMPANIES = 8
 RESERVE_CHECKED = 3
@@ -129,13 +105,7 @@ def _company_limit() -> int:
 
 
 def announced_wall_clock() -> Optional[float]:
-    """The wall clock the sandbox announces for this run, or None when it does not.
-
-    LAB-LOG #309: `LAB_ARENA_WALL_CLOCK_SECONDS` is set for every sandbox by
-    `runtime.sandbox_environment` (upstream 1cf9ce2d).  Anything unparseable,
-    non-finite or under the contract minimum (30 s) is treated as absent, so a
-    stray value can only ever shorten our plan back to the short clock.
-    """
+    """The wall clock the sandbox announces for this run, or None when it does not."""
 
     raw = str(os.environ.get("LAB_ARENA_WALL_CLOCK_SECONDS") or "").strip()
     if not raw:
@@ -150,15 +120,7 @@ def announced_wall_clock() -> Optional[float]:
 
 
 def plan_clock() -> dict:
-    """The two deadlines a run plans against, and where they came from.
-
-    ``short``   -- a complete, contract-valid checkpoint must exist by here.
-    ``horizon`` -- the run must have RETURNED by here (minus SAFETY_SECONDS).
-    ``long``    -- whether the phases may spread over the horizon: the research
-                   phase then gets up to AGENT_LONG_SECONDS and the later phases
-                   plan against the horizon instead of the short clock.
-    ``source``  -- "sandbox" when the announced clock decided, else "strategy".
-    """
+    """The two deadlines a run plans against, and where they came from."""
 
     announced = announced_wall_clock()
     if announced is None:
@@ -186,13 +148,7 @@ _HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
 
 
 def provider_infrastructure_error(exc: BaseException | None) -> str | None:
-    """Name the host-side fault in an exception chain, else None (the fault is ours).
-
-    The broker hands submitted code a 502 ``provider_unavailable`` for a provider
-    outage, and since upstream `10b602f5` it also rewrites an OpenRouter error
-    returned inside an HTTP 200 to that error's real status -- so a rate limit
-    that used to arrive as an unparseable "success" now arrives as a 429.
-    """
+    """Name the host-side fault in an exception chain, else None (the fault is ours)."""
     seen: set[int] = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
@@ -216,20 +172,7 @@ def provider_infrastructure_error(exc: BaseException | None) -> str | None:
 
 
 def recorded_infra_fault(tools: Any = None) -> str | None:
-    """The host fault the run SAW, even though no exception carries it any more.
-
-    LAB-LOG #234 gate 1 (the CRITICAL one).  ``agent.guard`` turns every tool
-    exception into ``{"ok": False, ...}`` so the loop can keep going, and that
-    includes the ``RuntimeError("provider_unavailable")`` a Deepline 429/5xx
-    arrives as (`lab_arena/operations.py:1661-1667` collapses every
-    infrastructure status into one generic 502 with that body).  The run then
-    fails for some later, innocent-looking reason and
-    ``provider_infrastructure_error`` -- which reads ONLY the final exception
-    chain -- finds nothing.  The host, meanwhile, has the infrastructure call on
-    record (`runner.py:1395-1405`), so our raise is rewritten to
-    ``provider_error`` (`:1406-1408`), which is not model-caused, and the round
-    dies for everyone.  So consult the record as well as the chain.
-    """
+    """The host fault the run SAW, even though no exception carries it any more."""
 
     fault = getattr(tools, "infra_fault", None)
     if isinstance(fault, str) and fault:
@@ -238,43 +181,7 @@ def recorded_infra_fault(tools: Any = None) -> str | None:
 
 
 def _no_companies(exc: BaseException | None, tools: Any = None) -> list[dict]:
-    """What to hand back when the run produced nothing.
-
-    ⚠️ This reverses the infrastructure branch of #224, which looked only at our
-    own ICP score. The round-level rule dominates it
-    (`scripts/185-lab-arena-miner-credentials.sql:610`):
-
-        HAVING bool_and(runs.status <> 'accepted')
-           AND NOT bool_or(terminal_cause IN (model_timeout, invalid_output,
-                           budget_exhausted, credential_error, model_error))
-        ...
-        IF v_incomplete > 0 THEN cancel the WHOLE round
-
-    That exclusion list is exactly MODEL_CAUSED_TERMINAL_CAUSES. So an assignment
-    with no accepted run whose failures were all INFRASTRUCTURE counts as
-    incomplete, and **one incomplete assignment cancels the round for everybody**.
-    We field 4 submissions x 20 ICPs = 80 assignments, so raising on a host fault
-    multiplies that exposure by 80 -- and a cancelled round voids every ICP we
-    scored and any crown we earned. Three rounds in a row died this way
-    (09-06 `capacity:scoring2:1`, 09-07 `scoring_window_closed`,
-    09-08 `capacity:stage1:4`).
-
-    So:
-      * host fault (429/5xx/shared account, broker unavailable) -> return [].
-        An accepted run with zero companies cannot make the assignment
-        incomplete. We trade one ICP's zero -- which is all a failed ICP was ever
-        worth -- for the round staying alive.
-      * our own fault -> raise. `model_error` IS in the exclusion list, so it
-        cannot cancel the round, and a failed run still earns one confirmation
-        attempt (`scripts/179-lab-arena-v1.sql:1859`). Free upside, no round risk.
-      * no exception at all -> return []: an empty search is an honest answer.
-
-    A host fault counts whether it is still in the exception chain or only in
-    the recorded infrastructure channel (`recorded_infra_fault`): what decides
-    the round is what the HOST has in `state.calls`, not what our last exception
-    happens to remember. A genuine agent failure with NO fault on either still
-    raises -- that contract is the free confirmation attempt and is unchanged.
-    """
+    """What to hand back when the run produced nothing."""
     if exc is None:
         return []
     reason = provider_infrastructure_error(exc)
@@ -294,33 +201,7 @@ def _no_companies(exc: BaseException | None, tools: Any = None) -> list[dict]:
 
 
 def verification_deadline(started: float) -> float:
-    """The RUN deadline -- what ``tools.deadline`` must be reset to before verification.
-
-    LAB-LOG #236 idea 3.  ``run_icp`` sets ``tools.deadline`` to the RESEARCH
-    cut-off (``agent_timeout - 35 s``) so the model stops calling tools in time to
-    still emit ``submit_companies`` itself.  That cut-off is by construction
-    ALREADY IN THE PAST when the agent returns -- at the status-quo dials it
-    lands ~137 s in, against an agent that may run to ~172 s -- and it was never
-    reset.
-
-    It really does bind afterwards, verified in this tree, not assumed:
-    ``ArenaTools._deepline`` raises ``BudgetExhausted("time budget exhausted")``
-    past the deadline (arena_tools.py:324), ``fetch_page`` turns that into
-    ``Page(url, error="budget")`` (arena_tools.py:571-574, :609-610), and
-    ``verify.verify_signal`` reads ``if not page.ok`` and drops the signal as
-    "evidence page unavailable (budget)" (verify.py) -- then drops the company
-    for "no verifiable intent signal".  So every evidence page the AGENT did not
-    already cache was unfetchable during verification, and the company built on
-    it was thrown away for a clock we set ourselves.  Pinned by
-    ``test_verification_deadline.py``.
-
-    The reset is to the run's own wall clock and nothing wider: the Arena kills
-    the sandbox at WALL_CLOCK_SECONDS and SAFETY_SECONDS is the margin, so this
-    is exactly the envelope LAB-LOG #235 §7 already prices (a worst-case tool
-    fired at ~277 s settles by ~352 s, ~4.7x inside the post-35f81d81 lease
-    budget).  Deepline calls are also not charged against the $5 OpenRouter
-    execution cap, and ``ArenaTools.call_budget`` still caps their number.
-    """
+    """The RUN deadline -- what ``tools.deadline`` must be reset to before verification."""
 
     return started + (WALL_CLOCK_SECONDS - SAFETY_SECONDS)
 
@@ -337,45 +218,7 @@ def identity_keys(company: Mapping[str, Any]) -> set[str]:
 
 def backfill_empty_slots(companies: list[dict], report: Any, *, limit: int,
                          schema: str = sm.SCHEMA_V1, exclude: Optional[set[str]] = None) -> tuple[list[dict], list[str]]:
-    """Fill slots the sonar re-verification EMPTIED, from the verified surplus.
-
-    LAB-LOG #236 idea 2.  ``verify_companies`` ranks every locally verified
-    company and truncates to ``limit``; the ones it cut are kept in
-    ``report.surplus``.  ``reverify.rerank`` may then EVICT a company -- and only
-    ever on an explicit MISMATCH verdict (reverify.py:616-619); "unprovable", a
-    timeout, a refused call and a ``None`` verdict are all NO INFORMATION and
-    keep the company (reverify.py:585-589).  This function refills what that
-    eviction emptied.
-
-    Three rules, all load-bearing:
-
-    * ⛔ It only ever APPENDS into a genuinely empty slot.  A company that passed
-      local verification is never replaced, re-ranked or competed against: if
-      ``len(companies) >= limit`` this returns the list unchanged.
-    * ⛔ The result can never exceed ``limit`` (<= 5).  A sixth company is not an
-      ignored extra -- ``validate_companies`` rejects the whole list
-      ("too many companies", qualification/competition_models.py:128,
-      MAX_COMPANIES=5 at lab_arena/output.py:18), the run terminates
-      ``invalid_output`` and the ICP scores 0.  The final list is re-validated
-      through the scorer mirror before it is returned, and the original list is
-      returned untouched if that fails.
-    * ⛳️ POSITION.  The platform scores ``company_scores[:goal]`` in MODEL ORDER,
-      not best-first (lab_arena/verify.py:242-243, lab_arena/scoring.py:260-261,
-      qualification/scoring/competition.py:270 ``list(companies)[:_company_goal(icp)]``).
-      A back-filled company is therefore appended LAST, deliberately: it ranked
-      below every survivor on the local estimate, and it is the one company in
-      the list the sonar gate has NOT seen (it was drawn after the reverify call
-      went out).  If ``goal`` ever turns out smaller than what we emit -- the
-      only case where position decides anything -- the unchecked candidate is the
-      one that falls outside the slice, never a re-verified survivor.
-
-    * ⛔ ``exclude`` (LAB-LOG #315): the identities of every company an explicit
-      sonar MISMATCH evicted this run.  A reserve company that was promoted, then
-      rejected, used to come straight back from the same surplus with its cached
-      contact -- the pre-check's verdict undone by its own refill.
-
-    Returns ``(companies, names_added)``; ``names_added`` is empty when nothing moved.
-    """
+    """Fill slots the sonar re-verification EMPTIED, from the verified surplus."""
 
     limit = max(1, int(limit))
     if len(companies) >= limit:
@@ -414,9 +257,9 @@ def backfill_empty_slots(companies: list[dict], report: Any, *, limit: int,
 
 def recheck_ashby_postings(companies: list[dict], report: Any, tools: Any, *, deadline: float, limit: int,
                            schema: str, exclude: set[str]) -> list[dict]:
-    """Loop s22 (teardown-0925 #6, upstream ab3a1e33): just before output, re-read the Ashby board API (free) and
-    drop a row whose posting left the board -- the judge now scores it a company-local zero -- then refill that slot
-    from the verified surplus.  Bounded (6 board reads, 20 s each) and never raises: on any doubt the rows stand."""
+    """Loop s22 (teardown-0925 #6, upstream ab3a1e33): just before output, re-read the Ashby board API (free) and drop
+    a row whose posting left the board -- the judge now scores it a company-local zero -- then refill that slot
+    from the verified surplus."""
 
     saved = getattr(tools, "timeout", None)
     try:
@@ -463,18 +306,7 @@ _NON_CANDIDATE_HOSTS = frozenset({
 
 
 def candidate_origins(tools: Any, companies: Optional[list] = None) -> dict[str, Any]:
-    """Observable candidate identities per discovery path, read from the trace (#317 addendum).
-
-    ``discovered`` counts only ``search_companies`` rows, which #281 §4 recorded as
-    a counter artifact: on the 09-12 runs 15 of 27 returned companies came from
-    attempts that reported zero discoveries because event-first research found
-    them through ``search_web``.  This reads every discovery tool's trace entry
-    for the registrable hosts it named (result rows and call arguments), keeps
-    them per tool, and says for each returned company which paths had shown its
-    host -- or ``unknown`` when none had, which is distinct from a zero count.
-    An upper bound on identities, not a count of qualified candidates.  Telemetry
-    only; never raises.
-    """
+    """Observable candidate identities per discovery path, read from the trace (#317 addendum)."""
 
     by_tool: dict[str, set[str]] = {}
     for entry in getattr(tools, "trace", None) or []:
@@ -513,13 +345,7 @@ def candidate_origins(tools: Any, companies: Optional[list] = None) -> dict[str,
 
 
 def _write_empty_snapshot(icp: Mapping[str, Any], tools: Any, usage: Optional[Mapping[str, Any]] = None) -> None:
-    """Local runs only: the exact research state at a voluntary empty decision (#317 addendum).
-
-    The paired recovery experiment branches from this state (the same trace,
-    pages and counters) so every arm shares one research expense.  Written only
-    when ARENA_EMPTY_SNAPSHOT_DIR is set, which the sandbox never does; can
-    never change what the ICP returns.
-    """
+    """Local runs only: the exact research state at a voluntary empty decision (#317 addendum)."""
 
     target = os.environ.get("ARENA_EMPTY_SNAPSHOT_DIR", "").strip()
     if not target:
@@ -539,17 +365,7 @@ def _write_empty_snapshot(icp: Mapping[str, Any], tools: Any, usage: Optional[Ma
 
 def _funnel(tools: Any, *, drafted: int, verify_out: int | None, reverify_out: int | None,
             returned: int, terminal: str, companies: Optional[list] = None) -> dict[str, Any]:
-    """The per-ICP funnel, in stderr, on EVERY path (LAB-LOG #248).
-
-    ⚠️ A rejection histogram alone cannot tell "the model produced nothing" from
-    "verification discarded everything" -- both end at zero companies. Only the
-    stage counts separate them, so they are emitted even (especially) when the
-    ICP returns empty, which is exactly the path that used to log nothing:
-    `if not drafts: return _no_companies(...)` returned before the report line.
-
-    `verify_out`/`reverify_out` are None when that stage never ran, which is
-    itself the signal -- do not coerce them to 0.
-    """
+    """The per-ICP funnel, in stderr, on EVERY path (LAB-LOG #248)."""
 
     out: dict[str, Any] = {
         "discovered": int(getattr(tools, "discovered", 0) or 0),
@@ -570,15 +386,7 @@ def _funnel(tools: Any, *, drafted: int, verify_out: int | None, reverify_out: i
 
 
 def _emit_report() -> None:
-    """Write the one stderr record for this ICP, exactly once.
-
-    stderr is the only channel that survives the sandbox, and the run used to
-    emit this only on the success path. It now runs from `finally`, so an empty
-    ICP and a raising ICP are as legible as a scoring one. The `verify` block
-    stays out: it carries company names, URLs and interpolated reasons, and the
-    bounded histograms in `verify_counts` say the same thing in a form that
-    aggregates across runs.
-    """
+    """Write the one stderr record for this ICP, exactly once."""
 
     if LAST_REPORT.get("_emitted"):
         return
@@ -591,23 +399,7 @@ def _emit_report() -> None:
 
 
 def checkpoint(companies: list[dict], *, schema: str, limit: int) -> bool:
-    """Publish the current companies as the sandbox's output document, atomically.
-
-    LAB-LOG #308.  agent_entrypoint writes our final return through the same
-    ``lab_arena_checkpoint.write``; writing earlier makes every phase boundary a
-    recoverable state under atomic_checkpoint_45m_v1 (runtime.observe_checkpoint
-    reads the last VALID document at the deadline).  Validated through the mirror
-    first so a checkpoint is never the malformed document that policy discards.
-    Never raises; False means nothing was written.
-
-    LAB-LOG #316 (independent review of #315): an EMPTY list is written when an
-    earlier checkpoint of this run put companies on disk -- the sonar pre-check
-    rejecting the last company must not leave that company as the document a
-    timeout would recover.  It is NOT written when nothing was ever checkpointed:
-    under the checkpoint policy a valid empty document turns a run that RAISES
-    into an accepted zero (runtime: nonzero exit + valid checkpoint = accepted),
-    which would forfeit the confirmation attempt a model_error still earns.
-    """
+    """Publish the current companies as the sandbox's output document, atomically."""
 
     if not companies and not LAST_REPORT.get("checkpoints"):
         return False
@@ -636,14 +428,7 @@ def checkpoint(companies: list[dict], *, schema: str, limit: int) -> bool:
 
 
 def read_quota(tools: Any) -> dict | None:
-    """The SAFE v2 quota read; adopt the real Deepline ceiling and record our spend.
-
-    ⚠️ Only ``include_sourcing_cost=True``.  A failed plain (v1) read marks
-    ``trusted_quota_failure`` on the host, and a non-accepted run after that is an
-    infrastructure failure that cancels the round for every miner (#299, upstream
-    1aa25db8).  The v2 cost read is exempt: bc083c46 keeps its failures out of run
-    health (#307).  Bounded to QUOTA_READS_MAX per run, far under the host's 256.
-    """
+    """The SAFE v2 quota read; adopt the real Deepline ceiling and record our spend."""
 
     with _QUOTA_READ_LOCK:
         reads = int(LAST_REPORT.get("quota_reads") or 0)
@@ -711,12 +496,7 @@ def _note_spend(tools: Any, usd: float) -> None:
 
 
 def refresh_spend(tools: Any) -> float:
-    """Re-base the tools' ledger on the host's sourcing_cost when it is readable.
-
-    Returns the spend the run now plans against.  ⚠️ Only the v2 read (read_quota)
-    is used; a failed v1 read cancels the round (#299).  A missing or unreadable
-    snapshot leaves the local estimate in charge.
-    """
+    """Re-base the tools' ledger on the host's sourcing_cost when it is readable."""
 
     read_started = time.monotonic()
     reads_before = int(LAST_REPORT.get("quota_reads") or 0)
@@ -774,10 +554,7 @@ def snapshot_settled(cost: Mapping[str, Any]) -> bool:
 
 
 def arm_spend_guard(tools: Any) -> float:
-    """s32 C1: research cap + host re-read hook + one read NOW, so a retry sees what earlier attempts spent.
-
-    Codex review-s32e: the sandbox cannot tell a retry from a first attempt, so an UNKNOWN starting balance fails
-    closed -- the cap is $0 (no paid call) until a host read succeeds; every refused call re-reads (10 s cooldown)."""
+    """s32 C1: research cap + host re-read hook + one read NOW, so a retry sees what earlier attempts spent."""
 
     try:
         tools.spend_cap_usd = RESEARCH_CAP_USD
@@ -833,14 +610,7 @@ def draft_limit(limit: int) -> int:
 
 
 def completion_plan(spend_usd: float, have: int, left: int) -> dict[str, Any]:
-    """The eligibility zone the remaining paid work may aim for (campaign H2).
-
-    ``have`` companies already hold a contact, ``left`` can still get one.  Zone 1: one pair suffices,
-    so spend may rise to $0.80 minus the completion reserve.  Zone 2 (bounded rescue): settled spend
-    already rules out one-pair eligibility, at least two companies can still complete, and two completions
-    fit under $1.60.  Zone 0: no affordable route -- no more paid work; the valid output stays.
-    Two required pairs with fewer than two attainable companies is never a plan.
-    """
+    """The eligibility zone the remaining paid work may aim for (campaign H2)."""
 
     spend = max(0.0, float(spend_usd or 0.0))
     have, left = max(0, int(have)), max(0, int(left))
@@ -870,13 +640,7 @@ def _apply_plan(tools: Any, plan: Mapping[str, Any], *, phase: str) -> None:
 
 def attach_contacts(companies: list[dict], icp: dict, tools: Any, *, deadline: float,
                     allow_paid: bool = True, checkpoint_fn: Any = None, planner: Any = None) -> dict[str, Any]:
-    """Phase B: one verified contact per company, in place; bounded by the deadline.
-
-    ``allow_paid`` is the phase's ceiling; the LIVE decision is taken again before
-    every company from the tools' spend guard (#314 §1), and every attached contact
-    is checkpointed at once through ``checkpoint_fn`` (#314 §6) so a kill after the
-    first contact keeps that contact.
-    """
+    """Phase B: one verified contact per company, in place; bounded by the deadline."""
 
     notes: dict[str, Any] = {"attempted": 0, "attached": 0, "details": {}}
     for company in companies:
@@ -914,18 +678,7 @@ def attach_contacts(companies: list[dict], icp: dict, tools: Any, *, deadline: f
 def fill_contacts_from_reserve(companies: list[dict], report: Any, icp: dict, tools: Any, *,
                                deadline: float, limit: int, schema: str,
                                checkpoint_fn: Any = None, exclude: Optional[set[str]] = None) -> dict[str, Any]:
-    """Replace a company that found no contact with a verified reserve company that has one.
-
-    LAB-LOG #314 §5.  ``report.surplus`` holds every company that passed the FULL
-    local verification and lost only to the ``limit`` truncation (each validated
-    alone).  Under contacts_v1 a row without a contact scores 0, so a reserve
-    company WITH a contact is strictly better in that slot.  Rules: the reserve
-    company must not share a name or host with anything emitted; the emitted list
-    never exceeds ``limit``; the swapped-in row goes LAST (model order is scoring
-    order -- backfill_empty_slots explains why); a reserve company that finds no
-    contact either is left out; the contactless company stays when nothing
-    replaces it.  Bounded by the deadline and the live spend guard.
-    """
+    """Replace a company that found no contact with a verified reserve company that has one."""
 
     notes: dict[str, Any] = {"missing": 0, "tried": 0, "swapped": []}
     missing = [c for c in companies if not c.get("contact")]
@@ -999,16 +752,6 @@ def run_icp(icp: dict) -> list[dict]:
     limit = _company_limit()
     LAST_REPORT.clear()
     LAST_REPORT.update({"icp_id": icp.get("icp_id"), "limit": limit})
-
-    try:
-        skip = SKIP_PRIVATE_EQUITY and sm.normalize_stage(icp.get("company_stage")) == "private equity"
-    except Exception:
-        skip = False
-    if skip:
-        _log("Private Equity ICP: research not started (skip_private_equity=1)")
-        LAST_REPORT["skipped"] = "private_equity"
-        _emit_report()
-        return []
 
     socket_path = str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip()
     if not socket_path and not os.environ.get("ARENA_TOOLS_FACTORY"):
@@ -1271,6 +1014,11 @@ def run_icp(icp: dict) -> list[dict]:
         if companies and time.monotonic() < phase_deadline - 30.0:
             companies = recheck_ashby_postings(companies, report, tools, deadline=phase_deadline - 15.0, limit=limit,
                                                schema=schema, exclude=rejected)
+        if len(companies) > 1:
+            screened = screen_stage(companies, icp, report)
+            if len(screened) != len(companies):
+                companies = screened
+                checkpoint(companies, schema=schema, limit=limit)
         LAST_REPORT["calls"] = tools.calls
         try:
             LAST_REPORT["spend_usd"] = round(float(tools.spend_usd()), 4)
@@ -1346,9 +1094,8 @@ def _http_client_factory():
 
 
 class _NoAgent:
-    """Loop s22: the scout bundle ships without agent.py/context.py (91 KB of full-source review headroom; research_mode
-    'scout' never runs the agent loop).  What the harness reads from the agent module -- an empty usage record and the
-    default model name -- comes from here; asking for the agent loop itself fails like an agent error."""
+    """Loop s22: the scout bundle ships without agent.py/context.py (91 KB of full-source review headroom;
+    research_mode 'scout' never runs the agent loop)."""
 
     DEFAULT_MODEL = "openai/gpt-5.5"
     LAST_USAGE: dict = {}

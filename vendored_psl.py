@@ -1,10 +1,4 @@
-"""Registrable-domain split, ported from leadpoet_verifier/identity/normalization.py.
-
-The scorer's company locator (candidate_company_prompt_identity) is the
-public-suffix-aware registrable domain: example.co.uk, brand.com.au -- not the
-last two labels. public_suffix_list.dat is the platform's pinned snapshot
-(Mozilla Public Suffix List, MPL-2.0), verified by the same SHA-256.
-"""
+"""Registrable-domain split, ported from leadpoet_verifier/identity/normalization.py."""
 
 from __future__ import annotations
 

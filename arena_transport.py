@@ -1,10 +1,4 @@
-"""Credential-free OpenRouter transport over the Arena worker socket.
-
-Adapted from leadpoet/pydantic-harness (MIT, see LICENSE-pydantic-harness).
-Only the transport is kept; the tool client lives in arena_tools.py because the
-baseline's search_web/fetch_page call ScrapingDog, which miner-funded runs
-cannot use.
-"""
+"""Credential-free OpenRouter transport over the Arena worker socket."""
 
 from __future__ import annotations
 

@@ -1,18 +1,4 @@
-"""Loop 20260923T0503Z "scout": event-first discovery in place of the research agent's drafting.
-
-Why (official results 09-20..09-23, analysis/official-results):
-  * the baseline qualifies 40% of what it returns (18/45) and miners 5% (9/175); miners lose companies on
-    geography (47), unprovable stage (32), contacts (21) and employee size (18);
-  * every point of 09-23 came from ICP 009, where the field found >= 4 distinct qualifying companies but
-    no entry returned more than 2;
-  * our Sol research agent saw 6-24 candidates per ICP and drafted 0-3, finalizing after 1-4 minutes.
-
-Scout searches for the ICP's intent EVENT with several cheap queries, extracts the companies that are the
-subject of a matching event (one cheap model call; verbatim snippets only), resolves each company's
-domain, LinkedIn page, size bucket and headquarters from the free company corpus and the LinkedIn company
-record ($0.003 -- the page the judge itself reads), keeps those inside the ICP's hard buckets, attaches
-stage proof, and returns CompanyDraft-shaped rows to the existing verify -> reverify -> contacts pipeline.
-"""
+"""Loop 20260923T0503Z "scout": event-first discovery in place of the research agent's drafting."""
 
 from __future__ import annotations
 
@@ -99,11 +85,12 @@ _TEMPLATES = {
     "partnership": ["{sub} company announces partnership", "{sub} strategic partnership"],
     "launch": ["{sub} company launches new platform", "{sub} announces new product"],
     "expansion": ["{sub} company expands into new market", "{sub} opens new office"],
+    "regulatory": ["{sub} company receives FDA clearance", "{sub} company earns certification accreditation",
+                   "{sub} granted regulatory approval CE mark", "{industry} company achieves authorization"],
     "other": ["{sub} company news", "{industry} company announcement"],
 }
 PRE_SEED = r"pre(?:\s*[-\u2010\u2011\u2012\u2013\u2014\u2212]\s*|\s+)seed"
-# Loop s39 (arena-2026-10-07): 'pre-Series A' is a token of its own, never a Series A round.  The judge masks it since
-# 2026-10-06; our rows whose stage quotes said pre-Series qualified 0 of 45 judged.  Its label is in no stage order.
+# Loop s39: 'pre-Series A' is a token of its own, never a Series A round (judge masks it since 2026-10-06).
 PRE_SERIES = r"pre(?:\s*[-\u2010-\u2015\u2212]\s*|\s+)series\s+[a-h]"
 _ROUND_RE = re.compile(r"\b(" + PRE_SEED + r"|" + PRE_SERIES + r"|seed|series\s+[a-h])\b(?:\s+(?:funding|round|financing|extension))?", re.I)
 SEED_RE = re.compile(r"(?<!pre[-\u2010\u2011\u2012\u2013\u2014\u2212 ])\bseed\b", re.I)
@@ -151,6 +138,8 @@ def region_places(icp: Mapping[str, Any]) -> list[str]:
 
 def template_queries(icp: Mapping[str, Any]) -> list[str]:
     kind = intent_kind(" ".join(str(s) for s in icp.get("intent_signals") or []))
+    if str(icp.get("intent_category") or "").upper() == "REGULATORY_CLEARANCE":
+        kind = "regulatory"
     fill = {"sub": str(icp.get("sub_industry") or icp.get("industry") or "").split(",")[0].strip()[:60],
             "industry": str(icp.get("industry") or "").strip()[:60],
             "stage": str(icp.get("company_stage") or "").replace("+", "").strip(),
@@ -193,7 +182,7 @@ LLM_EST_USD = 0.016
 
 def _llm_admitted() -> bool:
     """Admit one model call and RESERVE its estimate in the ledger before dispatch (Codex review-s32b: a call that
-    times out after dispatch may still bill).  A guard that raises refuses (fail closed)."""
+    times out after dispatch may still bill)."""
 
     guard = SPEND_GUARD
     if not callable(guard):
@@ -330,7 +319,10 @@ def plan_prompt(icp: Mapping[str, Any]) -> str:
         "ideal customer profile is the subject of the intent event. Vary the wording (synonyms of the event, the "
         "sub-industry and its product words). Each query is 4-10 words, names no specific company, and targets the "
         "event itself (for hiring intents: job postings / careers pages; for leadership changes cover different roles -- "
-        "CEO, CFO, CTO, CRO, CMO, COO, CPO, VP, senior director -- and verbs: appoints, names, joins, welcomes, promotes). "
+        "CEO, CFO, CTO, CRO, CMO, COO, CPO, VP, senior director -- and verbs: appoints, names, joins, welcomes, promotes; "
+        "for regulatory clearances cover at least 4 clearance types that fit the industry -- e.g. FDA 510(k) or De Novo, "
+        "CE mark, Joint Commission or other accreditation, ISO 27001 / SOC 2 / FedRAMP / IL4 authorization, a license "
+        "granted -- and verbs: receives, earns, achieves, granted). "
         "When the geography names a region or a city, put that place -- or its main states and cities -- into at least "
         "half of the queries; for a non-US country, name the country or its main cities. "
         "Return {\"queries\": [...]}.\n\nICP: %s"
@@ -480,9 +472,7 @@ _NAME_NOISE = frozenset({"the", "inc", "llc", "ltd", "corp", "co", "company", "g
 
 
 def name_hit(company_name: str, text: str) -> bool:
-    """Does the text name the company?  The scorer's name key is one concatenated token ("acmesecurity"), so the
-    full name must appear -- or its first distinctive word (>= 4 letters), since headlines shorten names
-    ("Grafana raises ..." for Grafana Labs).  Loop s6: the old first-word check split that single token."""
+    """Does the text name the company?"""
 
     blob = sm.company_name_key(text)
     key = sm.company_name_key(company_name)
@@ -734,8 +724,7 @@ def _host_matches(host: str, key: str) -> bool:
 
 
 def find_domain(tools: Any, name: str) -> str:
-    """Loop s8: d7 dropped 15 candidates as "no website" (news rows name the company, not its site).  One FREE web
-    search for the official site; a row counts only when its host is the company's own name."""
+    """Loop s8: d7 dropped 15 candidates as "no website" (news rows name the company, not its site)."""
 
     key = sm.company_name_key(name)
     if not key or not hasattr(tools, "_free_search"):
@@ -864,8 +853,7 @@ def _homepage(tools: Any, website: str) -> Any:
 
 
 def homepage_names_company(tools: Any, website: str, name: str) -> bool:
-    """Does the homepage (fetched free, cached) name the company in its title or first 4,000 characters?  True when
-    the page could not be read at all (no evidence either way)."""
+    """Does the homepage (fetched free, cached) name the company in its title or first 4,000 characters?"""
 
     page = _homepage(tools, website)
     if page is None:
@@ -877,7 +865,7 @@ def homepage_names_company(tools: Any, website: str, name: str) -> bool:
 
 def weak_identity(tools: Any, website: str, name: str) -> bool:
     """True when the homepage does not name the company or carries no linkedin.com/company link -- the anchor the
-    judge binds identity through.  An unreadable page is weak too."""
+    judge binds identity through."""
 
     page = _homepage(tools, website)
     if page is None:
@@ -1033,9 +1021,7 @@ _UNCERTAIN_RE = re.compile(r"\b(?:not|never|no|without|unconfirmed|rumou?red|pla
 
 
 def _verb_before(pattern: "re.Pattern", sentence: str, at: int, window: int) -> bool:
-    """A completion verb within `window` characters before position `at`.  Loop v5 (stage_gate_strict): on 10-03 a row
-    was 'proven' Series A by '<adviser> advised AI secured-lending automation platform <company> on its Series A
-    fundraise' -- 'secured' there is an adjective and the round is the adviser's mandate; precision.round_verb skips both."""
+    """A completion verb within `window` characters before position `at`."""
 
     found = bool(pattern.search(sentence[max(0, at - window):at]))
     if found and _on("STAGE_GATE_STRICT"):
@@ -1082,8 +1068,7 @@ def split_sentences(text: str) -> list[str]:
 
 def _stage_sentence(text: str, name: str, pattern: re.Pattern) -> str:
     """The first page sentence naming the company and matching the stage pattern (<= 60 words), an AFFIRMED one
-    (affirmed_round) before any other; '' when none.  Headlines end at the line break, not at a period.
-    Loop s22 (teardown-0925 #5b): an affirmed sentence in the judge's own first-pass form (judge_form) comes first."""
+    (affirmed_round) before any other; '' when none."""
 
     plain = affirmed = ""
     for sentence in split_sentences(str(text or "")[:30000]):
@@ -1136,9 +1121,9 @@ _RAISES_TAIL_RE = re.compile(r"\braises\s+(?:(?:an?|its|the)\s+)?(?:(?:(?:US|CA|
 
 
 def judge_form(sentence: str, match: re.Match) -> bool:
-    """Loop s22 (#5b): the judge's first-pass forms (lead_scorer _series_stage_proof_patterns): a past-tense completion
-    verb <= 60 characters (Seed: 40) before the label, '<Name> raises [$Y] <label>', or '<label> round has raised'.
-    'Secures'/'closes'/'lands' headlines stay affirmed but rank lower: the judge's regex rejects them (09-26 probe)."""
+    """Loop s22 (#5b): the judge's first-pass forms (lead_scorer _series_stage_proof_patterns): a past-tense
+    completion verb <= 60 characters (Seed: 40) before the label, '<Name> raises [$Y] <label>', or '<label> round
+    has raised'."""
 
     window = 40 if "seed" in match.group(0).lower() else 60
     if _verb_before(_JUDGE_VERB_RE, sentence, match.start(), window) or \
@@ -1168,9 +1153,7 @@ _TARGET_OPEN_RE = re.compile(r"\b(?:talks?|offers?|intention|intends?|term sheet
 
 def round_target(sentence: str, match: re.Match, name: str) -> bool:
     """Loop v5 (stage_gate_agree): an investor's announcement names the company AFTER the label, as the target of the
-    completed round -- '<Investor> ... has led a Series A investment in <Company>'.  On 10-03 scout proved a stage with
-    such a sentence (_stage_sentence takes it), the emit gate refused it ('no affirmed round naming the company') and
-    the row went out with no evidence.  Both gates now read it the same way."""
+    completed round -- '<Investor> ... has led a Series A investment in <Company>'."""
 
     six = " ".join(sentence[:match.start()].split()[-6:])
     if _UNCERTAIN_RE.search(six) or not _verb_before(_TARGET_VERB_RE, sentence, match.start(), 60) or \
@@ -1225,20 +1208,15 @@ _TICKER_CLOSE_FIX_RE = re.compile(r"(\((?:NASDAQ|Nasdaq|NYSE)\s*:\s*[A-Z][A-Z0-9
 
 
 def ticker_spaced(text: str) -> str:
-    """Loop s29 (upstream 16d7f6fc _public_quote_has_bound_market_locator): the judge renders 'Rapid7, Inc. (NASDAQ: RPD)'
-    with a space before the bracket and binds the ticker only then; our fetcher's 'Inc.(NASDAQ' failed it.
-    Loop v5: a linked ticker reads '(Nasdaq: XXXX )' in page text (tag boundaries are spaces); the judge's locator
-    pattern allows no space before the closing bracket, and a quote without a bound locator loses the judge's free
-    prefetch of the submitted stage URL.  Under stage_gate_agree that gap is closed too."""
+    """Loop s29 (upstream 16d7f6fc _public_quote_has_bound_market_locator): the judge renders 'Rapid7, Inc."""
 
     text = _TICKER_GAP_FIX_RE.sub(" (", str(text or ""))
     return _TICKER_CLOSE_FIX_RE.sub(r"\1)", text) if _on("STAGE_GATE_AGREE") else text
 
 
 def own_ticker_sentence(text: str, name: str) -> str:
-    """Loop s27 (d25 Rapid7, 'stage unproven' beside its own '(NASDAQ: RPD)' release): the sentence in which the company's
-    name leads straight into its own parenthesised exchange:ticker ('Tenable\u00ae Holdings, Inc. (NASDAQ: TENB)'), as a
-    listed company's releases open; only corporate words may stand between the name and the ticker."""
+    """Loop s27 (d25 Rapid7, 'stage unproven' beside its own '(NASDAQ: RPD)' release): the sentence in which the
+    company's name leads straight into its own parenthesised exchange:ticker ('Tenable\u00ae Holdings, Inc."""
 
     names = {n for n in (" ".join(str(name or "").split()), _CORP_TAIL_RE.sub("", " ".join(str(name or "").split()))) if len(n) >= 2}
     for sentence in split_sentences(str(text or "")[:30000]):
@@ -1324,8 +1302,7 @@ def _consent_chrome(sentence: str, offering: str = "") -> bool:
 
 
 def capability_sentence(text: str, name: str, icp: Mapping[str, Any], *, first_party: bool = False) -> tuple[str, int]:
-    """Loop s29c: prefer named own-domain sentences; unnamed ones are a fallback.
-    Third-party sentences must name the company. Keep 8-60 verbatim words and >= 2 ICP focus matches."""
+    """Loop s29c: prefer named own-domain sentences; unnamed ones are a fallback."""
 
     focus = {w for w in re.findall(r"[a-z]{4,}", " ".join(str(icp.get(k) or "") for k in
                                                             ("required_attribute", "product_service", "sub_industry")).casefold())
@@ -1354,7 +1331,7 @@ def capability_sentence(text: str, name: str, icp: Mapping[str, Any], *, first_p
 
 def capability_evidence(tools: Any, cand: Mapping[str, Any], prof: Mapping[str, Any], icp: Mapping[str, Any]) -> tuple[str, str]:
     """(url, quote) for required_attribute: the homepage, up to two about/product pages it links, and the intent page
-    when it is the company's own or a wire copy; first-party pages win ties. ('', '') when no page qualifies."""
+    when it is the company's own or a wire copy; first-party pages win ties."""
 
     from urllib.parse import urlsplit
     from .sourcetype import source_kind
@@ -1548,11 +1525,7 @@ def _page_span(text: str) -> str:
 
 
 def stage_quote_ok(quote: str, page_text: str, *, name: str, stage: str, url: str, website: str = "") -> str:
-    """Loop s22 (teardown-0925 #5b): '' when a company_stage_evidence item may be emitted, else why not.  The quote is
-    verbatim page text (no re-cut), sits on a first-party or fetchable news host (never tier 3), names the company on
-    a word boundary and proves the stage itself: an affirmed round whose latest label is the ICP's, an exchange:ticker
-    or a PE-control sentence.  09-25: the winner sent [] on 9/9 rows and passed stage 9/9; our 17 items were
-    finsmes navigation, a facebook post on Misochain (MRO), pantry.ai on Mezcla (Edibles.com) and moneymag (Curtin)."""
+    """Loop s22 (teardown-0925 #5b): '' when a company_stage_evidence item may be emitted, else why not."""
 
     if sm.normalize_stage(stage) == "public":
         quote, page_text = ticker_spaced(quote), ticker_spaced(page_text)
@@ -1588,8 +1561,8 @@ def stage_quote_ok(quote: str, page_text: str, *, name: str, stage: str, url: st
 
 
 def not_a_listed_company(prof: Mapping[str, Any]) -> str:
-    """Loop s22 (#5a): universities, agencies and charities have no shares -- d19/09-25 Curtin University (curtin.edu.au)
-    'proved' Public from a moneymag page about stock tickers.  '' for any other company."""
+    """Loop s22 (#5a): universities, agencies and charities have no shares -- d19/09-25 Curtin University
+    (curtin.edu.au) 'proved' Public from a moneymag page about stock tickers."""
 
     domain = str(prof.get("domain") or sm.registrable_host(str(prof.get("website") or "")) or "").lower()
     labels = domain.split(".")
@@ -1622,9 +1595,7 @@ def _tokens(text: str) -> list[str]:
 
 def event_conflict(name: str, text: str, want: str) -> str:
     """The later venture round, acquisition OF the company or listing that a URL path or a headline binds to it:
-    'series c' / 'acquired' / 'public', or '' when none.  Token rules written from the judge's rule description: the
-    name's tokens sit right next to the event words, so a co-mentioned company or a longer namesake never binds;
-    plans, talks and pending agreements never count."""
+    'series c' / 'acquired' / 'public', or '' when none."""
 
     try:
         from .identity import clean_name
@@ -1691,8 +1662,7 @@ _TITLE_TICKER_RE = r"\s*\(\s*(?:NASDAQ|Nasdaq|NYSE|ASX|TSXV?|LSE|AIM|HKEX|SGX|Eu
 
 def title_conflict(name: str, title: str, want: str, domain: str = "", context: str = "") -> str:
     """Loop s22 (#4b): a search-result headline that binds THIS company to a completed later round, an acquisition OF
-    it or a listing.  A short one-word name ('Deck', 'Euno') binds only when the result also names the company's
-    domain, so a namesake's news never drops a company."""
+    it or a listing."""
 
     found = event_conflict(name, title, want)
     source = _name_source(name)
@@ -1724,8 +1694,7 @@ STAGE_PROOF_WEAK_HOSTS = bool(STRATEGY.get("stage_proof_weak_hosts", 0))
 def current_stage_search(tools: Any, name: str, domain: str, want: str, *, deadline: float, started_spend: float,
                          since: Optional[str] = None) -> dict[str, Any]:
     """Loop s22 (#4b): ONE paid search in the judge's own form ('<name> <domain> latest funding round acquisition
-    IPO', company_evidence_investigator.py:1389-1395); result titles and dates only.  Never raises: a skipped or
-    failed search leaves {'ran': False} and the s19 path decides."""
+    IPO', company_evidence_investigator.py:1389-1395); result titles and dates only."""
 
     out: dict[str, Any] = {"ran": False, "conflict": ""}
     try:
@@ -1913,8 +1882,7 @@ def news_stage(tools: Any, name: str, domain: str, icp: Mapping[str, Any], *, de
 
 def hint_proof(tools: Any, name: str, hint: Mapping[str, Any], icp: Mapping[str, Any], website: str = "") -> tuple[str, str, str]:
     """Loop s15: a stage-first candidate's own funding article (the round named in its headline), quoted verbatim,
-    when the company's dated news is silent about its stage (a later round there already returned a mismatch).
-    Loop v5 (stage_gate_agree): the sentence the emit gate accepts is quoted when the page has one."""
+    when the company's dated news is silent about its stage (a later round there already returned a mismatch)."""
 
     want = sm.normalize_stage(icp.get("company_stage"))
     label = str(hint.get("round") or "")
@@ -1998,9 +1966,8 @@ def stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str
 
 def cached_stage(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any], urls: Any = ()) -> Optional[dict[str, Any]]:
     """Loop v5 (stage_cache_scan): a stage proof read from pages this run already holds -- the intent page, the
-    required-attribute page, the homepage and about pages, the stage-hint article, news rows and search-result pages
-    naming the company -- with the emit gate as the selector.  No provider call.  None when the cache says nothing or
-    affirms a later round for the company (then the search below decides, as before)."""
+    required-attribute page, the homepage and about pages, the stage-hint article, news rows and search-result
+    pages naming the company -- with the emit gate as the selector."""
 
     if not _on("STAGE_CACHE_SCAN"):
         return None
@@ -2021,13 +1988,7 @@ def use_cached_stage(name: str, icp: Mapping[str, Any], got: Mapping[str, Any]) 
 
 def stage_proof_found(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any], *, deadline: float,
                       hint: Optional[Mapping[str, Any]] = None, intent_url: str = "") -> tuple[str, str, str]:
-    """(stage label, evidence url, verbatim quote) proving the ICP's stage, or ('', '', '') -- never a guess.
-
-    Loop s9: the company's own dated news first (free); the search path below only when the news is silent.
-    Loop s15: between the two, the funding article a stage-first candidate was found through (hint).
-    Loop v5: before the search, the pages already cached for this company (cached_stage).  For a venture stage only a
-    fresh round on the candidate's own event page replaces the search (the search is how a later round or an
-    acquisition is found); any other cached sentence is used when the search comes back silent."""
+    """(stage label, evidence url, verbatim quote) proving the ICP's stage, or ('', '', '') -- never a guess."""
 
     want = sm.normalize_stage(icp.get("company_stage"))
     if not want:
@@ -2073,12 +2034,7 @@ def stage_proof_found(tools: Any, name: str, prof: Mapping[str, Any], icp: Mappi
 
 def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any], *,
                         deadline: float) -> tuple[str, str, str]:
-    """The s1..s8 stage search (free headlines, then one paid query), weak hosts ranked last (s9).
-
-    Loop s22 (teardown-0925 #5a): proof is sentence-level -- an AFFIRMED round (round_claims), an exchange:ticker
-    (ticker_sentence) or a PE-control sentence (pe_sentence) naming the company on a word boundary -- and a tier-3
-    aggregator page never supplies it.  s19's page-wide scan gave d17 VinciWorks jpost's Orca Security round, Avantis
-    a tracxn table of other schools and 09-25 Curtin University a moneymag 'stock ticker' page."""
+    """The s1..s8 stage search (free headlines, then one paid query), weak hosts ranked last (s9)."""
 
     want = sm.normalize_stage(icp.get("company_stage"))
     if not want:
@@ -2227,19 +2183,6 @@ def build_draft(icp: Mapping[str, Any], cand: Mapping[str, Any], prof: Mapping[s
     if attribute:
         draft["required_attribute"] = {"text": attribute, "passed": True, "evidence_url": prof["website"], "evidence_quote": "",
                                        "explanation": ""}
-        try:
-            from .sourcetype import source_kind
-            url = str(cand.get("url") or "")
-            if ATTRIBUTE_FROM_RELEASE and tools is not None and cand.get("source") != "ats" and \
-                    source_kind(url, prof.get("domain") or sm.registrable_host(prof["website"]), cand["company_name"]) in ("first_party", "wire"):
-                quote = attribute_sentence(_fetch_text(tools, url), cand["company_name"], attribute, str(icp.get("product_service") or ""))
-                if quote:
-                    draft["required_attribute"].update(evidence_url=url, evidence_quote=quote[:2000],
-                                                       explanation=f"{cand['company_name']}'s own release describes its offering.")
-        except BudgetExhausted:
-            raise
-        except Exception:
-            pass
         if CAPABILITY_EVIDENCE and tools is not None:
             try:
                 cap_url, cap_quote = capability_evidence(tools, cand, prof, icp)
@@ -2315,7 +2258,6 @@ def second_signal(tools: Any, draft: Mapping[str, Any], icp: Mapping[str, Any], 
         snippet = str(cand.get("snippet") or "")
         return row(cand["url"], cand.get("date"), snippet or str(cand.get("event") or ""), snippet)
     return None
-ATTRIBUTE_FROM_RELEASE = bool(STRATEGY.get("attribute_from_release", 1))
 STAGE_FIRST = bool(STRATEGY.get("stage_first", 1))
 ROSTER_WITH_STAGE_FIRST = int(STRATEGY.get("roster_with_stage_first") or 24)
 
@@ -2368,10 +2310,9 @@ _TRIAGE_RANK = {"likely": 0, "unknown": 1, "unlikely": 2}
 
 
 def triage(icp: Mapping[str, Any], cands: list[dict[str, Any]], *, http_client_factory=None) -> list[dict[str, Any]]:
-    """Loop s24 (d20 09-25 ICP 004): the resolve loop runs out of time after ~24 candidates, and ten of them there were
-    US-headquartered, far too large or public for a Canadian seed ICP (six 'HQ outside ICP', four size, two public) while
-    Tuhk -- qualified in d19 -- sat sixth in its lane and was never reached.  One cheap call ranks the merged list by
-    likely fit from the model's own knowledge; nothing is dropped, 'unlikely' only moves to the end."""
+    """Loop s24 (d20 09-25 ICP 004): the resolve loop runs out of time after ~24 candidates, and ten of them there
+    were US-headquartered, far too large or public for a Canadian seed ICP (six 'HQ outside ICP', four size, two
+    public) while Tuhk -- qualified in d19 -- sat sixth in its lane and was never reached."""
 
     if not TRIAGE or len(cands) <= 4:
         return cands
@@ -2450,7 +2391,7 @@ def own_source(tools, cand, prof, icp, window, deadline):
     noun of the article's event is in that page's URL slug and quoted sentence, the dates within 45 days (free GETs)."""
 
     from urllib.parse import urlsplit
-    from .sourcetype import _MONTHS, allowed_kinds, body_dateline, source_kind
+    from .sourcetype import _MONTHS, allowed_kinds, body_dateline, is_listing_url, source_kind
     name, home, pages = cand["company_name"], str(prof.get("website") or ""), getattr(tools, "pages", {})
     site, kinds = sm.registrable_host(home), allowed_kinds(icp["intent_signals"][0]) or ()
     said, art = f"{cand.get('snippet') or ''} {cand.get('event') or ''}", pages.get(cand.get("url"))
@@ -2486,8 +2427,10 @@ def own_source(tools, cand, prof, icp, window, deadline):
     links = list(dict.fromkeys(own(list(pages)) + links))
     seen = [k for last in {urlsplit(u).path.rstrip("/").rsplit("/", 1)[-1] for u in links} for k in slug(last)]
     keys = {k for k in keys if seen.count(k) < 3}
-    fresh = sorted((u for u in links if u not in pages and slug(u)), key=lambda u: (-len(slug(u)), -len(u)))[:3]
+    fresh = sorted((u for u in links if u not in pages and slug(u) and not is_listing_url(u)), key=lambda u: (-len(slug(u)), -len(u)))[:3]
     for url in [u for u in links if u in pages] + fresh:
+        if is_listing_url(url):
+            continue
         text = str(getattr(read(url), "text", "") if slug(url) else "")
         for s in split_sentences(text):
             cut = re.sub(r"^\W+", "", " ".join(s.split()[:40]))
@@ -2555,9 +2498,7 @@ _NOT_A_PRODUCT_RE = re.compile(r"\bnew (?:web ?site|website|blog|podcast|newslet
 
 
 def primary_event_shown(icp: Mapping[str, Any], cand: Mapping[str, Any], page_text: str = "") -> bool:
-    """The candidate's own event text states a COMPLETED event of the primary criterion's category.
-    Loop v5 (funding_label_guard): a FUNDING criterion that names a round needs that round label in the event text,
-    its URL or the opening of its page (`page_text`); a plain 'secured funding from <investor>' no longer shows it."""
+    """The candidate's own event text states a COMPLETED event of the primary criterion's category."""
 
     from .roster import intent_category
     category = intent_category(icp, intent_kind(" ".join(str(x) for x in icp.get("intent_signals") or [])))

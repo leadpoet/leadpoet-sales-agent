@@ -1,29 +1,4 @@
-"""The client-facing intent paragraph for output.v5 (intent_details_v1).  LAB-LOG #308.
-
-What the judge does with it (qualification/scoring/intent_details.py, model
-anthropic/claude-sonnet-4.5): after normal scoring it re-reads the paragraph
-against the verifier's OWN saved evidence -- the verified signals' quotes, dates
-and URLs and the fit gate's observed company facts -- and returns five Booleans:
-
-  facts_supported            every factual clause is backed by those quotes
-  verified_signals_covered   EVERY distinct verified signal is stated
-  relevance_grounded         commercial implications only as clearly conditional
-                             inference (may / could / suggests), never as fact
-  final_sentence_connects_icp a grounded reason the activity matters to the ICP,
-                             anywhere in the paragraph
-  natural_paragraph          prose; no headings, bullets, labels or scoring talk
-
-A failed review zeroes the company (competition.py _intent_details_gate_passed).
-So the paragraph is written from the verified facts and nothing else, and a
-deterministic fallback exists so a valid paragraph is ALWAYS attached -- the v5
-contract refuses an empty one (competition_models.py CompetitionCompanyV5).
-
-Two entry points:
-  fallback_paragraph(...)  no model, always valid, used at verify time and when
-                           the model's paragraph fails the local checks
-  write_paragraphs(...)    one OpenRouter call for every company at once, plus
-                           (loop s22) one re-ask naming the rule a row broke
-"""
+"""The client-facing intent paragraph for output.v5 (intent_details_v1)."""
 
 from __future__ import annotations
 
@@ -126,6 +101,7 @@ _INVENTED_INTENT_RE = re.compile(
     r"\bwill\s+(?:buy|purchase)\b",
     re.I,
 )
+_PAGE_CHROME_RE = re.compile(r"(?:^|\s)#{1,6}\s|\s\|\s")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 _SELLER_RE = re.compile(
@@ -440,21 +416,21 @@ def _closing_kind(category: str, signals: list[Mapping[str, Any]]) -> str:
 
 def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
                        signals: list[Mapping[str, Any]]) -> str:
-    """A grounded paragraph from verified descriptions and dates alone.
-
-    Every activity sentence restates one verified signal's description and its
-    event date; the closing sentence is deliberately conditional and names the
-    ICP's product/service.  Nothing else is asserted.
-    """
+    """A grounded paragraph from verified descriptions and dates alone."""
 
     name = " ".join(str(company_name or "").split()) or "The company"
     sentences: list[str] = []
     seen: set[str] = set()
-    for signal in signals:
+    primary = next((i for i, s in enumerate(signals) if s.get("index", s.get("matched_icp_signal")) == 0), 0)
+    for position, signal in enumerate(signals):
         desc = str(signal.get("description") or "")
+        # "Acme: Acme, a ... provider ..., raised ..." -- drop the leading name label so the event is not cut away.
+        desc = re.sub(r"^\s*" + re.escape(name) + r"\s*:\s*(?=" + re.escape(name[:1]) + ")", "", desc)
         key = sm.normalize_text(desc)[:80]
         if not desc or key in seen:
             continue
+        if position != primary and _PAGE_CHROME_RE.search(desc):
+            continue    # menu or heading text of a page, not a report of the event
         seen.add(key)
         if is_posting_url(signal.get("url")):
             try:
@@ -503,15 +479,7 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
 
 def covers_signals(text: str, signals: list[Mapping[str, Any]], *, company_name: str = "",
                    icp: Optional[Mapping[str, Any]] = None) -> bool:
-    """Does the paragraph plausibly state every verified signal? (local proxy for
-    the judge's verified_signals_covered: two of each signal's content words must
-    appear; the date counts only for a signal whose description has no content word).
-    s30: the company's own name and the ICP offering phrase the closing sentence
-    carries are not content words -- "Compass ... real estate brokerage" once passed
-    for an uncovered Compass acquisition.  s32 C4: a date alone no longer covers a
-    signal (Codex analysis-0928 negative control: a paragraph naming only the date of
-    an office opening passed); the judge requires the ACTIVITY, "covered is true only
-    when it states that specific verified activity"."""
+    """Does the paragraph plausibly state every verified signal?"""
 
     norm = sm.normalize_text(text)
     words = set(norm.split())
@@ -673,16 +641,8 @@ def _digit_groups(text: str) -> set[str]:
 
 
 def foreign_claim(text: str, signals: list[Mapping[str, Any]], icp: Mapping[str, Any], company_name: str = "") -> str:
-    """The rule a paragraph breaks when it states what neither the verified signals nor the ICP wording contain ('' if none).
-
-    Text work only.  (1) A number in the paragraph must appear in a signal's quote, description, title or date, in the
-    ICP's product_service or in the company's name; a money amount may be written differently ("$12,000,000" and "$12
-    million").  (2) The paragraph carries one conditional clause.  (3) That clause, from its hedge word (may / could /
-    suggests) to the end of the sentence, uses words from the verified signals, the ICP's product_service, the company's
-    name and a closed list of connective words; three or more other content words mean it asserts something about the
-    company that no admitted page states (the 10-04 case: a closing clause that said which other systems the company's
-    platform connects with, a sentence from its homepage).  A clause joined in front of the hedge ("<claim>, and this
-    hiring may ...") is held to the signals and reporting words the same way."""
+    """The rule a paragraph breaks when it states what neither the verified signals nor the ICP wording contain ('' if
+    none)."""
 
     evidence = " ".join(f"{s.get('quote') or ''} {s.get('description') or ''} {s.get('title') or ''} "
                         f"{_title(s)} {s.get('date') or ''} {human_date(s.get('date'))}" for s in signals)
@@ -807,8 +767,7 @@ _TITLE_RULE = (" A signal's page_title, when given, is that page's own headline:
 
 
 def _instructions(title: bool = False) -> str:
-    """The writer's rules; with paragraph_signal_only the offering is named in the ICP's words, not the homepage's.
-    The headline rule goes only into a request that carries a page_title."""
+    """The writer's rules; with paragraph_signal_only the offering is named in the ICP's words, not the homepage's."""
 
     if not SIGNAL_ONLY:
         return _INSTRUCTIONS
@@ -888,12 +847,7 @@ def _json_document(content: Any) -> Any:
 
 
 def parse_paragraph_rows(content: Any) -> list[dict[str, str]]:
-    """Rows of {company_name, intent_details} from the model's reply (loop s18).
-
-    d15 ICP 001: the JSON reply carried one unescaped quote inside a paragraph, json.loads failed, and all seven
-    companies silently fell back.  The reply format is now one 'PARAGRAPH <name> ||| <text>' line per company (no
-    quoting to get wrong); JSON is still accepted, row by row, with a tolerant extractor when the document is broken.
-    """
+    """Rows of {company_name, intent_details} from the model's reply (loop s18)."""
 
     text = str(content or "")
     rows = [{"company_name": name.strip().strip("*`\"'"), "intent_details": " ".join(body.split())}
@@ -920,8 +874,7 @@ async def _write(companies: list[Mapping[str, Any]], icp: Mapping[str, Any], *,
                  feedback: Optional[Mapping[str, tuple[str, str]]] = None) -> tuple[dict[str, str], Optional[float]]:
     """One direct chat call on the route scout's model calls use (loop s11n): no pydantic-ai, whose package the
     runtime image lacks -- on arena-2026-09-24 the host's per-run requirements.txt install failed 17-19 of 20 runs
-    of every entry that shipped one, so this bundle ships none.  Rows are validated one by one: a malformed row
-    falls back alone."""
+    of every entry that shipped one, so this bundle ships none."""
 
     from .reverify import _client_and_base
 
@@ -963,13 +916,7 @@ async def _write(companies: list[Mapping[str, Any]], icp: Mapping[str, Any], *,
 def write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
                      evidence: Mapping[str, list[Mapping[str, Any]]], model_name: str,
                      timeout: float, http_client_factory=None) -> dict[str, Any]:
-    """Attach a reviewed paragraph to every company IN PLACE; fall back per company.
-
-    ``evidence`` is Report.evidence from verify.py: the verified signals per company
-    (keyed by sm.company_name_key), the only facts the paragraph may state.
-    Returns bounded notes for the report.  Never raises: a failed call leaves the
-    deterministic fallback in place, which is always contract-valid.
-    """
+    """Attach a reviewed paragraph to every company IN PLACE; fall back per company."""
 
     notes: dict[str, Any] = {"companies": len(companies), "model": model_name, "accepted": 0, "fallback": 0}
     if not companies:

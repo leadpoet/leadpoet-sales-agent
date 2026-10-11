@@ -1,15 +1,4 @@
-"""Second-criterion HIRING evidence from the company's own ATS board, over the sandbox's free web egress.
-
-Why: a company that proves both ICP criteria is capped at 80 intent points instead of 60 x source multiplier
-(51-54), and HIRING is the most common second criterion.  The judge verifies a single Greenhouse, Ashby or Lever
-posting through that ATS's public API and binds the board tenant to the company, so an open posting whose title
-names one of the criterion's role families is first-party, dated, verifiable evidence.
-
-Flow per company (no paid provider call): find the board tenant (links on the homepage / careers page, else the
-domain label and name as tenant guesses), list open postings from the public board API, keep postings published
-inside the criterion's window whose TITLE contains one of the criterion's role words, and emit the newest one as
-matched_icp_signal 1 with the canonical posting URL the judge accepts.
-"""
+"""Second-criterion HIRING evidence from the company's own ATS board, over the sandbox's free web egress."""
 
 from __future__ import annotations
 

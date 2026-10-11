@@ -1,13 +1,4 @@
-"""Local precheck for the scorer's independent company-fit re-verification.
-
-This module mirrors selected deterministic decisions and sends a bounded
-Perplexity/sonar web check before submission. Contradicted companies are dropped,
-unprovable ones are ranked last, and a name-only identity discrepancy may adopt
-the verifier's observed name. It does not claim full
-lead_scorer._llm_reverify_company parity: the scorer's identity-bound, current
-LinkedIn Company-size refresh and its second schema/identity repair call remain
-server-only. Best effort: transport or parse failure leaves the company untouched.
-"""
+"""Local precheck for the scorer's independent company-fit re-verification."""
 
 from __future__ import annotations
 
@@ -513,11 +504,7 @@ def _has_affirmed_stage_proof(
 
 
 def _stage_quote_supports_observation(observed: str, quote: str) -> bool:
-    """Sanity-check that a quote names evidence specific to the reported stage.
-
-    This guard rejects bare category keywords and obvious uncertainty. It does
-    not replace the web verifier's independent company-attribution check.
-    """
+    """Sanity-check that a quote names evidence specific to the reported stage."""
 
     text = str(quote or "").strip()
     if not text:
@@ -629,9 +616,8 @@ def _subject_is_company(subject_text: str, names: set[tuple[str, ...]]) -> bool:
 
 
 def acquired_stage_quote_supports_company(company_name: Any, observed_company_name: Any, quote: Any) -> bool:
-    """lead_scorer._acquired_stage_quote_supports_company: completed acquisition /
-    current-parent proof whose SUBJECT is this exact company (name or name + legal
-    suffix), not superseded ("later went public"), not conditional."""
+    """lead_scorer._acquired_stage_quote_supports_company: completed acquisition / current-parent proof whose SUBJECT
+    is this exact company (name or name + legal suffix), not superseded ("later went public"), not conditional."""
 
     if not isinstance(quote, str) or not quote.strip():
         return False
@@ -696,10 +682,9 @@ def bound_public_supersession_supports_company(company_name: Any, observed_compa
 def first_party_ownership_conflicts_with_stage(company_website: Any, company_name: Any,
                                                observed_company_name: Any, observed_stage: str,
                                                attribute_evidence_url: Any, attribute_evidence_quote: Any) -> bool:
-    """lead_scorer._first_party_ownership_conflicts_with_stage: when the REQUIRED-ATTRIBUTE
-    evidence sits on the company's own registrable domain and proves (subject-bound)
-    that this company was acquired, a pinned venture stage is UNRESOLVED; a Public
-    stage is reopened only by a completed take-private / current delisting."""
+    """lead_scorer._first_party_ownership_conflicts_with_stage: when the REQUIRED-ATTRIBUTE evidence sits on the
+    company's own registrable domain and proves (subject-bound) that this company was acquired, a pinned venture
+    stage is UNRESOLVED; a Public stage is reopened only by a completed take-private / current delisting."""
 
     venture_stage = observed_stage in {"seed", "series a", "series b", "series c+"}
     if not venture_stage and observed_stage != "public":
@@ -820,22 +805,7 @@ def apply_verified_homepage_anchor(
     company: Mapping[str, Any],
     homepage_identity: Mapping[str, Any] | None,
 ) -> MutableMapping[str, Any]:
-    """Downgrade an identity mismatch the first-party homepage contradicts.
-
-    Mirrors the block added to ``lead_scorer`` in upstream ``25c8a51b``
-    ("Fix contradictory Arena verification and judge failure handling",
-    LIVE on gateway ``91021d8f``). When the web verifier reports a DIFFERENT
-    LinkedIn slug but the server's own fetch of the company homepage yields the
-    exact triplet we submitted, the model's alternate slug is no longer treated
-    as proof of a wrong company. The decision becomes UNAVAILABLE with
-    ``web_linkedin_conflicts_with_verified_homepage`` and a bounded repair pass
-    re-checks it.
-
-    🔹 Strategy consequence: a homepage-anchored slug can no longer cost -10 on
-    a slug disagreement. It is worth 0 at worst. ``verify.py`` already emits
-    ``company_linkedin`` only when the link is read on the company's own
-    homepage, so every slug we submit qualifies for this protection.
-    """
+    """Downgrade an identity mismatch the first-party homepage contradicts."""
 
     if not isinstance(homepage_identity, Mapping):
         return receipt
@@ -872,25 +842,7 @@ def apply_verified_homepage_anchor(
 
 
 def submitted_homepage_anchor(company: Mapping[str, Any]) -> dict[str, str] | None:
-    """The first-party homepage anchor for a company WE emitted, or None.
-
-    ⛳️ LAB-LOG #237 finding 3.  `apply_verified_homepage_anchor` mirrors the
-    scorer's downgrade but had no anchor to work with, so it was never reachable
-    from `rerank` and a slug conflict was EVICTED instead.  The anchor is not a
-    guess: `verify.py:409-423` emits ``company_linkedin`` ONLY when the slug was
-    read as a ``linkedin.com/company/`` link on the company's own homepage
-    (fetched through Firecrawl, whose markdown keeps link targets), and the name
-    was already required to appear on that same page.  So for our own output the
-    submitted triplet IS the first-party triplet the scorer rebuilds server-side
-    from its own fetch of the same homepage.
-
-    ⚠️ The one thing we cannot observe is whether the SCORER's independent fetch
-    succeeds.  Its anchor exists only when its homepage identity check returns
-    MATCH; when that fetch is refused the web verdict's mismatch stands and the
-    company costs -10/goal.  That is the risk this alignment accepts, and it is
-    bounded to the single shape below: same name, same domain, both slugs
-    non-numeric, ours read off the homepage.  Everything else still evicts.
-    """
+    """The first-party homepage anchor for a company WE emitted, or None."""
 
     slug = linkedin_slug(company.get("company_linkedin"))
     domain = canonical_domain(company.get("company_website"))
@@ -904,20 +856,7 @@ MAX_ORGANIZATION_NAME_LENGTH = 200
 
 
 def name_only_mismatch(receipt: Mapping[str, Any]) -> bool:
-    """True when the ONLY thing separating us from the observed company is the name.
-
-    Domain and LinkedIn slug are the strong identifiers; when both already agree,
-    a differing name is a naming discrepancy, not a different company. Upstream
-    now says so itself: `8ba01c27` / `e4f29bf1` accept the observed name when it
-    is the `legalName` published in the homepage's JSON-LD Organization record
-    (brand `name` matching ours, same url domain, same sameAs LinkedIn) and
-    upgrade the receipt to MATCH with `verifier_accepted`.
-
-    We cannot mirror that test directly -- we read the homepage as Firecrawl
-    markdown, which drops `<script type="application/ld+json">` -- so instead of
-    guessing at aliases we submit the name the verifier itself observed, which
-    makes the comparison agree outright. See `adopt_observed_name`.
-    """
+    """True when the ONLY thing separating us from the observed company is the name."""
     if receipt.get("decision") != MISMATCH or receipt.get("reason_code") != "identity_mismatch":
         return False
     domain = receipt.get("submitted_domain")
@@ -931,12 +870,7 @@ def name_only_mismatch(receipt: Mapping[str, Any]) -> bool:
 
 
 def adopt_observed_name(receipt: Mapping[str, Any]) -> str:
-    """The observed name worth submitting instead of ours, or "" to keep ours.
-
-    Bounded and injection-screened exactly like the existing rename path: the
-    name reaches the judge's prompt, so an unbounded or instruction-shaped name
-    must never be adopted.
-    """
+    """The observed name worth submitting instead of ours, or "" to keep ours."""
     raw = " ".join(sm.strip_gateway_controls(receipt.get("observed_name_raw")).split())
     try:
         from .identity import clean_name
@@ -1219,8 +1153,7 @@ def _reported_nothing(verdict: Mapping[str, Any], dimension: str, matches: str) 
 
 
 def _industry_unproven(verdict: Mapping[str, Any], icp: Mapping[str, Any]) -> bool:
-    """lead_scorer.py:1705-1732 (upstream d2f02967).  A company the verifier proves is a
-    supplier/operator in SOME industry, cited, that is simply not the ICP's industry."""
+    """lead_scorer.py:1705-1732 (upstream d2f02967)."""
 
     if not all(field in verdict for field in _INDUSTRY_FIELDS):
         return False
@@ -1240,13 +1173,7 @@ def _industry_unproven(verdict: Mapping[str, Any], icp: Mapping[str, Any]) -> bo
 
 
 def _employee_size_unproven(verdict: Mapping[str, Any]) -> bool:
-    """lead_scorer.py:1743-1770 (upstream 83cf2073).  A cited employee value that is not
-    one of LinkedIn's canonical buckets proves no supported bucket exists.
-
-    NOT mirrored: upstream returns retryable first when its LinkedIn refresh failed
-    (`linkedin_refresh_outcome == "retryable_failure"`).  That cache is the scorer's and
-    is invisible here, so this can call a company clean that upstream retries.  It only
-    reorders our own bundle, never evicts, so the error is bounded."""
+    """lead_scorer.py:1743-1770 (upstream 83cf2073)."""
 
     if not all(field in verdict for field in _EMPLOYEE_FIELDS):
         return False
@@ -1279,9 +1206,8 @@ def _stage_unproven(verdict: Mapping[str, Any]) -> bool:
 
 
 def _identity_unproven(identity: Mapping[str, Any]) -> bool:
-    """lead_scorer._is_same_domain_unproven_web_identity (:1609) and
-    _is_verified_homepage_web_identity_conflict (:1635).  `evidence_source` is implicit
-    -- every receipt this module builds is company_web_reverification."""
+    """lead_scorer._is_same_domain_unproven_web_identity (:1609) and _is_verified_homepage_web_identity_conflict
+    (:1635)."""
 
     if identity.get("decision") != UNAVAILABLE:
         return False
@@ -1304,8 +1230,8 @@ def _identity_unproven(identity: Mapping[str, Any]) -> bool:
 
 def failure_class(verdict: Mapping[str, Any], dims: Mapping[str, str],
                   identity: Mapping[str, Any], icp: Mapping[str, Any]) -> str:
-    """INSUFFICIENT when the platform would class this a clean, non-retryable 0; "" when
-    it would keep retrying the run.  Mirrors lead_scorer.py:2160-2180."""
+    """INSUFFICIENT when the platform would class this a clean, non-retryable 0; "" when it would keep retrying the
+    run."""
 
     incomplete = [name for name, value in dims.items() if value == UNAVAILABLE]
     if identity.get("decision") == UNAVAILABLE:
@@ -1328,13 +1254,6 @@ def _consistent(flag: Optional[bool], canonical: bool) -> str:
 def decide(verdict: Mapping[str, Any], company: Mapping[str, Any], icp: Mapping[str, Any]) -> dict[str, Any]:
     identity = apply_verified_homepage_anchor(
         evaluate_identity(company, verdict), company, submitted_homepage_anchor(company))
-    try:  # brand_name: a name identity.bind read off the homepage (the judge's own match) is not replaced
-        from . import identity as idn
-        if identity.get("reason_code") == "identity_name_differs" and \
-                (idn._reg(identity.get("submitted_domain")), identity.get("submitted_name")) in idn.HOME:
-            identity.update(decision=MATCH, reason_code="verifier_accepted")
-    except Exception:
-        pass
     dims: dict[str, str] = {}
     evidence: dict[str, dict[str, str]] = {}
     bucket = _observed_bucket(verdict.get("observed_employee_count"))

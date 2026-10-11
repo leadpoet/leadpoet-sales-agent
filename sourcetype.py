@@ -1,16 +1,4 @@
-"""Loop s22: proof-source admissibility and press-release datelines, written from the judge's stated rules.
-
-1. The judge keeps an explicit proof-source qualifier of the ICP's intent signal (upstream 5fc93688, prompts/_common.py
-   PART A): when the signal asks for "a press release, product page, or company announcement", an independent article is
-   not one of those sources.  d19 (09-25 bank) ICP 008 asked for "a press release, investor post, or product update" and
-   Feldera's FinSMEs article came back contradicted: an unverified primary costs 10 raw points (-2 per ICP).
-2. A press release is dated by its body dateline ("San Francisco, CA - April 22, 2025 - ..."), not by page metadata.
-   d19 Deck: datePublished 2026-02-27 in the page head, dateline 2025-04-22 in the body -> outside the 365-day window,
-   contradicted, -2 per ICP.
-
-Only a KNOWN independent publisher is excluded: unknown hosts (a partner's page, an investor's post, a trade body) stay,
-because a wrong exclusion loses a company while a wrong inclusion costs the same penalty the s19 build already risked.
-"""
+"""Loop s22: proof-source admissibility and press-release datelines, written from the judge's stated rules."""
 
 from __future__ import annotations
 
@@ -178,6 +166,17 @@ _EVENT_WORDS = {"FUNDING": "raises funding round", "PRODUCT_LAUNCH": "launches",
                 "REGULATORY_CLEARANCE": "clearance approval", "LEADERSHIP_CHANGE": "appoints", "HIRING": "hiring"}
 
 
+_LISTING_PATH_RE = re.compile(r"/(?:category|categories|tag|tags|topic|topics|author|authors|archive|archives|page|"
+                              r"search|label|labels)(?:/|$)|^/?(?:[\w-]+/)?(?:news|blog|blogs|press|newsroom|"
+                              r"press-releases|media|insights|articles|updates|resources)/?$", re.I)
+
+
+def is_listing_url(url: Any) -> bool:
+    """A category, tag, author, archive or section-index page rather than one article: never an announcement."""
+
+    return bool(_LISTING_PATH_RE.search(urlsplit(str(url or "")).path or "/"))
+
+
 def first_party_row(tools: Any, name: str, domain: str, category: str, *, window_days: int,
                     category_pattern: Optional[str] = None) -> Optional[dict[str, Any]]:
     """One bounded search on the company's own domain plus the press wires for the same kind of event; the first row
@@ -192,7 +191,7 @@ def first_party_row(tools: Any, name: str, domain: str, category: str, *, window
     pattern = re.compile(category_pattern, re.I) if category_pattern else None
     for row in (data or {}).get("results") or []:
         url = str(row.get("url") or "")
-        if source_kind(url, domain, name) not in ("first_party", "wire"):
+        if source_kind(url, domain, name) not in ("first_party", "wire") or is_listing_url(url):
             continue
         text = f"{row.get('title') or ''} {row.get('text') or row.get('excerpt') or ''}"
         if key not in _name_key(text[:3000]):

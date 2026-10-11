@@ -1,20 +1,4 @@
-"""Loop 20260923T0503Z s10 "hiring": open ATS postings as the evidence for HIRING ICPs.
-
-Why:
-  * d7: the only hiring evidence the event lane found were job-board mirrors (jobs.a16z.com, revopscareers.com);
-    the judge rejected Moov's "Senior Software Engineer" as outside "platform, integration, or payments-operations
-    roles" and could not read a posting date from the mirror;
-  * the judge fetches single ATS postings through their own APIs (intent_verification_three_stage.py: Greenhouse
-    boards-api with first_published as the freshness anchor, Ashby, Workable, Workday) and binds the ATS tenant to
-    the company ("exact hiring employer binding");
-  * the free page fetch reads those board APIs (x5/x6): Greenhouse jobs with title and first_published, Ashby jobs
-    with title, publishedAt and jobUrl, Lever postings with text, createdAt and hostedUrl.
-
-For each in-ICP company (the roster), find its board (a link on its homepage or careers page, else the domain
-label as the board name), list the open postings, let one cheap model call pick at most one posting per company
-whose TITLE is inside the role categories the ICP's signal names, and hand the posting to scout as a candidate
-(url = the single-posting page, date = first publication).
-"""
+"""Loop 20260923T0503Z s10 "hiring": open ATS postings as the evidence for HIRING ICPs."""
 
 from __future__ import annotations
 
@@ -259,8 +243,7 @@ def rank_sources(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def ashby_listed(tools: Any, url: Any) -> Optional[bool]:
-    """Loop s22 (#6, upstream ab3a1e33): is this exact Ashby posting still on its board?  A fresh read of the board
-    API (the posting page is a JS shell); None when the read failed or the listing may be cut short.  Never raises."""
+    """Loop s22 (#6, upstream ab3a1e33): is this exact Ashby posting still on its board?"""
 
     try:
         match = _NATIVE_RES[1].fullmatch(str(url or "").strip())
@@ -289,7 +272,7 @@ def ashby_listed(tools: Any, url: Any) -> Optional[bool]:
 def recheck_ashby(rows: list[Mapping[str, Any]], tools: Any, *, deadline: float, clock: Any = None,
                   max_fetches: int = 6) -> list[Mapping[str, Any]]:
     """Loop s22 (#6): the rows whose Ashby intent posting left its board since research (upstream ab3a1e33 scores such
-    a posting a company-local zero, so its slot is worth a verified reserve row).  Bounded, free, never raises."""
+    a posting a company-local zero, so its slot is worth a verified reserve row)."""
 
     import time as _time
     clock = clock or _time.monotonic

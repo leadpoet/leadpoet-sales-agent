@@ -1,17 +1,4 @@
-"""Loop v5 "evidence precision": which stage / capability evidence goes out, and which rows ride along.
-
-Pure text work on pages the run already holds (tools.pages): nothing here calls a provider or fetches a page.
-scout.py and verify.py call each entry point behind a strategy.json knob (default below; 0 switches it off) and
-inside a guard that keeps the previous behaviour on any error.
-
-Why (published rounds 09-30 .. 10-03):
-  * a row without company_stage_evidence passed stage 1 time in 137 on Series A / B / C+ ICPs, with one entry 79%;
-  * the judge re-fetches the cited URL with a plain GET: the same release passed 93-97% from PR Newswire or
-    GlobeNewswire, 89% from the company's own announcement page and about 35% from Business Wire;
-  * a quote without the round label passed 7%, an adviser's deal page 1 time in 16;
-  * a returned row whose required attribute is not confirmed costs a third of a qualified company, but only on an
-    ICP where something qualifies -- elsewhere it is free.
-"""
+"""Loop v5 "evidence precision": which stage / capability evidence goes out, and which rows ride along."""
 
 from __future__ import annotations
 
@@ -39,9 +26,6 @@ def _knob(key: str, default: int, high: int = 1) -> int:
 
 STAGE_CACHE_SCAN = _knob("stage_cache_scan", 1)            # cached pages of the company are scanned for a stage sentence
 STAGE_EXTRA_SOURCES = _knob("stage_extra_sources", 2, 2)   # corroborating entries kept beside the best one
-# Loop s38 (arena-2026-10-07): 12 of our 87 ICP runs with companies got no judgment (others 8 of 261); on one ICP the
-# seven such runs carried 8.0 stage entries on average, the 35 judged runs 3.2.  Entries sent per company, best first.
-STAGE_EVIDENCE_KEEP = max(1, _knob("stage_evidence_keep", 3, 3))
 STAGE_HOST_ORDER = _knob("stage_host_order", 1)            # plain-GET-friendly hosts first, Business Wire last
 STAGE_GATE_AGREE = _knob("stage_gate_agree", 1)            # scout picks its proof quote with the emit gate
 STAGE_GATE_STRICT = _knob("stage_gate_strict", 1)          # 'secured-lending', advisers' deal pages, namesakes
@@ -56,6 +40,8 @@ INTENT_FIRST_PARTY = _knob("intent_first_party", 1)
 # 26 such rows).  On 10-06 the two such rows that reached the intent check both qualified, one of them ours.  The
 # swap to the company's own announcement stays; the withhold is off unless this is 1.
 INTENT_WITHHOLD = _knob("intent_withhold", 0)
+# Loop s38: runs with many stage entries went unjudged more often.  Entries sent per company, best first.
+STAGE_EVIDENCE_KEEP = max(1, _knob("stage_evidence_keep", 3, 3))
 
 SCAN_PAGES = 80
 SCAN_CHARS = 30000
@@ -85,11 +71,7 @@ _ADVISER_RE = re.compile(r"\b(?:advis(?:ed|es|ing)|advis[eo]rs?\s+(?:to|for|on)|
 
 
 def round_verb(sentence: str, at: int, window: int, pattern: "re.Pattern") -> bool:
-    """Is there a completion verb in the `window` characters before the round label at `at` that is the company's own?
-
-    Not a compound adjective ('AI secured-lending platform', 'closed-end fund'), not 'secured loan / debt / credit',
-    and not a verb standing before an advisory verb: in 'X announced that it advised Y on its Series A fundraise' the
-    round is the adviser's mandate, and such a quote passed the judge 1 time in 16."""
+    """Is there a completion verb in the `window` characters before the round label at `at` that is the company's own?"""
 
     start, reach = max(0, at - window), max(0, at - 240)
     floor = start
@@ -126,9 +108,7 @@ def _name_words(name: Any) -> list[str]:
 
 def page_binds(name: str, text: str, url: str = "", website: str = "") -> bool:
     """False when a third-party page can only be a namesake's: the company's name has several words, and the page
-    carries neither that name nor the label of the company's own domain.  Then a sentence matching the first word
-    alone ('<Word> secures $46M Series B financing' on the site of another company whose name starts with the same
-    word) binds nothing.  A one-word name, an unknown website and the company's own domain always bind."""
+    carries neither that name nor the label of the company's own domain."""
 
     words = _name_words(name)
     domain = sm.registrable_host(website) if website else ""
@@ -157,11 +137,11 @@ _CUT_RE = re.compile(r"\s[–—|]\s+|\s--\s+")
 
 
 def quote_rank(quote: str, stage: str) -> int:
-    """Smaller is better.  0: a past-tense body sentence in the judge's own first-pass form.  +1 for a headline (no
+    """Smaller is better. 0: a past-tense body sentence in the judge's own first-pass form. +1 for a headline (no
     closing period, or no past-tense completion verb), +1 for a page title with a site suffix ('... - Site Name':
     such quotes came back unavailable where a body sentence passed), +2 for a 58+ word run-on, +2 when the bundled
-    copy of the judge's quote check does not accept the sentence (venture stages only: that copy mis-scores
-    '(NYSE: X)' listing sentences)."""
+    copy of the judge's quote check does not accept the sentence (venture stages only: that copy mis-scores '(NYSE:
+    X)' listing sentences)."""
 
     want = sm.normalize_stage(stage)
     text = str(quote or "").rstrip()
@@ -181,8 +161,7 @@ def quote_rank(quote: str, stage: str) -> int:
 
 def emit_ok(quote: str, text: str, *, name: str, stage: str, url: str, website: str = "") -> str:
     """'' when verify.stage_evidence would emit this (url, quote), else why not: scout.stage_quote_ok plus the emit
-    loop's own rules (public URL, a listing only from the company's page or a wire, no prompt controls).  A proof
-    chosen with this function is never withheld later."""
+    loop's own rules (public URL, a listing only from the company's page or a wire, no prompt controls)."""
 
     try:
         url = sm.public_http_url(url)
@@ -205,9 +184,7 @@ _LEAD_TAIL = (r"(?:\s+(?:inc|corp|corporation|ltd|limited|plc|llc|group|holdings
 
 def led_label(sc: Any, name: str, sentence: str) -> str:
     """The round a sentence states with the company as its SUBJECT, or '': the first label within 80 characters after
-    '<Company>[ Inc.][ (...)][, appositive,] [has / today announced it has ...] <completion verb>'.  In the run-on
-    text of a scraped page '<Company> Industry: ... Related deals <Other> closed a Series A' names the company before
-    the label too; there the verb belongs to someone else and this returns ''."""
+    '<Company>[ Inc.][ (...)][, appositive,] [has / today announced it has ...] <completion verb>'."""
 
     source = sc._name_source(name)
     if not source:
@@ -224,11 +201,7 @@ def led_label(sc: Any, name: str, sentence: str) -> str:
 
 
 def _pieces(sc: Any, body: str, name: str, probe: "re.Pattern", venture: bool) -> Iterable[tuple[str, bool]]:
-    """(sentence, cut) for the page's sentences.  A scraped page has no line breaks, so menus, a headline and a
-    dateline run into the lead sentence -- the very one that states the round or the listing -- and push it past the
-    selectors' 60 words or put page chrome into it.  Such a sentence yields, for each stage wording in it, the
-    verbatim stretch from the company's last mention before that wording to the end of the sentence (60 words at
-    most; a venture round's stretch ends before the next mention of the company, where the next statement starts)."""
+    """(sentence, cut) for the page's sentences."""
 
     source = sc._name_source(name)
     for sentence in sc.split_sentences(body):
@@ -263,9 +236,8 @@ def _pieces(sc: Any, body: str, name: str, probe: "re.Pattern", venture: bool) -
 def stage_quotes(text: str, name: str, stage: str, url: str, website: str = "", limit: int = 3,
                  subject: bool = False) -> list[str]:
     """The sentences of one page that the emit gate accepts for the ICP stage, best first: affirmed rounds for a
-    venture stage, the company-bound exchange:ticker sentence for Public, the PE-control sentence for Private Equity.
-    With `subject` (the cached-page scan, which reads every page naming the company) a venture sentence must also
-    have the company as the subject of the round, as its named target or, on its own domain, as 'our Series B'."""
+    venture stage, the company-bound exchange:ticker sentence for Public, the PE-control sentence for Private
+    Equity."""
 
     sc = _sibling("scout")
     want = sm.normalize_stage(stage)
@@ -303,11 +275,7 @@ def stage_quotes(text: str, name: str, stage: str, url: str, website: str = "", 
 
 
 def tighten(quote: str, text: str, *, name: str, stage: str, url: str, website: str = "") -> str:
-    """The accepted sentence without what the page glued in front of it.  A scraped page has no line breaks, so
-    navigation words, a headline or a dateline run into the lead sentence ('Ok, Thanks Seed Round <Company> Raises
-    ... <Company>, a ..., has raised $4.5 million in Seed funding').  The cut starts at a mention of the company or
-    after a dateline dash -- the latest one that the emit gate still accepts -- and is verbatim page text; a lead of
-    three words or fewer ('This article covers <Company> ...') is the sentence's own opening and stays."""
+    """The accepted sentence without what the page glued in front of it."""
 
     source = _sibling("scout")._name_source(name)
     cuts = {m.end() for m in _CUT_RE.finditer(quote)}
@@ -328,8 +296,7 @@ def emit_quote(text: str, name: str, stage: str, url: str, website: str = "") ->
 
 
 def names_stage(quote: Any, stage: str) -> bool:
-    """A quote naming a round the ICP stage accepts.  The older test looked for the normalised stage as a substring,
-    'series c' for 'Series C+', so a Series D-H quote was never offered to the gate."""
+    """A quote naming a round the ICP stage accepts."""
 
     sc = _sibling("scout")
     want = sm.normalize_stage(stage)
@@ -340,8 +307,7 @@ def names_stage(quote: Any, stage: str) -> bool:
 
 def direct_state(tools: Any, url: str, check: bool = False) -> Optional[bool]:
     """tools.direct_ok(url) when the tools object has it: True a direct plain GET returned the page, False it was
-    tried and failed, None unknown (also for a missing method or any error).  With `check` an unknown URL is tried
-    once through tools.direct_check (a free GET, no provider call)."""
+    tried and failed, None unknown (also for a missing method or any error)."""
 
     probe = getattr(tools, "direct_check" if check else "direct_ok", None)
     if not callable(probe):
@@ -354,11 +320,7 @@ def direct_state(tools: Any, url: str, check: bool = False) -> Optional[bool]:
 
 
 def evidence_key(tools: Any, url: str, quote: str, stage: str, website: str = "", check: bool = False) -> tuple[int, int, int]:
-    """Sort key of one accepted stage-evidence entry, smaller is better.  The HOST CLASS leads (first-entry stage
-    pass over all published rounds: PR Newswire / GlobeNewswire 97%, the company's own page 86-89% whether or not a
-    plain GET reads it, other hosts 80% when a plain GET reads them and 65% when not, deal listings and Business Wire
-    last); the direct-read state only orders pages inside the 'other' class and demotes a wire page that failed.
-    Then the quote (a judge-form body sentence before a headline or a page title)."""
+    """Sort key of one accepted stage-evidence entry, smaller is better."""
 
     domain = sm.registrable_host(website) if website else ""
     rank = int(_sibling("sourcetype").stage_host_rank(url, domain))
@@ -380,7 +342,7 @@ def order_evidence(items: list[tuple[str, str]], *, tools: Any, stage: str, webs
                    check: bool = False) -> list[tuple[str, str]]:
     """Accepted (url, quote) entries, one per URL (its best quote) and one URL per site for the same quote text (a
     banner sentence on three pages of one site is one piece of evidence, not three; a release on a wire and on the
-    company's newsroom is two), best source first; ties keep the given order.  `check` (the final ordering only) lets up to DIRECT_CHECKS unknown URLs be tried by a free GET."""
+    company's newsroom is two), best source first; ties keep the given order."""
 
     best: dict[str, tuple[tuple[int, int, int], int, str]] = {}
     checks = DIRECT_CHECKS if check and STAGE_DIRECT_CHECK else 0
@@ -483,9 +445,7 @@ def later_round(text: str, name: str, want: str, url: str, website: str = "") ->
 
 def cache_scan(tools: Any, *, name: str, stage: str, website: str = "", urls: Iterable[Any] = ()) -> dict[str, Any]:
     """{'entries': [(url, quote)], 'later': label}: for each cached page of this company the best sentence the emit
-    gate accepts for the ICP stage, best source first.  When one of those pages affirms a LATER round for the company
-    nothing is offered ('later' names it): a Seed / A / B sentence beside a later round is a stale stage.  A page
-    that itself leads with a later round (scout.later_round_on_page) is never quoted."""
+    gate accepts for the ICP stage, best source first."""
 
     sc = _sibling("scout")
     want = sm.normalize_stage(stage)
@@ -541,8 +501,7 @@ def _names_this_company(tools: Any, url: str, text: str, domain: str, name: str)
 
 def _funding_page(sc: Any, url: str, text: str, name: str, stage: str) -> bool:
     """A page ABOUT the round: its URL slug or its opening names a round the ICP stage accepts, or its slug is a
-    '<Company> raises ...' headline.  Only such a page's date is the round's date; an About paragraph on a fresh
-    product release is not."""
+    '<Company> raises ...' headline."""
 
     try:
         path = unquote(urlsplit(str(url)).path)
@@ -554,10 +513,7 @@ def _funding_page(sc: Any, url: str, text: str, name: str, stage: str) -> bool:
 def cache_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Mapping[str, Any],
                 urls: Iterable[Any] = ()) -> Optional[dict[str, Any]]:
     """A stage proof read from pages already in the cache, before any stage search is paid: {'url', 'quote', 'extras',
-    'date'}; {'later': ...} when the cache affirms a later round or an ownership change; None when it says nothing.
-    'date' is set only for a page about the round itself (_funding_page): the caller reads it as the round's date
-    (fresh round -> no stage search; the current-stage search skips older results), and the first date on any other
-    page is not that."""
+    'date'}; {'later': ...} when the cache affirms a later round or an ownership change; None when it says nothing."""
 
     stage = str(icp.get("company_stage") or "")
     website = str(prof.get("website") or prof.get("domain") or "")
@@ -589,10 +545,7 @@ _BANNER_RE = re.compile(r"\b(?:we|this (?:web)?site|our (?:web)?site)\s+(?:use|u
 
 
 def consent_text(sentence: Any, icp_text: Any = "") -> bool:
-    """Cookie, consent, tracking or privacy-banner wording: page chrome, never a statement of what the company sells.
-    (Our rows quoted 'these cookies support core functionalities ...' as the required attribute; the judge confirmed
-    the attribute for none of them.)  A phrase whose own words are in the ICP's offering text is not chrome: a
-    consent-management or advertising ICP keeps its vocabulary."""
+    """Cookie, consent, tracking or privacy-banner wording: page chrome, never a statement of what the company sells."""
 
     focus = str(icp_text or "").casefold()
     if _CONSENT_DOMAIN_RE.search(focus) and not _BANNER_RE.search(str(sentence or "")):
@@ -619,8 +572,7 @@ _LATER_RE = re.compile(r"\b(?:or|and)\s+(?:later|above|beyond|higher|subsequent)
 
 def funding_label_ok(signal: Any, event_text: Any) -> bool:
     """A FUNDING criterion that names a round ('Announced a Series A funding round ...') is shown only by an event
-    text naming that round; 'or later' admits every later one.  A criterion naming no round accepts any funding event
-    (10-03: '... secured 2.5m in funding from <investor>' went out for a Series A criterion and failed 16 times)."""
+    text naming that round; 'or later' admits every later one."""
 
     sc = _sibling("scout")
 
@@ -636,9 +588,7 @@ def funding_label_ok(signal: Any, event_text: Any) -> bool:
 
 
 def _signal_round(row: Mapping[str, Any], stage: str) -> bool:
-    """The row's own intent signal (its description or URL slug) names a round the ICP stage accepts.  The judge reads
-    that page anyway: such rows passed stage without any stage evidence 52 times of 57 over the published rounds (rows
-    whose signal is silent: 20 of 352), and two of them were qualifiers of ours."""
+    """The row's own intent signal (its description or URL slug) names a round the ICP stage accepts."""
 
     try:
         return names_stage(" ".join(f"{s.get('description') or ''} " + re.sub(r"[-_/]+", " ", str(s.get("url") or ""))
@@ -648,14 +598,7 @@ def _signal_round(row: Mapping[str, Any], stage: str) -> bool:
 
 
 def companion_drop(rows: list[Any], icp: Mapping[str, Any]) -> tuple[list[Any], list[tuple[Any, str]]]:
-    """(rows kept, [(row dropped, reason)]) at final selection.
-
-    Only when the ICP has a STRONG row -- capability proven on the company's own domain and, on a Series A / B / C+
-    ICP, stage evidence attached -- a companion whose capability is unproven goes, and on those three stage classes
-    one whose stage is unproven too, unless its own intent signal names the round (_signal_round).  A Seed, Public
-    or Private Equity row is never dropped for missing stage evidence alone, a strong row is never dropped, and
-    without a strong row every row stays: there the floor of the
-    ICP score is zero and such rows cost nothing."""
+    """(rows kept, [(row dropped, reason)]) at final selection."""
 
     want = sm.normalize_stage(icp.get("company_stage"))
     gated = want in _GATED_STAGES
@@ -686,89 +629,54 @@ def companion_drop(rows: list[Any], icp: Mapping[str, Any]) -> tuple[list[Any], 
     return (kept, dropped) if kept else (rows, [])
 
 
-EVENT_GATE = _knob("event_gate", 1)
-_EV_ASK = re.compile(r"\bchanges? at the (?:very )?top\b|\b(?:c suite|c level|ceo|chief executive) (?:change|transition|appointment|succession)")
-_EV_TOP = re.compile(r"\bchief \w|\bc[efotrmipsd]o\b|\bciso\b|(?<!vice )\bpresident\b|\bchair")
-_EV_WEAK = re.compile(
-    r"(?P<results>\bfinancial results\b|\b(?:quarter|quarterly|year|annual) (?:\w+ ){0,3}?results\b|\bearnings\b)|"
-    r"(?P<board>\bboard appointments?\b|\b(?:appoint\w*|elect(?:s|ed)|nam(?:es|ed)|adds?|added|nominat\w+|welcom\w+) "
-    r"(?:(?!report|present|accord|respon|answer)\w+ ){0,8}?to (?:its|the|their|our) (?:\w+ )?board\b|"
-    r"\bjoins? (?:\w+ ){0,3}board\b|\b(?:new|as|as a) board members?\b|"
-    r"\badvisory (?:board|council)\b|\bboard of advisors\b|\b(?:non executive|independent) directors?\b)|"
-    r"(?P<regional>\b(?:general manager|managing director|vice president|[se]?vp|head|gm) (?:(?:of|for|and|the|sales|north|south|east|west) ){0,4}"
-    r"(?:asia|apac|apj|emea|latam|latin america|middle east|africa|europe|americas|anz|india|japan|china|uk)\b|"
-    r"\bregional (?:\w+ ){0,2}?(?:sales|head|director|manager|lead|leader|officer)\b|\bcountry (?:manager|head|lead|director)\b)")
-_EV_OTHER = re.compile(r"((?:\w+ ){1,4}?)(?:adds|appoints|names|elects|hires|taps|welcomes|nominates) (.+)")
+_SCREENED_STAGES = _GATED_STAGES + ("private equity",)
 
 
-def _ev_norm(value):
-    return re.sub("[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+def _primary(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    signals = [x for x in row.get("intent_signals") or [] if isinstance(x, Mapping)]
+    return min(signals, key=lambda x: x.get("matched_icp_signal") or 0) if signals else None
 
 
-def event_gate(icp, row):
-    """'' or why no primary signal of the row is a change at the top.  Runs only where a LEADERSHIP_CHANGE ICP's
-    required_attribute asks for one (10-05: attribute confirmed for 10 of 63 flagged rows, 160 of 177 others).  Positive
-    patterns only: a board seat, a regional role or a results release with no chief / president / chair title beside
-    it, or another organisation's headline that merely mentions the company."""
-
-    if str(icp.get("intent_category")).upper() != "LEADERSHIP_CHANGE" or not _EV_ASK.search(_ev_norm(icp.get("required_attribute"))):
-        return ""
-    ids = [i for i in (re.sub("^the ", "", _ev_norm(row.get("company_name"))).split(" ")[0],
-                       _ev_norm(_sibling("identity")._reg(row.get("company_website")).split(".")[0]).replace(" ", "")) if len(i) > 1]
-    why = ""
-    for sig in row.get("intent_signals") or []:
-        if sig.get("matched_icp_signal"):
-            continue
-        parts = [_ev_norm(sig.get("description"))] + [_ev_norm(p) for p in unquote(urlsplit(str(sig.get("url"))).path).split("/")]
-        text = " / ".join(parts)
-        weak = not _EV_TOP.search(text) and _EV_WEAK.search(text)
-        why = "event: " + weak.lastgroup if weak else ""
-        for m in filter(None, map(_EV_OTHER.match, () if why else parts)):     # "<other> adds <company> CFO ... to its board"
-            lead, rest = m.group(1).replace(" ", ""), m.group(2).replace(" ", "")
-            if "board" not in lead and not any(i in lead or lead in i for i in ids) and any(i in rest for i in ids):
-                why = "event: another organisation's release"
-        if not why:
-            return ""
-    return why
+_LI_POST_RE = re.compile(r"/(?:posts|feed|pulse)/|/activity", re.I)
 
 
-def event_select(rows, icp, tools, report):
-    """After companion_drop.  Flagged: event_gate, or a company_name that is neither a name of the homepage this run read
-    (a real page, not a wall) nor anywhere in its source; an unread homepage never flags.  Beside an unflagged strong row
-    flagged rows go to report.companions; without one they stay, ranked last."""
+def li_post(row: Mapping[str, Any]) -> bool:
+    """The primary signal page is a LinkedIn post: 0 of 31 such rows qualified on 10-07/10-09."""
 
-    if not EVENT_GATE or len(rows) < 2:
-        return rows
     try:
-        homes, keep, gone = list((tools.__dict__.get("_s22_probe") or {}).values()), [], []
-        for row in rows:
-            why = event_gate(icp, row)
-            key, site = sm.company_name_key(row.get("company_name")), sm.registrable_host(str(row.get("company_website")))
-            html = "" if why else next((str(g.get("html"))[:2000000] for g in homes
-                                        if (g.get("status") or 500) < 400 and _own(g.get("final_url"), site)), "")
-            if key and html and key not in _ev_norm(re.sub(r"&#?\w+;", " ", html)).replace(" ", "") and \
-                    key not in map(sm.company_name_key, _sibling("identity").parse_home(html)["names"] or [key]):
-                wf = _sibling("webfetch")
-                if not wf.wall("", *wf.visible_text(html, 4000)[:2]):
-                    why = "company_name not on the homepage read"
-            (gone if why else keep).append((row, why))
-        if not gone:
-            return rows
-        gated, needs = sm.normalize_stage(icp.get("company_stage")) in _GATED_STAGES, bool(str(icp.get("required_attribute") or "").strip())
-        if not ((needs or gated) and any((not needs or (r.get("_capability") and r.get("_cap_own"))) and
-                                         (not gated or r.get("company_stage_evidence")) for r, _ in keep)):
-            return [r for r, _ in keep + gone]
-        report.companions.extend({k: v for k, v in r.items() if not k.startswith("_")} for r, _ in gone)
-        report.dropped_companies.extend((str(r.get("company_name")), f"companion drop ({why} beside a strong row)") for r, why in gone)
-        return [r for r, _ in keep]
-    except Exception:
-        return rows
+        parts = urlsplit(str((_primary(row) or {}).get("url") or "").strip())
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    return (host == "linkedin.com" or host.endswith(".linkedin.com")) and bool(_LI_POST_RE.search(parts.path))
+
+
+def stage_screen(rows: list[Any], icp: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
+    """(rows kept, rows set aside).  Any ICP: a LinkedIn-post row goes unless it is the only row left.  Series A/B/C+
+    and PE ICPs: an unevidenced row goes beside an evidenced one."""
+
+    posts = [li_post(row) for row in rows]
+    gone: list[Any] = []
+    if len(rows) > 1 and any(posts):
+        stay = [r for r, p in zip(rows, posts) if not p] or rows[:1]
+        gone = [r for r in rows if not any(r is s for s in stay)]
+        rows = stay
+    stage = str(icp.get("company_stage") or "")
+    if sm.normalize_stage(stage) not in _SCREENED_STAGES:
+        return rows, gone
+
+    def proven_row(row: Mapping[str, Any]) -> bool:
+        primary = _primary(row)
+        return bool(row.get("company_stage_evidence")) or bool(primary and _signal_round({"intent_signals": [primary]}, stage))
+
+    proven = [proven_row(row) for row in rows]
+    if not any(proven) or all(proven):
+        return rows, gone
+    return [r for r, ok in zip(rows, proven) if ok], gone + [r for r, ok in zip(rows, proven) if not ok]
 
 
 def resolve_full(drafts: list[Any], limit: int) -> bool:
-    """The resolve loop's 'enough drafts' stop.  Stage-unproven drafts no longer count toward it, so a producing ICP
-    keeps resolving candidates for its open slots (the loop's call reserve still ends it).  A ceiling on all drafts
-    bounds the verify phase: limit + 5, and limit + 12 once two drafts are proven."""
+    """The resolve loop's 'enough drafts' stop."""
 
     if len(drafts) < limit:
         return False
@@ -779,4 +687,4 @@ def resolve_full(drafts: list[Any], limit: int) -> bool:
 __all__ = ["round_verb", "page_binds", "deal_page_refused", "quote_rank", "emit_ok", "led_label",
            "stage_quotes", "tighten", "emit_quote", "names_stage", "direct_state", "evidence_key", "order_evidence", "same_site_quote", "rank_claims", "company_pages",
            "later_round", "cache_scan", "cache_proof", "consent_text", "capability_state",
-           "funding_label_ok", "companion_drop", "resolve_full"]
+           "funding_label_ok", "companion_drop", "li_post", "stage_screen", "resolve_full"]

@@ -1,28 +1,4 @@
-"""Post-LLM verification and repair, applying the scorer's own rules first.
-
-The Arena scorer rejects evidence on deterministic grounds before any LLM
-judge runs (LAB-LOG #191 §scorer).  Every one of those grounds is cheap to
-check locally, and most can be REPAIRED from the page text we already hold:
-
-  * snippet must share >=30% of its 4-grams with the fetched page  -> re-cut a
-    verbatim window from the page around the signal words
-  * description must be >=25% grounded and its signal words must appear on the
-    page                                                          -> rebuild
-    from the verbatim window when it is not
-  * company name must appear in the page (news/company sources)   -> drop
-  * date must parse, not be future, and sit inside the buyer cap  -> drop
-  * URL must be structurally valid, on a trusted TLD, and unique per company
-    by domain                                                      -> drop
-  * employee bucket must be one of the ICP's exact LinkedIn buckets, country
-    must resolve to the ICP's, stage must match when the ICP pins one
-                                                                   -> drop
-  * required_attribute claim must exist, pass, and quote its evidence page
-                                                                   -> repair/drop
-
-A dropped signal costs nothing; a dropped company frees a slot.  A company that
-reaches the scorer with a fabricated snippet costs -10 points on the ICP, so
-the bias here is toward cutting.
-"""
+"""Post-LLM verification and repair, applying the scorer's own rules first."""
 
 from __future__ import annotations
 
@@ -75,23 +51,7 @@ class Report:
                 "companions_dropped": [c.get("company_name") for c in self.companions]}
 
     def counts(self) -> dict[str, Any]:
-        """Bounded, reconcilable counters for stderr (LAB-LOG #248).
-
-        Three histograms, deliberately kept apart so the numbers add up:
-
-        * ``company_drops`` -- MUTUALLY EXCLUSIVE. ``verify_signal`` returns at
-          the first failure, so exactly one code per dropped company and
-          ``sum(company_drops) == verify_in - verify_out``.
-        * ``signal_drops`` -- NOT exclusive. A company can lose several signals
-          and still be emitted, so these never reconcile against the company
-          count and must not be read as company losses.
-        * ``repairs`` -- NOT exclusive either; several can fire on one company.
-          A repair is a company we SAVED, never one we lost.
-
-        Reasons are interpolated free text, so they are folded to stable codes
-        here rather than emitted raw: raw text would leak company names and
-        URLs into stderr and would not aggregate across runs.
-        """
+        """Bounded, reconcilable counters for stderr (LAB-LOG #248)."""
 
         return {"company_drops": _histogram(_company_drop_code, (r for _n, r in self.dropped_companies)),
                 "signal_drops": _histogram(_signal_drop_code, (r for _n, _u, r in self.dropped_signals)),
@@ -256,10 +216,7 @@ def judge_dates(text: str) -> set[date]:
 
 
 def date_visible(value: Any, text: str, limit: int = 6000) -> bool:
-    """Loop s16: does the page show this date where the judge's paragraph reviewer can see it?  The reviewer gets
-    the verified quotes and the first ~6,000 bytes of each cited page; a date it cannot see there is 'invented
-    recency' and zeroes the company (d13 Elorian AI: finsmes page, no date in content, paragraph said 'dated').
-    s32 C5: "can see" = one of the judge's own deterministic date forms (judge_dates)."""
+    """Loop s16: does the page show this date where the judge's paragraph reviewer can see it?"""
 
     try:
         day = date.fromisoformat(str(value or "")[:10])
@@ -294,14 +251,7 @@ _CURRENT_STATE_RE = re.compile(
 
 
 def integrity_policy(icp: Mapping[str, Any]) -> bool:
-    """Is this round judged under arena_integrity_v1?
-
-    LAB-LOG #314 §4.  The ICP the sandbox receives carries only
-    ``output_schema_version`` (lab_arena/runner.py:2461-2468), never the policy
-    markers, and every v5 round since 09-16 has run under arena_integrity_v1
-    (#295; the public round view pins the two together).  An explicit marker,
-    should one ever arrive, wins either way.
-    """
+    """Is this round judged under arena_integrity_v1?"""
 
     marker = str(icp.get("integrity_policy") or "").strip()
     if marker:
@@ -310,13 +260,7 @@ def integrity_policy(icp: Mapping[str, Any]) -> bool:
 
 
 def current_state_claim(spec: Mapping[str, Any]) -> bool:
-    """A claim about a CURRENT state (active hiring) rather than a dated event.
-
-    The integrity judge's own rule (qualification/scoring/prompts/_common.py):
-    for active-hiring claims a visible posting age over six months contradicts,
-    and "if no posting age is visible on the page, do NOT penalize on staleness;
-    judge content only".  Nothing else is exempt from carrying a date.
-    """
+    """A claim about a CURRENT state (active hiring) rather than a dated event."""
 
     category = str(spec.get("category") or "").strip().upper()
     if category in {"HIRING", "JOBS"}:
@@ -341,46 +285,7 @@ def _is_primary(signal: Mapping[str, Any]) -> bool:
 
 
 def order_candidates(candidates: list[Mapping[str, Any]], *, website: str) -> tuple[list[Mapping[str, Any]], str]:
-    """Source-weight order, with ONE narrow exception for the primary signal.
-
-    ``candidates`` arrives sorted by SOURCE_MULTIPLIERS, highest first, which is
-    what we want: with only three output slots (SIGNAL_OUTPUT_CAP) the heaviest
-    evidence should be the evidence that survives.
-
-    But the primary is not just another signal.  ``verify_company`` DROPS the
-    whole company when no index-0 signal verifies, because
-    ``count_penalizable_false_positives`` scores an unverified primary as
-    ``fp_unverified_primary`` = -10 (qualification/scoring/lead_scorer.py:2884-2894,
-    consumed at qualification/scoring/competition.py:455-456).  So a primary that
-    never gets TRIED is not a lost bonus, it is a lost company.
-
-    ⚠️ NARROWED on purpose.  Hoisting the primary unconditionally costs real
-    source weight on any company with more than three candidates -- it pushes a
-    1.0 job_board/github/linkedin signal out of the payload for a 0.85
-    company_website one that would have been reached anyway.  So the hoist fires
-    only in the two situations where staying put actually costs the primary its
-    turn:
-
-      1. the three-signal OUTPUT CAP would cut it -- at least SIGNAL_OUTPUT_CAP
-         distinct evidence domains sit ahead of it, so the loop can fill up and
-         ``break`` before it is reached;
-      2. a SAME-DOMAIN COLLISION -- a higher-weight candidate ahead of it claims
-         the same registrable domain, and ``verify_signal`` drops the second one
-         as "duplicate evidence domain on this company".
-
-    In every other case the order is returned untouched.
-
-    🔹 SAFETY PROPERTY, and it is the whole reason this is only a reordering:
-    this function never adds, removes, edits or approves anything.  It returns a
-    PERMUTATION of its input, and every element still has to pass the full
-    ``verify_signal`` gauntlet afterwards.  It therefore CANNOT retain a signal
-    the three-stage verifier would have dropped -- a hoisted primary that fails
-    verification is dropped exactly as before, and the company goes with it
-    (keeping a bad index-0 signal is worth -10, not 0).  Pinned by
-    ``test_signal_order.py``.
-
-    Returns ``(ordered, reason)``; ``reason`` is "" when nothing moved.
-    """
+    """Source-weight order, with ONE narrow exception for the primary signal."""
 
     ordered = list(candidates)
     primary_at = next((i for i, sg in enumerate(ordered) if _is_primary(sg)), None)
@@ -474,11 +379,7 @@ def funding_announcements(raw: Mapping[str, Any], candidates: list[Mapping[str, 
 def select_signals(raw: Mapping[str, Any], candidates: list[Mapping[str, Any]], *, icp: Mapping[str, Any],
                    tools: ArenaTools, today: date, report: Report,
                    signals_spec: list[dict[str, Any]], buyer_cap: int) -> list[dict[str, Any]]:
-    """Maximize verified criterion coverage, then prefer complete funding announcements.
-
-    Verify alternatives with private domain sets; assemble only combinations respecting
-    the same dedup key and output cap. Non-funding/no-announcement behavior is unchanged.
-    """
+    """Maximize verified criterion coverage, then prefer complete funding announcements."""
     company = {k: raw.get(k) for k in ("company_name", "company_website")}
     kwargs = dict(company=company, icp=icp, tools=tools, today=today, report=report,
                   signals_spec=signals_spec, buyer_cap=buyer_cap)
@@ -524,13 +425,7 @@ def select_signals(raw: Mapping[str, Any], candidates: list[Mapping[str, Any]], 
 
 
 def company_named(name: str, website: str, text: str) -> bool:
-    """Is this company identifiable on the page -- by name OR by its own domain?
-
-    LAB-LOG #306: upstream e3cfe55c accepts a company whose page shows a different
-    name when the domain binds, and the judge's page check is an LLM reading, not
-    an exact-string match.  Requiring the exact submitted name here (the #305
-    finding) was stricter than the platform on the very gate it relaxed.
-    """
+    """Is this company identifiable on the page -- by name OR by its own domain?"""
 
     if sm.company_in_content(name, text):
         return True
@@ -711,16 +606,7 @@ def _paragraph_quote(record: Mapping[str, Any]) -> str:
 
 def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: ArenaTools,
                    signals: list[dict[str, Any]], report: Report, website: str = "") -> list[dict[str, Any]]:
-    """Up to three {url, quote} passages the investigator may use for stage (v5).
-
-    Bounded and grounded: a passage is emitted only when its quote is verbatim
-    page text we fetched.  Nothing here asserts a stage -- it hands the judge's
-    bounded investigator (#304) the page it would otherwise have to find itself.
-
-    Loop s22 (teardown-0925 #5b): no best_window re-cut any more; an item goes out only when scout.stage_quote_ok
-    passes (verbatim, first-party or news host, names the company, proves the stage), else [] -- what the 09-25
-    winner sent on 9/9 rows (stage passed 9/9); the judge then reads our intent URLs first.
-    """
+    """Up to three {url, quote} passages the investigator may use for stage (v5)."""
 
     try:
         from . import scout as _scout
@@ -1098,12 +984,7 @@ def announced_schema(icp: Mapping[str, Any]) -> str:
 
 def drop_companions(kept: list[dict[str, Any]], icp: Mapping[str, Any], report: Report) -> list[dict[str, Any]]:
     """Loop v5 (companion_drop): final selection on an ICP that has a STRONG row (capability proven on the company's
-    own domain and, on a Series A / B / C+ ICP, stage evidence attached).  There a row that fails the judge's
-    required-attribute check costs a third of a qualified company, so a capability-unproven companion goes, and on
-    those three stage classes a stage-unproven one too (such rows passed stage 1 time in 137).  Seed and Public rows
-    are never dropped for missing stage evidence alone; without a strong row nothing changes (the ICP's floor is 0,
-    the rows are free).  Every drop is logged in report.dropped_companies and kept in report.companions; a dropped
-    row never enters the surplus, which the harness uses to refill slots."""
+    own domain and, on a Series A / B / C+ ICP, stage evidence attached)."""
 
     if not getattr(px, "COMPANION_DROP", 0) or len(kept) < 2:
         return kept
@@ -1118,6 +999,22 @@ def drop_companions(kept: list[dict[str, Any]], icp: Mapping[str, Any], report: 
         report.dropped_companies.append((str(company.get("company_name") or "?"), reason))
         report.companions.append({k: v for k, v in company.items() if not k.startswith("_")})
     return list(stay)
+
+
+def screen_stage(kept: list[dict[str, Any]], icp: Mapping[str, Any], report: Report) -> list[dict[str, Any]]:
+    """precision.stage_screen: a row set aside goes to report.companions (never the surplus) and is logged."""
+
+    try:
+        stay, gone = px.stage_screen(kept, icp)
+    except Exception as exc:
+        report.repaired.append(("*", f"stage screen skipped ({type(exc).__name__})"))
+        return kept
+    for company in gone:
+        why = "LinkedIn post as the primary signal beside another row" if px.li_post(company) else \
+            "stage unproven beside a stage-evidenced row"
+        report.dropped_companies.append((str(company.get("company_name") or "?"), why))
+        report.companions.append({k: v for k, v in company.items() if not k.startswith("_")})
+    return list(stay) if stay else kept
 
 
 def verify_companies(drafts: list[Mapping[str, Any]], *, icp: Mapping[str, Any], tools: ArenaTools,
@@ -1147,7 +1044,7 @@ def verify_companies(drafts: list[Mapping[str, Any]], *, icp: Mapping[str, Any],
                              -(bool(c.get("_capability")) + bool(c.get("company_stage_evidence"))),
                              c.setdefault("_weak", _weak_source(c, icp)), -c["_estimate"]))
     kept = drop_companions(kept, icp, report)
-    kept = px.event_select(kept, icp, tools, report) if px else kept
+    kept = screen_stage(kept, icp, report)
     final: list[dict[str, Any]] = []
     consumed = 0
     for company in kept:

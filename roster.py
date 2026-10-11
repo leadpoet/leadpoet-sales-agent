@@ -1,17 +1,4 @@
-"""Loop 20260923T0503Z s8 "roster": company-first discovery beside scout's event-first search.
-
-Why (d7: s7 on the 09-23 ICPs under the company-only judge, upstream 52562079):
-  * event-first search returned companies on 4 of 10 ICPs; the others found no in-bucket subject of an event;
-  * the platform's contextdev_post_news_search is a per-COMPANY lookup (x3): one domain's dated primary stories
-    (title, excerpt, url, published_at) at $0 -- e.g. Moov's Business Wire launch dated the day before the round;
-  * every ICP names one excluded company, the exemplar the ICP was written from (atturra.com for the Sydney
-    consulting ICP, finexio.com for the payments one), so its peers are the pool to search.
-
-Roster asks one strong model for up to ROSTER_SIZE real companies inside the ICP's hard buckets (the exemplar's
-peers first), reads each company's dated news for free, keeps the in-window primary stories whose headline or
-excerpt carries the ICP's intent category, lets one cheap model call confirm which story reports the company's
-own qualifying event, and hands those companies to scout's resolve -> fits -> stage -> draft path.
-"""
+"""Loop 20260923T0503Z s8 "roster": company-first discovery beside scout's event-first search."""
 
 from __future__ import annotations
 
@@ -203,10 +190,7 @@ def short_feed(stories: list[Mapping[str, Any]], window: int, *, age_days) -> bo
 def searched_rows(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, Any]], news: Mapping[str, list[dict[str, Any]]],
                   rows: list[dict[str, Any]], category: str, *, age_days, deadline: float, clock,
                   tried: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    """Story rows from one Exa event search per short-feed company, in roster order, capped at EVENT_COMPANIES.
-
-    Loop s27 (d25): a feed row that only matched the category words ('CrowdStrike Named a Leader in ...') no longer
-    exempts a company -- CrowdStrike, Fortinet and N-able were never searched although their releases qualified."""
+    """Story rows from one Exa event search per short-feed company, in roster order, capped at EVENT_COMPANIES."""
 
     if not EVENT_SEARCH or category not in CATEGORY_WORDS or category == "HIRING":
         return []

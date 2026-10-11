@@ -1,21 +1,4 @@
-"""Deepline-only sourcing tools over the Arena worker socket.
-
-Miner-funded runs hold two credentials: OpenRouter and Deepline
-(lab_arena/credentials.py RUNTIME_PROVIDERS).  The public baseline routes
-search_web and fetch_page through api.scrapingdog.com, which a miner run
-cannot use -- so here every tool is a Deepline integration:
-
-  search_companies     hunter_discover
-  get_company_profile  free_simple_company_search
-  get_company_events   predictleads_company_{job_openings,financing_events,news_events}
-  search_web           exa_search  (with text, so results already carry page text)
-  fetch_page           exa_contents, then contextdev_get_web_scrape_markdown
-                       (free, fixed price), then firecrawl_scrape as last resort
-
-Every page fetched is cached by URL so the verification pass never spends a
-second call on the same evidence, and a hard call budget keeps the run under
-the Arena's 30-call Deepline quota per ICP.
-"""
+"""Deepline-only sourcing tools over the Arena worker socket."""
 
 from __future__ import annotations
 
@@ -178,19 +161,7 @@ _HUNTER_HEADCOUNT = {
 
 
 class BudgetExhausted(RuntimeError):
-    """A refused call.  ``calls_left`` is what the model should be told remains.
-
-    The TIME deadline and the CALL ceiling are two separate budgets, and only
-    the call ceiling is what ``ArenaTools.remaining()`` counts.  When the
-    deadline trips, remaining() still reports whatever the call budget had
-    left, so the model was handed {"error": "time budget exhausted",
-    "calls_left": 19} and read it, correctly, as a contradiction -- ICP 016,
-    in its own words: "the tool's message is a bit strange since it says there
-    are still 19 calls left but is marked as exhausted" (LAB-LOG #283).
-    No later call can succeed once the deadline has passed, so the deadline
-    raise carries an explicit 0 and the call-ceiling raise leaves this None to
-    fall back to the live counter.
-    """
+    """A refused call. ``calls_left`` is what the model should be told remains."""
 
     def __init__(self, message, *, calls_left=None):
         super().__init__(message)
@@ -284,9 +255,7 @@ def weak_evidence_host(url: Any) -> bool:
 
 
 def _markdown_text(url: Any, markdown: str) -> str:
-    """A scraped page's markdown as the text the selectors read.  Loop s33 (markdown_clean): link targets are dropped
-    and parentheses kept (webfetch.markdown_text); a board API / JSON / feed document keeps the earlier flattening
-    the hiring parsers were written against, and so does everything when the knob is 0."""
+    """A scraped page's markdown as the text the selectors read."""
 
     try:
         if PACING.get("markdown_clean") and not webfetch.structured(url, markdown):
@@ -318,12 +287,7 @@ def _result_data(payload: Any) -> dict[str, Any]:
 
 
 def _result_list(payload: Any) -> list[Any]:
-    """The list a Deepline tool returned, whatever envelope it came in.
-
-    contextdev_post_news_search answers with a BARE list under result.data, which
-    ``_result_data`` (dict-only) turns into {} -- so a list has to be unwrapped on
-    its own (LAB-LOG #306).
-    """
+    """The list a Deepline tool returned, whatever envelope it came in."""
 
     if isinstance(payload, list):
         return payload
@@ -492,9 +456,7 @@ class ArenaTools:
 
     def direct_ok(self, url: Any) -> Optional[bool]:
         """Loop s33: did a plain GET by a library client -- the judge's own kind of fetch for stage and
-        required-attribute evidence -- read this URL as a page in this run?  True; False (tried and refused, timed
-        out, a wall, too thin or missing; read only with the browser User-Agent; or on a WEAK_EVIDENCE_HOSTS host);
-        None (never tried, e.g. a page known only from a search result or one skipped because its host was refusing)."""
+        required-attribute evidence -- read this URL as a page in this run?"""
 
         try:
             return self._direct.outcome.get(str(url or "").strip().split("#")[0])
@@ -503,7 +465,7 @@ class ArenaTools:
 
     def direct_check(self, url: Any) -> Optional[bool]:
         """direct_ok, making the free direct GET first when this URL was never tried (a page that came from a search
-        result's cached text, say).  No provider call, no spend; the page cache is left alone.  Never raises."""
+        result's cached text, say)."""
 
         known = self.direct_ok(url)
         if known is not None:
@@ -527,9 +489,7 @@ class ArenaTools:
 
     def _direct_page(self, url: str, cache_chars: int) -> Optional[Page]:
         """Loop s33: the page by a direct plain GET over the web-egress bridge -- free: it is not a provider call, it
-        is not counted in ``calls`` and it costs nothing.  None when no direct read was made or it did not read as a
-        page (blocked, wall, thin, not HTML): the caller then uses the Deepline scrape exactly as before.  An origin's
-        own 404 / 410 is final and comes back as a failed Page.  Never raises."""
+        is not counted in ``calls`` and it costs nothing."""
 
         try:
             got = self._direct.read(url, cache_chars, deadline=self.deadline)
@@ -550,7 +510,7 @@ class ArenaTools:
 
     def _breaker_refusal(self, tool: str) -> str:
         """'' when ``tool`` may be called; else why not (it failed BREAKER_FAILURES times in a row and its retry
-        interval has not passed).  Called under the lock, before the call is counted."""
+        interval has not passed)."""
 
         try:
             state = self._breaker.get(tool)
@@ -598,13 +558,7 @@ class ArenaTools:
 
 
     def snapshot(self) -> dict[str, Any]:
-        """The research state at one instant, JSON-safe, for a paired replay (#317 addendum).
-
-        Everything a second chance could read: the trace, the page cache with its
-        full text, the call counters and the spend ledger.  The harness writes it
-        only when ARENA_EMPTY_SNAPSHOT_DIR is set (local runs); it is never an
-        input to any gate and never emitted in the sandbox.
-        """
+        """The research state at one instant, JSON-safe, for a paired replay (#317 addendum)."""
 
         deadline = self.deadline
         return {
@@ -673,13 +627,7 @@ class ArenaTools:
         return body if isinstance(body, dict) else {}
 
     def _note_transport(self, exc: BaseException) -> None:
-        """A call that never produced a status; never let the note fail the call.
-
-        NOT an infra fault: no status came back, so nothing proves the host has an
-        infrastructure row, and `_no_companies` must keep its round-safe raise
-        (model_error, which cannot cancel the round and earns the confirmation
-        attempt).  What this buys is a readable record instead of silence.
-        """
+        """A call that never produced a status; never let the note fail the call."""
 
         try:
             diagnostics.record_transport_error(channel="deepline", detail=type(exc).__name__)
@@ -874,23 +822,7 @@ class ArenaTools:
         return self.estimated_spend_usd() + self.external_spend_usd
 
     def set_confirmed_spend(self, usd: Any, *, settled: bool = False, as_of: Optional[float] = None) -> bool:
-        """Re-base the planning ledger on the host's sourcing_cost -- never downward, unless SETTLED.
-
-        s32 C1: ``settled`` = the snapshot showed zero inflight and zero success-unresolved calls, so
-        its number is the whole ICP spend (every attempt, SQL 319) up to the read.  Then the ledger
-        may move DOWN to it plus SETTLED_MARGIN_USD: across 147 saved runs the local price-mirror
-        estimate never ran below the host (median $0.56 vs $0.34), and keeping that over-estimate
-        would stop research at ~2/3 of the real ceiling.
-
-        LAB-LOG #315 (independent review of #314): a snapshot may be cached for a
-        second and may carry successful-but-unresolved calls at zero dollars, so
-        "the host says $0.75" does not prove that the $0.03 we estimated a moment
-        ago is inside that $0.75.  The watermark therefore moves to
-        max(host number, what we were already planning against): a local estimate
-        stays until the host's number has visibly grown past it.  This is
-        CONSERVATIVE PACING, not exact settlement -- an over-estimate is kept until
-        settlement overtakes it, never silently dropped.
-        """
+        """Re-base the planning ledger on the host's sourcing_cost -- never downward, unless SETTLED."""
 
         number = self._usd(usd)
         if number is None:
@@ -932,12 +864,7 @@ class ArenaTools:
         return round(confirmed + max(0.0, ledger - at_read), 4)
 
     def paid_allowed(self, estimate_usd: float = 0.0) -> bool:
-        """May a call that will charge about ``estimate_usd`` start now?  No cap = yes.
-
-        With an estimate the call must FIT: spend + estimate <= cap.  Without one
-        the question is "is there room for any priced call at all", which at
-        exactly the cap is no -- every priced call costs more than nothing.
-        """
+        """May a call that will charge about ``estimate_usd`` start now?"""
 
         if self.spend_cap_usd is None:
             return True
@@ -948,14 +875,7 @@ class ArenaTools:
         return self.spend_usd() + estimate <= cap + 1e-9
 
     def adopt_quota(self, snapshot: Any, *, reserve: int = 2) -> dict[str, Any]:
-        """Replace the hard-coded call ceiling with the round's real Deepline quota.
-
-        ``snapshot`` is a lab_arena_checkpoint.quota_usage() document.  The round
-        may allow 30 or 200 Deepline calls per ICP (three quota profiles coexist,
-        contracts.EXECUTION_CALL_QUOTA_PROFILES) and a constant is wrong on one of
-        them; this reads the real number.  Never raises: an unreadable snapshot
-        leaves the ceiling where it was.
-        """
+        """Replace the hard-coded call ceiling with the round's real Deepline quota."""
 
         try:
             providers = snapshot.get("providers") if isinstance(snapshot, dict) else None
@@ -973,12 +893,7 @@ class ArenaTools:
                 "call_budget_before": before, "call_budget": new_budget}
 
     def search_news(self, query: str, *, limit: int = 5, company_website: str = "") -> dict[str, Any]:
-        """Dated news results at zero cost (contextdev_post_news_search, Decimal("0")).
-
-        Replaces the $0.56 predictleads_* calls for FUNDING / HIRING / NEWS discovery
-        wherever a headline and a URL are enough; the page still has to be fetched
-        (free branch first) before anything on it can be cited.
-        """
+        """Dated news results at zero cost (contextdev_post_news_search, Decimal("0"))."""
 
         query = str(query or "").strip()
         if not query:
@@ -1019,13 +934,7 @@ class ArenaTools:
         return {"results": rows, "count": len(rows), "entity": entity}
 
     def validate_email(self, email: str) -> str:
-        """'valid' | 'catch_all' | 'invalid' | 'unknown' from one zerobounce_validate call ($0.028).
-
-        The judge validates the submitted email with the same provider and zeroes the
-        pair on an invalid verdict (2 of 5 accepted contacts in #317/e5).  The reading
-        mirrors contact_verification._email_status: unsafe flags and invalid statuses
-        first, then catch-all, then valid; anything else is unknown.
-        """
+        """'valid' | 'catch_all' | 'invalid' | 'unknown' from one zerobounce_validate call ($0.028)."""
 
         data = _result_data(self._deepline("zerobounce_validate", {"email": str(email or "").strip()}))
         records = [r for r in (data, data.get("result") if isinstance(data, dict) else None) if isinstance(r, dict)]
@@ -1047,12 +956,7 @@ class ArenaTools:
 
     def search_company_people(self, company_linkedin: str, roles: list[str] | None = None, *,
                               title_filter: bool = True) -> list[dict[str, str]]:
-        """CURRENT employees of one LinkedIn company ($0.07, one page of up to 25; from autopilot c8, e12).
-
-        Web people-search returns name matches -- in loop d1 most rejections were "no current position at this
-        company".  LinkedIn's own search filtered by the company page returns current employees with their
-        current title, so a paid profile lookup goes only to someone who is there.
-        """
+        """CURRENT employees of one LinkedIn company ($0.07, one page of up to 25; from autopilot c8, e12)."""
 
         url = str(company_linkedin or "").strip()
         if "linkedin.com/company/" not in url.lower():
@@ -1079,13 +983,8 @@ class ArenaTools:
 
     def find_people(self, company_name: str, domain: str, roles: list[str] | None = None, *,
                     limit: int = 6, allow_paid: bool = True, company_linkedin: str = "") -> list[dict[str, str]]:
-        """LinkedIn person URLs at the company: free web search first, then the company-filtered LinkedIn search
-        when the company's page is known (loop s3), then paid web search as the last fallback.
-
-        Returns [{"linkedin_url", "title"}].  The result titles are search-engine
-        titles ("Name - Role - Company | LinkedIn"), useful for ranking and never
-        for attribution; only harvestapi_get_profile proves a person.
-        """
+        """LinkedIn person URLs at the company: free web search first, then the company-filtered LinkedIn search when
+        the company's page is known (loop s3), then paid web search as the last fallback."""
 
         company_name = " ".join(str(company_name or "").split())
         domain = _domain(domain)
@@ -1155,12 +1054,7 @@ class ArenaTools:
         return found[:limit]
 
     def get_person_profile(self, linkedin_url: str) -> dict[str, Any]:
-        """One harvestapi_get_profile call with findEmail, returned RAW.
-
-        Raw on purpose: contacts.py mirrors the verifier's own candidate walk
-        (qualification/scoring/contact_verification._profile_candidates) over the
-        same envelope, so what we accept is what the judge will re-fetch and read.
-        """
+        """One harvestapi_get_profile call with findEmail, returned RAW."""
 
         match = _LINKEDIN_PERSON_RE.search(str(linkedin_url or ""))
         if not match:

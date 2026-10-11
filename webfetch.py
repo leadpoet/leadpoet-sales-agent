@@ -1,20 +1,4 @@
-"""Loop s33: page reads by a direct plain GET over the sandbox's free web-egress bridge.
-
-Why: every page read was a Deepline scrape that counts against the ~198-call quota per ICP (about a fifth of all
-calls; 26 of 70 live ICP runs ended at the call ceiling) while the bridge went unused (0 connections on 50 live ICP
-runs).  A direct GET costs no provider call and no money, and it is the kind of fetch the judge makes for stage and
-required-attribute evidence, so a page that reads here is a page whose sentences the judge can find.
-
-The visible text follows the judge's own projection of a fetched page (qualification/scoring/verification_helpers
-visible_html_text + company_evidence_investigator._plain_text): script / style / template / noscript, nav / aside /
-footer, hidden and "related" blocks are not text; every tag boundary separates text; whitespace before , . ; : ! ? is
-removed.  A sentence taken from this text is therefore a continuous span of the text the judge compares quotes with
-(both sides collapse whitespace).  Block boundaries are kept as line breaks so a headline does not run into the lead.
-
-Host limits per ICP attempt (lab_arena/web_egress.py): 32 concurrent and 512 total connections, 64 MiB per direction
-per connection, 256 MiB in total, port 443 (CONNECT) or 80 only, paid-provider hosts refused.  The ATS lane uses the
-same bridge, so this module stays far inside them with its own counters.
-"""
+"""Loop s33: page reads by a direct plain GET over the sandbox's free web-egress bridge."""
 
 from __future__ import annotations
 
@@ -99,7 +83,7 @@ def markdown_text(markdown: Any) -> str:
     """A markdown scrape as one line of visible text: link and image targets are dropped (the label stays), heading,
     quote and emphasis markers go, backslash escapes are resolved and PARENTHESES STAY -- the old strip turned
     '[<Company>](https://...) (NYSE: XXX)' into '<Company> https://... NYSE: XXX', which no ticker or round
-    sentence selector can read.  Whitespace before , . ; : ! ? is removed as the judge's page text removes it."""
+    sentence selector can read."""
 
     def piece(match: re.Match) -> str:
         if match.group(1) is not None:
@@ -113,8 +97,7 @@ def markdown_text(markdown: Any) -> str:
 
 
 def flat_text(body: Any) -> str:
-    """The pre-s33 flattening (every markdown marker and both parentheses become a space).  Kept for board-API JSON
-    and feeds: the hiring lane's parsers were written against exactly this form."""
+    """The pre-s33 flattening (every markdown marker and both parentheses become a space)."""
 
     return " ".join(re.sub(r"[#*_>`\[\]()]", " ", str(body or "")).split())
 
@@ -247,9 +230,7 @@ class _Visible(HTMLParser):
 
 
 def visible_text(document: Any, limit: int = 24_000) -> tuple[str, str, list[str]]:
-    """(title, visible text, raw link targets) of an HTML document; ('', '', []) when it does not parse.  The links
-    are every anchor (hidden or not: a footer's LinkedIn link, a menu's careers link) and any job-board URL in the
-    markup (boards are embedded through scripts and frames)."""
+    """(title, visible text, raw link targets) of an HTML document; ('', '', []) when it does not parse."""
 
     document = str(document or "")
     limit = max(0, int(limit))
@@ -326,12 +307,7 @@ def _decode(raw: bytes, content_type: str) -> str:
 
 
 class Direct:
-    """One ICP's direct reader: a lazy client, the bridge counters and the outcome of every URL it tried.
-
-    ``outcome[url]`` answers "does a plain GET by a library client read this page?" -- the judge's own kind of fetch:
-    True when it did; False when it was tried and did not (refused, timed out, a wall, too thin, missing), when the
-    page only read with the browser User-Agent, or when its host is known not to answer such a fetch (skip_hosts);
-    a URL never tried -- also one skipped because its host had just refused other URLs -- has no entry."""
+    """One ICP's direct reader: a lazy client, the bridge counters and the outcome of every URL it tried."""
 
     def __init__(self, *, enabled: bool = True, local: bool = False, timeout: float = 8.0, max_fetches: int = 200,
                  json_hosts: bool = True, skip_hosts: tuple = (), transport: Any = None) -> None:
@@ -390,9 +366,8 @@ class Direct:
             return self._client
 
     def _get(self, url: str, started: float, headers: dict[str, str]) -> dict[str, Any]:
-        """_get_raw inside a wall-clock bound.  httpx times each socket read, not the request: an origin that
-        trickles its response headers would hold a read (and with it the ICP) for as long as it likes.  The GET runs
-        in a daemon thread that is abandoned after HARD_FACTOR timeouts; MAX_STUCK such reads stop the lane."""
+        """_get_raw inside a wall-clock bound. httpx times each socket read, not the request: an origin that trickles
+        its response headers would hold a read (and with it the ICP) for as long as it likes."""
 
         box: list[dict[str, Any]] = []
 
@@ -463,11 +438,10 @@ class Direct:
         return {"status": 0, "error": "too many redirects"}
 
     def _retire(self, client: Any, error: str) -> None:
-        """A failed connect retires the client.  httpcore keeps a proxy tunnel whose TLS handshake failed (CONNECT
+        """A failed connect retires the client. httpcore keeps a proxy tunnel whose TLS handshake failed (CONNECT
         answered, start_tls raised: the tunnel closed, a bad certificate, a silent origin) in its pool as an active
         connection: MAX_CONNECTIONS of them and every later read, to any host, waits out the pool timeout and
-        fails.  The next read builds a new pool.  A GET that _get gave up on retires nothing: by the time it ends
-        the client may be carrying the next read."""
+        fails."""
 
         if error not in ("ConnectError", "ConnectTimeout", "PoolTimeout"):
             return
@@ -509,9 +483,8 @@ class Direct:
                 "strikes": HOST_STRIKES if "Timeout" in error else 0 if "allow" in error else 1}
 
     def read(self, url: Any, limit: int, *, deadline: Optional[float] = None) -> Optional[dict[str, Any]]:
-        """None when no direct read was made (off, no bridge, allowance used, host already refusing): the caller
-        reads the page as before.  Else {"ok": True, final_url, title, text, links, kind, plain} or
-        {"ok": False, "final": <the origin says the page does not exist>, "error"}.  Never raises."""
+        """None when no direct read was made (off, no bridge, allowance used, host already refusing): the caller reads
+        the page as before."""
 
         url = str(url or "").strip().split("#")[0]
         if not self.available() or not _allowed(url):

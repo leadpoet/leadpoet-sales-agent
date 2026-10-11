@@ -1,20 +1,4 @@
-"""Deterministic mirrors of the Arena scorer's pre-LLM gates and contracts.
-
-Every rule here is transcribed from the platform at repo HEAD (LAB-LOG #191):
-  qualification/scoring/verification_helpers.py   text/snippet/grounding checks
-  qualification/scoring/intent_signal_gate.py     URL structure, anti-bot, freshness
-  qualification/scoring/lead_scorer.py            stage, untrusted TLDs, negation,
-                                                  source multipliers, intent caps
-  qualification/scoring/competition.py            source inference, ICP normalization
-  qualification/employee_buckets.py               LinkedIn buckets
-  qualification/competition_models.py             the output contract
-  qualification/scoring/company_fit_decision.py   identity name/domain/slug keys
-
-The point of mirroring is that a harness can apply the scorer's own rejection
-rules to its own output BEFORE submitting, instead of hoping the LLM got it
-right.  tests/test_mirror_parity.py asserts these functions agree with the
-platform code, so drift shows up as a failing test rather than a zero score.
-"""
+"""Deterministic mirrors of the Arena scorer's pre-LLM gates and contracts."""
 
 from __future__ import annotations
 
@@ -237,12 +221,7 @@ def registrable_host(url: str) -> str:
 
 
 def extract_domain(url: str) -> str:
-    """lead_scorer.py::_extract_domain — the LAST TWO labels of the host.
-
-    The scorer dedups a company's signals and exempts company-owned evidence
-    by this key, so ``blog.acme.com`` and ``acme.com`` are the SAME domain to
-    it (and ``acme.co.uk`` collapses to ``co.uk``, faithfully).
-    """
+    """lead_scorer.py::_extract_domain — the LAST TWO labels of the host."""
 
     try:
         clean = str(url or "").strip()
@@ -575,23 +554,7 @@ def contains_prompt_control(text: Any) -> bool:
 
 
 def strip_gateway_controls(text: Any) -> str:
-    """Drop every character `validate_candidate_prompt_text` refuses.
-
-    ⛳️ LAB-LOG #237.  A scraped page can carry SOFT HYPHENS (U+00AD, category
-    Cf) inside words -- Endpoints News hyphenates that way -- and `best_window`
-    re-cuts the snippet straight out of the page text, AFTER the one
-    `strip_prompt_controls` pass, so they reached the wire.  Upstream ff17a8df
-    now turns a company the judge model cannot parse into a zero breakdown
-    (`failure_class model_contract_incompatible`, competition.py:307-311)
-    instead of letting the ValidationError escape: no -10, but the breakdown is
-    APPENDED, so the company occupies one of the five slots and scores nothing.
-    Exactly one of the 133 companies we have ever emitted was rejected this way.
-
-    A control that is also whitespace becomes a space, so removing it cannot
-    weld two words together; everything else (the soft hyphen included) is simply
-    dropped, which is what un-hyphenates ``sit\xadu\xada\xadtion`` back into
-    ``situation``.  Callers collapse whitespace afterwards.
-    """
+    """Drop every character `validate_candidate_prompt_text` refuses."""
 
     out = []
     for character in str(text or ""):
@@ -783,13 +746,7 @@ GATEWAY_CLAIM_TEXT_MAX = 2000
 
 
 def _reject_prompt_controls(value: str, field_name: str) -> str:
-    """gateway/qualification/models.py:244-252 `validate_candidate_prompt_text`.
-
-    LAB-LOG #237: the platform raises here, the ValidationError is caught at
-    competition.py:309, and the company becomes a zero breakdown that still
-    spends one of the five slots.  Catching it locally is the difference between
-    one company repaired before we submit and one slot silently forfeited.
-    """
+    """gateway/qualification/models.py:244-252 `validate_candidate_prompt_text`."""
 
     if contains_prompt_control(value):
         raise ValueError("%s contains control or format characters" % field_name)
