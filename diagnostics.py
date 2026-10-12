@@ -113,8 +113,8 @@ def record_transport_error(*, channel: str = "openrouter", detail: str = "") -> 
     except Exception:
         return
     if detail:
-        _log("transport error on the %s channel (%s); not an infra fault -- nothing "
-             "reached the host's call ledger" % (channel, str(detail)[:80]))
+        _log("transport error on the %s channel (%s); not recorded as an infra fault -- the call may still "
+             "have settled on the host's call ledger" % (channel, str(detail)[:80]))
 
 
 def infra_fault(channel: str | None = None) -> str | None:
@@ -140,23 +140,6 @@ def channel_down(channel: str = "openrouter") -> str | None:
         with _LOCK:
             health = dict(LAST_REPORT.get("channel_health") or {})
         return health.get(channel if channel in CHANNELS else "openrouter")
-    except Exception:
-        return None
-
-
-def terminal_fault(channel: str | None = None) -> str | None:
-    """A recorded fault on this channel that CANNOT heal inside the run."""
-
-    try:
-        with _LOCK:
-            faults = dict(LAST_REPORT.get("infra_faults") or {})
-            health = dict(LAST_REPORT.get("channel_health") or {})
-        names = (channel,) if channel is not None else CHANNELS
-        for name in names:
-            for reason in (faults.get(name), health.get(name)):
-                if reason in TERMINAL_REASONS:
-                    return reason
-        return None
     except Exception:
         return None
 
@@ -189,5 +172,5 @@ reset()
 __all__ = [
     "ALLOWED_ERROR_CODES", "ALLOWED_STATUSES", "CHANNELS", "INFRA_CODES", "INFRA_STATUSES",
     "LAST_REPORT", "TERMINAL_REASONS", "channel_down", "classify", "infra_fault",
-    "record_response", "record_transport_error", "reset", "snapshot", "terminal_fault",
+    "record_response", "record_transport_error", "reset", "snapshot",
 ]

@@ -11,7 +11,6 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-
 def normalize_text(text: str) -> str:
     t = str(text or "").lower()
     t = re.sub(r"[^\w\s]", " ", t)
@@ -92,7 +91,6 @@ def signal_word_grounding(text: str, content: str) -> tuple[int, int, list[str]]
         return 0, 0, []
     grounded = words & content_words
     return len(grounded), len(words), sorted(words - content_words)
-
 
 
 _INVALID_URL_RE = re.compile(
@@ -180,27 +178,11 @@ def parse_signal_date(value: Any) -> Optional[date]:
     return parsed.date()
 
 
-def freshness_reason(claim_text: str, signal_date: Any, buyer_cap_days: Optional[int], today: date) -> Optional[str]:
-    """Mirror of check_evidence_freshness with the Arena's deterministic cap."""
-
-    max_age = buyer_cap_days if buyer_cap_days is not None else claim_max_age_days(claim_text)
-    if max_age is None:
-        return None
-    parsed = parse_signal_date(signal_date)
-    if parsed is None:
-        return f"buyer requires evidence within {max_age} days but the signal has no valid date"
-    age = (today - parsed).days
-    if age > max_age:
-        return f"evidence is {age} days old; cap is {max_age} days"
-    return None
-
-
 def future_date_reason(signal_date: Any, today: date) -> Optional[str]:
     parsed = parse_signal_date(signal_date)
     if parsed is not None and parsed > today:
         return f"signal date {parsed.isoformat()} is in the future"
     return None
-
 
 
 FABRICATED_TLDS = frozenset(
@@ -221,7 +203,7 @@ def registrable_host(url: str) -> str:
 
 
 def extract_domain(url: str) -> str:
-    """lead_scorer.py::_extract_domain — the LAST TWO labels of the host."""
+    """Lead_scorer.py::_extract_domain — the LAST TWO labels of the host."""
 
     try:
         clean = str(url or "").strip()
@@ -282,8 +264,7 @@ SOURCE_MULTIPLIERS = {
 
 
 def evidence_source(url: str, company_website: str) -> str:
-    """competition.py::_evidence_source — the scorer's source class from the URL."""
-
+    """Competition.py::_evidence_source — the scorer's source class from the URL."""
     hostname = (urlsplit(str(url)).hostname or "").lower().removeprefix("www.")
     company_hostname = (urlsplit(str(company_website)).hostname or "").lower().removeprefix("www.")
     path = (urlsplit(str(url)).path or "").lower()
@@ -311,7 +292,6 @@ def intent_total(per_signal_scores: Iterable[float]) -> float:
 
 def company_score_estimate(fit_estimate: float, per_signal_scores: Iterable[float]) -> float:
     return max(0.0, min(100.0, min(fit_estimate, MAX_FIT) + intent_total(per_signal_scores)))
-
 
 
 LINKEDIN_BUCKETS = ("0-1", "2-10", "11-50", "51-200", "201-500", "501-1,000",
@@ -394,7 +374,6 @@ def icp_buckets(icp: Mapping[str, Any]) -> list[str]:
     return out
 
 
-
 _SERIES_C_PLUS = frozenset({"series c+", "series c", "series d", "series e", "series f", "series g", "series h"})
 
 
@@ -409,7 +388,6 @@ def normalize_stage(value: Any) -> str:
 
 def stage_matches(observed: str, requested: str) -> bool:
     return observed == requested or (requested == "series c+" and observed in _SERIES_C_PLUS)
-
 
 
 _LEGAL_SUFFIXES = frozenset(
@@ -445,32 +423,6 @@ def canonical_domain(value: Any) -> str:
         return host.encode("idna").decode("ascii")
     except UnicodeError:
         return ""
-
-
-def canonical_linkedin(value: Any) -> str:
-    raw = str(value or "").strip()
-    if raw.startswith("//"):
-        raw = f"https:{raw}"
-    if raw and "://" not in raw:
-        raw = f"https://{raw}"
-    try:
-        parsed = urlsplit(raw)
-    except ValueError:
-        return ""
-    host = str(parsed.hostname or "").casefold().removeprefix("www.")
-    parts = [p for p in parsed.path.split("/") if p]
-    if (
-        parsed.scheme.casefold() not in {"http", "https"}
-        or parsed.username is not None or parsed.password is not None
-        or not (host == "linkedin.com" or host.endswith(".linkedin.com"))
-        or len(parts) < 2 or parts[0].casefold() != "company"
-    ):
-        return ""
-    slug = parts[1].casefold()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._%+-]{0,99}", slug):
-        return ""
-    return f"https://www.linkedin.com/company/{slug}"
-
 
 
 import unicodedata
@@ -565,7 +517,6 @@ def strip_gateway_controls(text: Any) -> str:
     return "".join(out)
 
 
-
 _COUNTRY_ALIASES = {
     "united states": "united states", "usa": "united states", "us": "united states",
     "u.s.": "united states", "u.s.a.": "united states", "united states of america": "united states",
@@ -618,8 +569,6 @@ def allowed_countries(icp_geography: Any) -> tuple[frozenset[str], dict[str, str
     if not allowed and deferred:
         return frozenset(), {}
     return frozenset(allowed), allowed
-
-
 
 
 def _text(value: Any) -> str:
@@ -708,8 +657,6 @@ def evaluation_date() -> date:
     return datetime.now(timezone.utc).date()
 
 
-
-
 def public_http_url(value: Any, *, allow_empty: bool = False) -> str:
     text = str(value or "").strip()
     if not text and allow_empty:
@@ -746,7 +693,7 @@ GATEWAY_CLAIM_TEXT_MAX = 2000
 
 
 def _reject_prompt_controls(value: str, field_name: str) -> str:
-    """gateway/qualification/models.py:244-252 `validate_candidate_prompt_text`."""
+    """Gateway/qualification/models.py:244-252 `validate_candidate_prompt_text`."""
 
     if contains_prompt_control(value):
         raise ValueError("%s contains control or format characters" % field_name)
@@ -843,7 +790,7 @@ STAGE_EVIDENCE_MAX = 3
 
 
 def validate_intent_details_text(value: Any) -> str:
-    """qualification/intent_details.py: one plain prose paragraph, <= 2000 chars."""
+    """Qualification/intent_details.py: one plain prose paragraph, <= 2000 chars."""
 
     if not isinstance(value, str) or not value.strip():
         raise ValueError("intent_details must be a non-empty paragraph")

@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
-import httpx
 
-try:
-    from . import scorer_mirror as sm
-except ImportError:
-    import importlib
-
-    sm = importlib.import_module(f"{os.path.basename(os.path.dirname(os.path.abspath(__file__)))}.scorer_mirror")
+from . import llm
+from . import scorer_mirror as sm
 
 MODEL = "perplexity/sonar"
 TIMEOUT_S = 45.0
@@ -36,7 +30,6 @@ LINKEDIN_BUCKETS = ("0-1", "2-10", "11-50", "51-200", "201-500", "501-1,000", "1
 OBSERVED_INTERVALS = ((1, "0-1"), (10, "2-10"), (50, "11-50"), (200, "51-200"), (500, "201-500"),
                       (1_000, "501-1,000"), (5_000, "1,001-5,000"), (10_000, "5,001-10,000"))
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,99}$")
-
 
 
 _SERIES_C_PLUS_MATCHING_STAGES = sm._SERIES_C_PLUS
@@ -170,10 +163,6 @@ _VENTURE_STAGE_PROOF_PATTERNS = {
 }
 _PRE_SEED_STAGE_TOKEN_RE = re.compile(
     r"\bpre(?:\s*[-\u2010\u2011\u2013\u2014]\s*|\s+)seed\b",
-    re.I,
-)
-_PRE_SERIES_STAGE_TOKEN_RE = re.compile(   # s39, as the judge since 8598b672
-    r"\bpre(?:\s*[-\u2010-\u2015]\s*|\s+)series\s+[a-z](?:[1-9][0-9]*)?\b\+?",
     re.I,
 )
 _VENTURE_STAGE_STATEMENT_PATTERNS = {
@@ -562,16 +551,15 @@ def _stage_quote_supports_observation(observed: str, quote: str) -> bool:
     seed_compatible_text = _PRE_SEED_STAGE_TOKEN_RE.sub(
         "pre_seed_stage", text
     )
-    series_text = _PRE_SERIES_STAGE_TOKEN_RE.sub("pre_venture_stage", text)
     proven_venture_stages = [
         stage
         for stage, patterns in _VENTURE_STAGE_PROOF_PATTERNS.items()
         if _has_affirmed_stage_proof(
-            seed_compatible_text if stage == "seed" else series_text,
+            seed_compatible_text if stage == "seed" else text,
             patterns,
         )
         or _has_affirmed_stage_proof(
-            seed_compatible_text if stage == "seed" else series_text,
+            seed_compatible_text if stage == "seed" else text,
             _VENTURE_STAGE_STATEMENT_PATTERNS.get(stage, ()),
             reject_historical=True,
         )
@@ -592,7 +580,6 @@ def _stage_quote_supports_observation(observed: str, quote: str) -> bool:
     ):
         return False
     return observed_category == latest
-
 
 
 _OWNERSHIP_LEGAL_SUFFIXES = frozenset({
@@ -616,8 +603,7 @@ def _subject_is_company(subject_text: str, names: set[tuple[str, ...]]) -> bool:
 
 
 def acquired_stage_quote_supports_company(company_name: Any, observed_company_name: Any, quote: Any) -> bool:
-    """lead_scorer._acquired_stage_quote_supports_company: completed acquisition / current-parent proof whose SUBJECT
-    is this exact company (name or name + legal suffix), not superseded ("later went public"), not conditional."""
+    """Lead_scorer._acquired_stage_quote_supports_company: completed acquisition /."""
 
     if not isinstance(quote, str) or not quote.strip():
         return False
@@ -644,8 +630,7 @@ def acquired_stage_quote_supports_company(company_name: Any, observed_company_na
 
 
 def bound_public_supersession_supports_company(company_name: Any, observed_company_name: Any, quote: Any) -> bool:
-    """lead_scorer._bound_public_supersession_supports_company: a completed take-private
-    or current delisting whose subject is this company reopens a Public stage."""
+    """Lead_scorer._bound_public_supersession_supports_company: a completed take-private."""
 
     if not isinstance(quote, str) or not quote.strip():
         return False
@@ -682,9 +667,7 @@ def bound_public_supersession_supports_company(company_name: Any, observed_compa
 def first_party_ownership_conflicts_with_stage(company_website: Any, company_name: Any,
                                                observed_company_name: Any, observed_stage: str,
                                                attribute_evidence_url: Any, attribute_evidence_quote: Any) -> bool:
-    """lead_scorer._first_party_ownership_conflicts_with_stage: when the REQUIRED-ATTRIBUTE evidence sits on the
-    company's own registrable domain and proves (subject-bound) that this company was acquired, a pinned venture
-    stage is UNRESOLVED; a Public stage is reopened only by a completed take-private / current delisting."""
+    """Lead_scorer._first_party_ownership_conflicts_with_stage: when the REQUIRED-ATTRIBUTE."""
 
     venture_stage = observed_stage in {"seed", "series a", "series b", "series c+"}
     if not venture_stage and observed_stage != "public":
@@ -749,7 +732,7 @@ def linkedin_slug(value: Any) -> str:
 
 
 def evaluate_identity(company: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict[str, str]:
-    """evaluate_company_identity with the web verdict as the observation."""
+    """Evaluate_company_identity with the web verdict as the observation."""
 
     observed_name = verdict.get("observed_company_name", verdict.get("observed_name"))
     observed_site = verdict.get("observed_company_website", verdict.get("observed_website"))
@@ -840,7 +823,6 @@ def apply_verified_homepage_anchor(
     return receipt
 
 
-
 def submitted_homepage_anchor(company: Mapping[str, Any]) -> dict[str, str] | None:
     """The first-party homepage anchor for a company WE emitted, or None."""
 
@@ -886,7 +868,7 @@ def adopt_observed_name(receipt: Mapping[str, Any]) -> str:
 
 
 def prompt_locator_host(website: str) -> str:
-    """candidate_company_prompt_identity()["company"]: the PSL registrable domain of the website host."""
+    """Candidate_company_prompt_identity()["company"]: the PSL registrable domain of the website host."""
     from urllib.parse import urlparse
 
     host = str(urlparse(website.strip()).hostname or "").casefold()
@@ -1078,7 +1060,7 @@ NON_SUPPLIER_ROLES = frozenset({"customer_user", "internal_function", "third_par
 def industry_evidence_decision(candidate_industry: Any, candidate_subindustry: Any, requested_industry: str,
                                flag: Optional[bool], *, evidence: Optional[Mapping[str, Any]] = None,
                                activity_role: Any = None, web_path: bool = True) -> str:
-    """lead_scorer._industry_evidence_decision (audit #210: role-driven on the web path)."""
+    """Lead_scorer._industry_evidence_decision."""
 
     if not isinstance(candidate_industry, str):
         return UNAVAILABLE
@@ -1142,7 +1124,7 @@ _STAGE_FIELDS = ("observed_company_stage", "stage_matches",
 
 
 def _reported_nothing(verdict: Mapping[str, Any], dimension: str, matches: str) -> bool:
-    """lead_scorer.py:1780-1787 -- the generic tail: no verdict, no evidence at all."""
+    """Lead_scorer.py:1780-1787 -- the generic tail: no verdict, no evidence at all."""
 
     if verdict.get(matches) is not None:
         return False
@@ -1153,7 +1135,7 @@ def _reported_nothing(verdict: Mapping[str, Any], dimension: str, matches: str) 
 
 
 def _industry_unproven(verdict: Mapping[str, Any], icp: Mapping[str, Any]) -> bool:
-    """lead_scorer.py:1705-1732 (upstream d2f02967)."""
+    """Lead_scorer.py:1705-1732 (upstream d2f02967)."""
 
     if not all(field in verdict for field in _INDUSTRY_FIELDS):
         return False
@@ -1173,7 +1155,7 @@ def _industry_unproven(verdict: Mapping[str, Any], icp: Mapping[str, Any]) -> bo
 
 
 def _employee_size_unproven(verdict: Mapping[str, Any]) -> bool:
-    """lead_scorer.py:1743-1770 (upstream 83cf2073)."""
+    """Lead_scorer.py:1743-1770 (upstream 83cf2073)."""
 
     if not all(field in verdict for field in _EMPLOYEE_FIELDS):
         return False
@@ -1206,8 +1188,7 @@ def _stage_unproven(verdict: Mapping[str, Any]) -> bool:
 
 
 def _identity_unproven(identity: Mapping[str, Any]) -> bool:
-    """lead_scorer._is_same_domain_unproven_web_identity (:1609) and _is_verified_homepage_web_identity_conflict
-    (:1635)."""
+    """Lead_scorer._is_same_domain_unproven_web_identity (:1609) and."""
 
     if identity.get("decision") != UNAVAILABLE:
         return False
@@ -1230,8 +1211,7 @@ def _identity_unproven(identity: Mapping[str, Any]) -> bool:
 
 def failure_class(verdict: Mapping[str, Any], dims: Mapping[str, str],
                   identity: Mapping[str, Any], icp: Mapping[str, Any]) -> str:
-    """INSUFFICIENT when the platform would class this a clean, non-retryable 0; "" when it would keep retrying the
-    run."""
+    """INSUFFICIENT when the platform would class this a clean, non-retryable 0; "" when."""
 
     incomplete = [name for name, value in dims.items() if value == UNAVAILABLE]
     if identity.get("decision") == UNAVAILABLE:
@@ -1307,60 +1287,38 @@ def decide(verdict: Mapping[str, Any], company: Mapping[str, Any], icp: Mapping[
             "reason": str(verdict.get("reason") or "")[:300]}
 
 
-def _client_and_base(http_client_factory, timeout: float) -> tuple[httpx.AsyncClient, str, dict[str, str]]:
-    arena_mode = bool(str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip())
-    if http_client_factory is not None:
-        return http_client_factory(timeout), "http://openrouter.ai/api/v1", {"Authorization": "Bearer arena-host"}
-    if arena_mode:
-        try:
-            from .arena_transport import arena_openrouter_http_client
-        except ImportError:
-            import importlib
-
-            arena_openrouter_http_client = importlib.import_module(
-                f"{os.path.basename(os.path.dirname(os.path.abspath(__file__)))}.arena_transport").arena_openrouter_http_client
-        return arena_openrouter_http_client(timeout), "http://openrouter.ai/api/v1", {"Authorization": "Bearer arena-host"}
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY is required outside the Arena")
-    return (httpx.AsyncClient(timeout=httpx.Timeout(timeout)), "https://openrouter.ai/api/v1",
-            {"Authorization": f"Bearer {key}"})
-
-
-async def _ask(client: httpx.AsyncClient, base: str, headers: Mapping[str, str], prompt: str, *, model: str) -> tuple[Optional[dict], str]:
-    body = {"model": model, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-            "temperature": 0.0, "max_tokens": 1200}
+def _ask(prompt: str, *, model: str) -> tuple[Optional[dict], str]:
+    content = llm.chat([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+                       model=model, max_tokens=1200, purpose="reverify")
+    if content is None:
+        return None, "no reply"
+    match = re.search(r"\{.*\}", content or "", re.S)
+    if match is None:
+        return None, "no JSON object in response"
     try:
-        response = await client.post(base + "/chat/completions", json=body, headers={**headers, "Content-Type": "application/json"})
-        if response.status_code != 200:
-            return None, f"provider HTTP {response.status_code}: {response.text[:120]}"
-        content = response.json()["choices"][0]["message"]["content"]
-        match = re.search(r"\{.*\}", content or "", re.S)
-        if match is None:
-            return None, "no JSON object in response"
         verdict = json.loads(match.group(0))
-        return (verdict, "") if isinstance(verdict, dict) else (None, "JSON was not an object")
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
+    except ValueError:
+        return None, "invalid JSON"
+    return (verdict, "") if isinstance(verdict, dict) else (None, "JSON was not an object")
 
 
-async def _run_all(companies, icp, *, http_client_factory, timeout: float, model: str):
-    client, base, headers = _client_and_base(http_client_factory, timeout)
-    try:
-        return await asyncio.gather(*(_ask(client, base, headers, build_prompt(c, icp), model=model) for c in companies))
-    finally:
-        await client.aclose()
+def _run_all(companies, icp, *, model: str):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        return list(pool.map(lambda c: _ask(build_prompt(c, icp), model=model), companies))
 
 
 def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_client_factory=None,
            timeout: float = TIMEOUT_S, model: str = MODEL) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop contradicted companies, rank unprovable ones last, adopt the observed name."""
+    """Drop only a name/website mismatch; rank other contradictions last (``notes['contested']``); adopt the
+    observed name."""
 
     notes: dict[str, Any] = {"model": model, "companies": []}
     if not companies:
         return companies, notes
     try:
-        results = asyncio.run(_run_all(companies, icp, http_client_factory=http_client_factory, timeout=timeout, model=model))
+        results = _run_all(companies, icp, model=model)
     except Exception as exc:
         notes["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         return companies, notes
@@ -1391,10 +1349,14 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
                      dimensions=decision["dimensions"], reason=decision["reason"],
                      failure_class=decision.get("failure_class", ""))
         notes["companies"].append(entry)
-        if decision["overall"] == MISMATCH:
+        if decision["overall"] == MISMATCH and identity["decision"] == MISMATCH:
             entry["dropped"] = True
             continue
-        if decision["overall"] == MATCH:
+        if decision["overall"] == MISMATCH:
+            entry["contested"] = True
+            notes.setdefault("contested", []).append(str(company.get("company_website") or ""))
+            tier = 3
+        elif decision["overall"] == MATCH:
             tier = 0
         else:
             tier = 1 if decision.get("failure_class") == INSUFFICIENT else 2

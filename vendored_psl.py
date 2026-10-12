@@ -75,7 +75,7 @@ def snapshot() -> PublicSuffixSnapshot:
 
 
 def registrable_domain(host: str) -> str:
-    """example.co.uk for www.sub.example.co.uk; '' when the host is not a company domain."""
+    """Example.co.uk for www.sub.example.co.uk; '' when the host is not a company domain."""
 
     host = str(host or "").strip().rstrip(".").lower()
     if not host or "." not in host:
