@@ -232,6 +232,57 @@ def event_query(icp: Mapping[str, Any], category: str, name: str) -> str:
     return " ".join(template.format(name=f'"{name}"').split())[:200]
 
 
+def hq_prefilter(tools: Any, kept: list[dict[str, Any]], icp: Mapping[str, Any], dropped: dict[str, str],
+                 feed: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+    """v106: a free headquarters check BEFORE any paid event search, on a geography-constrained ICP.
+
+    On 10-12 ICP0 (United States, West Coast) the lane kept 20 Series A AI companies and spent its eight paid event
+    searches on the newest rounds - Siena (New York), Rein (Delaware), Runlayer (New York), Geordie (London) - which
+    the fit check then dropped, while StackOne, Chalk, E2B, Simular, Envive, Spangle (all West Coast) were never
+    searched.  The free company corpus carries "city, state, country"; a company whose corpus location contradicts the
+    ICP geography is dropped here, one whose location is unknown or unresolved stays, and confirmed in-region companies
+    go first."""
+
+    from . import geo
+    want = geo.constraint(icp)
+    if not kept or not (want.get("country") or want.get("states")):
+        return kept
+    inside, unknown, note = [], [], {}
+    for company in kept:
+        location = ""
+        try:
+            profile = (tools.get_company_profile(company.get("domain") or "") or {}).get("company") or {}
+            location = " ".join(str(profile.get("location") or "").split())
+        except BudgetExhausted:
+            raise
+        except Exception:  # noqa: BLE001 - the corpus is an aid, never a dependency
+            location = ""
+        parts = [p.strip() for p in location.split(",") if p.strip()]
+        country = parts[-1] if parts else ""
+        state = parts[-2] if len(parts) >= 3 else ""
+        city = parts[0] if len(parts) >= 2 else ""
+        if not country:
+            unknown.append(company)
+            continue
+        try:
+            verdict = geo.check(icp, hq_country=country, hq_state=state, hq_city=city)
+        except Exception:  # noqa: BLE001
+            unknown.append(company)
+            continue
+        if verdict.get("drop"):
+            dropped[str(company.get("company_name"))] = f"{verdict['drop']} (corpus location before the event search)"
+            note[str(company.get("company_name"))] = "out"
+        elif verdict.get("unresolved"):
+            unknown.append(company)
+            note[str(company.get("company_name"))] = "unresolved"
+        else:
+            inside.append(company)
+            note[str(company.get("company_name"))] = "in"
+    if feed is not None:
+        feed["hq_prefilter"] = note
+    return inside + unknown
+
+
 def company_events(tools: Any, companies: list[Mapping[str, Any]], icp: Mapping[str, Any], category: str, *,
                    age_days: Callable[[Any], Optional[int]], deadline: float, clock: Callable[[], float],
                    over_budget: Callable[[], bool], limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -330,6 +381,7 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
             if not company.get("domain"):
                 dropped[company["company_name"]] = "no domain"
         kept = [c for c in kept if c.get("domain")]
+        kept = hq_prefilter(tools, kept, icp, dropped, feed)
         by_key = {sm.company_name_key(k["company_name"]): k for k in kept}
         companies = [{"company_name": c["company_name"], "domain": c["domain"]} for c in kept]
         if category == "HIRING":
@@ -371,6 +423,6 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
     return events
 
 
-__all__ = ["run_stage_first", "funding_queries", "funded_companies", "latest_round", "round_accepted", "venture_stage",
+__all__ = ["run_stage_first", "hq_prefilter", "funding_queries", "funded_companies", "latest_round", "round_accepted", "venture_stage",
            "company_events", "event_query", "stage_hint", "stage_key", "round_news_row", "seed_round_news",
            "later_round_in_news", "RECENCY_DAYS", "MAX_COMPANIES", "recency_days"]

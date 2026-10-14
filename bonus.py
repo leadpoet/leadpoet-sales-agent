@@ -18,6 +18,8 @@ from .arena_tools import BudgetExhausted
 
 MODEL = "google/gemini-2.5-flash"
 MAX_NEWS_ROWS = 4
+MAX_PAID_SEARCHES = 5           # v108: paid bonus searches per ICP (one per row), $0.010 each
+PAID_RESULT_ROWS = 3            # pages read from one paid search
 WINDOW_CHARS = 4000
 _ROLE_SPLIT_RE = re.compile(r"\s*(?:,|\bor\b|\band\b|/)\s*", re.I)
 
@@ -128,8 +130,38 @@ def _hiring_candidate(tools: Any, icp: Mapping[str, Any], index: int, name: str,
     return None
 
 
+_QUERY_DROP_RE = re.compile(r"\b(?:(?:in|within|over) the (?:last|past) \d+ (?:days?|weeks?|months?|years?)|"
+                            r"per (?:a|an|the|its) [^.]*)", re.I)
+_QUERY_STOP = frozenset("a an the or and of in on to its their for with by per has have had was were is are new own "
+                        "any some that which this these those from into within during".split())
+
+
+_DATELINE_RE = re.compile(r"^.{0,90}?(?:/\s?PR\s?Newswire\s?/|\((?:BUSINESS WIRE|GLOBE NEWSWIRE|ACCESSWIRE|ACCESS Newswire|"
+                          r"Newsfile Corp\.?[^)]{0,40}|EZ Newswire|PRWEB)\))\s*[-–—]{1,2}\s*", re.I)
+
+
+def after_dateline(sentence: str) -> str:
+    """A press-wire lede without its dateline: 'COLUMBUS, Ohio, Jan. 14, 2026 /PRNewswire/ -- Huntington ... today
+    announced ...' -> 'Huntington ... today announced ...'.  A sentence split at 'Jan.' keeps the fragment
+    '14, 2026 /PRNewswire/ -- ' in front, which is no part of the event."""
+
+    flat = " ".join(str(sentence or "").split())
+    rest = _DATELINE_RE.sub("", flat, count=1)
+    return rest if rest != flat and len(rest.split()) >= 5 else flat
+
+
+def paid_query(name: str, signal_text: str) -> str:
+    """The company's name in quotes and the criterion's own content words, without its time and source clauses:
+    'Received a regulatory clearance, approval, or certification in the last 12 months, per a filing or regulator
+    update.' -> '"Zions Bancorporation" Received regulatory clearance approval certification'."""
+
+    text = _QUERY_DROP_RE.sub(" ", " ".join(str(signal_text or "").split()))
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9+\-]{2,}", text) if w.casefold() not in _QUERY_STOP]
+    return (f'"{" ".join(str(name or "").split())}" ' + " ".join(words[:10])).strip()[:200]
+
+
 def _news_candidate(tools: Any, icp: Mapping[str, Any], index: int, name: str, domain: str,
-                    reuse: list[str]) -> Optional[dict]:
+                    reuse: list[str], paid: Any = None) -> Optional[dict]:
     from .roster import CATEGORY_WORDS, company_news
     from .scout import _CHROME_RE, _fetch_text, event_sentence, find_date
     from .sourcetype import body_dateline
@@ -142,29 +174,53 @@ def _news_candidate(tools: Any, icp: Mapping[str, Any], index: int, name: str, d
         blob = f"{story.get('title') or ''} {story.get('excerpt') or ''}"
         if story.get("url") and pattern.search(blob) and criteria.in_window(icp, index, story.get("published_date")):
             rows.append((str(story["url"]), str(story.get("published_date") or "")[:10] or None))
-    tried = 0
-    for url, listed in rows:
-        if tried >= MAX_NEWS_ROWS or criteria.url_admissible(icp, index, url, f"https://{domain}/"):
+    def scan(pages: list[tuple[str, Optional[str]]], most: int) -> Optional[dict]:
+        tried = 0
+        for url, listed in pages:
+            if tried >= most or criteria.url_admissible(icp, index, url, f"https://{domain}/"):
+                continue
+            tried += 1
+            text = _fetch_text(tools, url)
+            if not text:
+                continue
+            sentence = ""
+            for candidate in re.split(r"(?<=[.!?])\s+", text[:WINDOW_CHARS]):
+                if pattern.search(candidate) and candidate.strip():
+                    cut = after_dateline(event_sentence(candidate, name))
+                    if cut and not _CHROME_RE.search(cut):
+                        sentence = cut
+                        break
+            when = body_dateline(text) or listed or find_date(text, url)
+            if not sentence or not when or not criteria.in_window(icp, index, when):
+                continue
+            if not confirm(name, signal_text, sentence):
+                continue
+            return {"matched_icp_signal": index, "url": url, "date": str(when)[:10], "description": sentence[:350],
+                    "snippet": sentence[:600]}
+        return None
+
+    found = scan(rows, MAX_NEWS_ROWS)
+    if found is not None or paid is None or not paid():
+        return found
+    # v108: the free feed lists about twelve stories; the bonus event is searched for by name, once, in its window
+    data = tools.search_web(paid_query(name, signal_text), recency_days=criteria.window(icp, index), limit=10,
+                            company_website=f"https://{domain}/")
+    seen = {url for url, _ in rows}
+    key = sm.company_name_key(name)
+    extra: list[tuple[str, Optional[str]]] = []
+    for story in (data or {}).get("results") or []:
+        url = str(story.get("url") or "")
+        blob = f"{story.get('title') or ''} {story.get('excerpt') or story.get('text') or ''}"
+        when = str(story.get("published_date") or "")[:10]
+        if not url.startswith("http") or url in seen or not pattern.search(blob):
             continue
-        tried += 1
-        text = _fetch_text(tools, url)
-        if not text:
+        if when and not criteria.in_window(icp, index, when):
             continue
-        sentence = ""
-        for candidate in re.split(r"(?<=[.!?])\s+", text[:WINDOW_CHARS]):
-            if pattern.search(candidate) and candidate.strip():
-                cut = event_sentence(candidate, name)
-                if cut and not _CHROME_RE.search(cut):
-                    sentence = cut
-                    break
-        when = body_dateline(text) or listed or find_date(text, url)
-        if not sentence or not when or not criteria.in_window(icp, index, when):
+        if key and key not in sm.company_name_key(blob):      # the story must name the company
             continue
-        if not confirm(name, signal_text, sentence):
-            continue
-        return {"matched_icp_signal": index, "url": url, "date": str(when)[:10], "description": sentence[:350],
-                "snippet": sentence[:600]}
-    return None
+        seen.add(url)
+        extra.append((url, when or None))
+    return scan(extra, PAID_RESULT_ROWS)
 
 
 def _date_shown(tools: Any, verified: Mapping[str, Any]) -> bool:
@@ -191,6 +247,15 @@ def attach(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], tool
     """Add at most one verified bonus row per bonus criterion to each row, in place; notes for the report."""
 
     notes: dict[str, Any] = {"added": [], "tried": 0}
+    paid_left = [MAX_PAID_SEARCHES]
+
+    def paid() -> bool:
+        if paid_left[0] <= 0 or clock() >= deadline:
+            return False
+        paid_left[0] -= 1
+        notes["paid_searches"] = notes.get("paid_searches", 0) + 1
+        return True
+
     n = criteria.count(icp)
     if n < 2:
         return notes
@@ -210,7 +275,7 @@ def attach(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], tool
                 if criteria.is_hiring(icp, index):
                     found = _hiring_candidate(tools, icp, index, name, domain)
                 else:
-                    found = _news_candidate(tools, icp, index, name, domain, primary_urls)
+                    found = _news_candidate(tools, icp, index, name, domain, primary_urls, paid)
             except BudgetExhausted:
                 notes["stopped"] = "budget"
                 return notes
@@ -241,4 +306,4 @@ def attach(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], tool
     return notes
 
 
-__all__ = ["attach", "role_groups", "title_matches", "confirm"]
+__all__ = ["attach", "role_groups", "title_matches", "confirm", "paid_query", "after_dateline"]

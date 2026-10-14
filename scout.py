@@ -800,6 +800,7 @@ def find_domain(tools: Any, name: str) -> str:
     except Exception:
         return ""
     from .vendored_psl import registrable_domain
+    matches: list[str] = []
     for row in rows[:10]:
         host = sm.registrable_host(str(row.get("url") or ""))
         if not host or any(bad in host for bad in _NOT_HOMEPAGES):
@@ -808,9 +809,42 @@ def find_domain(tools: Any, name: str) -> str:
             base = registrable_domain(host) or host
         except Exception:
             base = host
-        if _host_matches(base, key):
+        if _host_matches(base, key) and base not in matches:
+            matches.append(base)
+    # v102d: two hosts can carry the company's name.  On 10-11 ICP8 geosurge.com (an empty page) was taken before
+    # geosurge.ai (the company): the row went out with the wrong website and the judge could verify nothing, three
+    # judgments out of three, while the right site qualified 9 of 12 times on-chain.  The first host whose homepage
+    # names the company wins; a host whose homepage is an empty stub is never the company's site.
+    unknown = ""
+    for base in matches[:3]:
+        state = _homepage_state(tools, base, name)
+        if state == "names":
             return base
-    return ""
+        if state != "stub" and not unknown:
+            unknown = base
+    return unknown
+
+
+_STUB_CHARS = 200
+
+
+def _homepage_state(tools: Any, host: str, name: str) -> str:
+    """'names' when the readable homepage names the company, 'stub' when it is readable and all but empty, else
+    'unknown' (unreadable, or readable without the name)."""
+
+    try:
+        page = _homepage(tools, "https://" + host + "/")
+    except BudgetExhausted:
+        raise
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if page is None:
+        return "unknown"
+    title = str(getattr(page, "title", "") or "")
+    text = str(getattr(page, "text", "") or "")
+    if name_hit(name, title) or name_hit(name, text[:4000]):
+        return "names"
+    return "stub" if len((title + text).strip()) < _STUB_CHARS else "unknown"
 
 
 def resolve(tools: Any, cand: Mapping[str, Any]) -> dict[str, Any]:
@@ -884,15 +918,25 @@ def resolve(tools: Any, cand: Mapping[str, Any]) -> dict[str, Any]:
             if found and found not in seen_alt:
                 yield found, None, "site search"
 
+        # v104: a guessed site that does not name the company loses to an alternative whose homepage does, LinkedIn
+        # link or not; and an empty stub page is no website at all.  On 10-11 ICP8 the funding lane guessed
+        # geosurge.com (a 114-byte page) for geoSurge; geosurge.ai names the company but has no LinkedIn link, so it
+        # was passed over, the row went out with the stub and the judge could verify nothing (3 judgments of 3).
+        guessed_state = _homepage_state(tools, domain, name)
         for alt, row, source in alternatives():
-            if weak_identity(tools, "https://" + alt + "/", name):
+            if weak_identity(tools, "https://" + alt + "/", name) and not (
+                    guessed_state != "names" and _homepage_state(tools, alt, name) == "names"):
                 continue
             LAST.setdefault("domains_corrected", []).append(f"{name}: {domain} -> {alt} ({source})")
             domain = alt
             profile, profiled = (row or corpus_profile(alt)), True
             break
         else:
-            LAST.setdefault("domains_unnamed", []).append(f"{name}: {domain}")
+            if guessed_state == "stub":
+                LAST.setdefault("domains_stub", []).append(f"{name}: {domain}")
+                domain = ""
+            else:
+                LAST.setdefault("domains_unnamed", []).append(f"{name}: {domain}")
     website = ("https://" + domain + "/") if domain else ""
     linkedin, source = homepage_linkedin(tools, website), "homepage"
     if not linkedin:

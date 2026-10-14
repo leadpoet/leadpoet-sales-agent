@@ -22,7 +22,6 @@ import re
 from typing import Any, Mapping, Optional
 
 from . import criteria
-from . import judge_history
 from . import gates
 from . import scorer_mirror as sm
 
@@ -50,6 +49,12 @@ PREFLIGHT_EXA_UNKNOWN_Q = 0.8
 CRITICAL_GATES = ("country", "stage_evidence", "normalized_company", "output_document", "exclusion", "evidence_source")
 # v91: stages whose proof is a priced-round announcement.
 VENTURE_STAGES = ("pre seed", "seed", "series a", "series b", "series c", "series d", "series e", "series c+")
+# v110 (eventgrade): published 2026-10-12, the paying ICP - rows graded strong qualified 73%, weak 54%, none 11%,
+# 'not such an event' 0 of 8; over all rows 46%.  Two earlier rounds: intent passed 68% vs 15% by event_ok.
+EVENT_NOT_OK_Q = 0.15
+EVENT_NOT_OK_R = 0.8
+CHANGE_GRADE_Q = {"strong": 1.5, "weak": 1.1, "none": 0.4}
+CHANGE_NONE_R = 0.6
 BOARD_ONLY_Q = 0.3
 BOARD_ONLY_R = 0.85
 _BOARD_RE = re.compile(
@@ -62,6 +67,10 @@ _EXEC_ROLE_RE = re.compile(
     r"managing\s+director\b|executive\s+vice\s+president\b|senior\s+vice\s+president\b|evp\b|svp\b)"
     r"|\b(?:ceo|cfo|cto|coo)\s+(?:transition|succession|appointment)\b", re.I)
 _HEAD_CHARS = 160
+# v109: the board-only discount applies only when the criterion's own words ask for an executive role.
+_EXEC_CRITERION_RE = re.compile(
+    r"\b(?:c[- ]?level|c[- ]?suite|chief|ceo|cfo|cto|coo|cmo|cro|cio|ciso|executive|officer|vice\s+president|\bvp\b|"
+    r"head\s+of|president|managing\s+director|general\s+manager)\b", re.I)
 
 
 def _primary_signals(row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -100,6 +109,15 @@ def funding_round_named(row: Mapping[str, Any], icp: Mapping[str, Any]) -> bool:
     except Exception:  # noqa: BLE001 - an unreadable row is simply not treated as round-named
         return False
     return False
+
+
+def board_discounted(icp: Mapping[str, Any]) -> bool:
+    """Does the primary criterion name an executive role (so that a director's appointment does not meet it)?"""
+
+    try:
+        return bool(_EXEC_CRITERION_RE.search(str(criteria.signals(icp)[0].get("text") or "")))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def board_only_event(row: Mapping[str, Any], icp: Mapping[str, Any]) -> bool:
@@ -175,13 +193,17 @@ def estimates(row: Mapping[str, Any], icp: Mapping[str, Any]) -> dict[str, float
             eps += PREFLIGHT_EXA_UNKNOWN_EPS
         else:
             eps += PREFLIGHT_EXA_EPS
-    if board_only_event(row, icp):
+    if flags.get("event_ok") is False:
+        q *= EVENT_NOT_OK_Q
+        r = max(r, EVENT_NOT_OK_R)
+    grade = str(flags.get("change_grade") or "")
+    if grade in CHANGE_GRADE_Q:
+        q *= CHANGE_GRADE_Q[grade]
+        if grade == "none":
+            r = max(r, CHANGE_NONE_R)
+    if board_only_event(row, icp) and board_discounted(icp):
         q *= BOARD_ONLY_Q
         r = max(r, BOARD_ONLY_R)
-    try:
-        q, r = judge_history.adjust(q, r, row.get("company_name"), icp)   # v98: the judge's published record
-    except Exception:  # noqa: BLE001 - the model's own estimate stands
-        pass
     return {"q": max(0.01, min(0.9, q)), "r": max(0.0, min(0.9, r)), "eps": min(0.3, eps)}
 
 
@@ -229,7 +251,8 @@ def explain(row: Mapping[str, Any], icp: Mapping[str, Any]) -> dict[str, Any]:
             "ra_passed": claim.get("passed") if claim else None, "ra_quote": str(claim.get("evidence_quote") or "")[:160],
             "source": str(flags.get("source") or ""), "conflict": conflict(row),
             "rank_last": bool(flags.get("rank_last")), "round_named": funding_round_named(row, icp),
-            "board_only": board_only_event(row, icp)}
+            "board_only": board_only_event(row, icp), "event_ok": flags.get("event_ok"),
+            "change": flags.get("change_grade")}
 
 
 def expected_score(rows: list[Mapping[str, Any]], icp: Mapping[str, Any]) -> float:
@@ -293,11 +316,8 @@ def rank_key(row: Mapping[str, Any], icp: Mapping[str, Any]) -> tuple:
     row (``rank_last``) and a board-only leadership row last."""
 
     est = estimates(row, icp)
-    try:
-        proven = judge_history.strong(row.get("company_name"), icp)
-    except Exception:  # noqa: BLE001
-        proven = False
-    return (bool((row.get("_flags") or {}).get("rank_last")), board_only_event(row, icp), not proven,
+    return (bool((row.get("_flags") or {}).get("rank_last")), (row.get("_flags") or {}).get("event_ok") is False,
+            board_only_event(row, icp) and board_discounted(icp),
             staged(icp) and not stage_backed(row, icp), staged(icp) and not has_stage_evidence(row),
             -est["q"] * value(row, icp), -est["q"])
 
@@ -312,7 +332,7 @@ def _admit(pool: list[Mapping[str, Any]], icp: Mapping[str, Any], cap: int) -> t
         trial = chosen + [row]
         ev = expected_score(trial, icp)
         strong = (_tier(row) in SEND_TIERS and est["q"] * value(row, icp) >= LONE_MIN_QV
-                  and not board_only_event(row, icp))
+                  and not (board_only_event(row, icp) and board_discounted(icp)))
         if strong or ev > best_ev + 1e-9:
             chosen, best_ev = trial, ev
     return chosen, best_ev
@@ -332,30 +352,12 @@ def select(rows: list[Mapping[str, Any]], icp: Mapping[str, Any], *, limit: int 
     if off_category and len(off_category) < len(ranked):
         dropped.update({str(r.get("company_name")): "signal headline is not the ICP's kind of event" for r in off_category})
         ranked = [r for r in ranked if not any(r is f for f in off_category)]
-    # v98: a company the judge never qualified at this stage in six or more published verdicts, and penalised half
-    # the time or found at another stage, is not sent beside another row (on-chain 10-03..10-07: 90 such companies,
-    # e.g. Palantir 0 of 21 with 21 penalties, Pints AI 0 of 20 "stage unavailable").
-    history: dict[str, str] = {}
-    for r in ranked:
-        try:
-            why = judge_history.withhold_reason(r.get("company_name"), icp)
-        except Exception:  # noqa: BLE001
-            why = ""
-        if why:
-            history[str(r.get("company_name"))] = why
-    if history and len(history) < len(ranked):
-        notes_history = dict(history)
-        ranked = [r for r in ranked if str(r.get("company_name")) not in history]
-    else:
-        notes_history = {}
     unique, twins = one_per_site(ranked)
     pool = unique[:MAX_POOL]
     cap = max(1, min(cap_for(icp, pool), int(limit or 1)))
     notes: dict[str, Any] = {"pool": [str(r.get("company_name")) for r in pool], "cap": cap}
     if dropped:
         notes["conflicts"] = dropped
-    if notes_history:
-        notes["judge_history"] = notes_history
     if twins:
         notes["same_site"] = twins
     bare = [r for r in pool if staged(icp) and not stage_backed(r, icp)]

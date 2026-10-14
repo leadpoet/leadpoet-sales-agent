@@ -199,6 +199,15 @@ def complete_partial_tail(description: str, text: str) -> str:
     words = str(description or "").split()
     if len(words) < 3:
         return description
+    if re.search(r"(?:^|\s)[A-Z]\.$", str(description).strip()):
+        # v112: "... unanimously appointed Brantley J." - the sentence was split at an initial; the rest follows on the page
+        page = " ".join(str(text or "").split())
+        anchor = " ".join(words[-5:])
+        at = page.find(anchor)
+        if at >= 0:
+            rest = re.match(r"\s+[^.!?]{2,240}?[.!?](?=\s|$)", page[at + len(anchor): at + len(anchor) + 300])
+            if rest:
+                return str(description).strip() + rest.group(0).rstrip()
     tail = " ".join(words[-4:])
     flat = " ".join(str(text or "").split())
     match = re.search(re.escape(tail) + r"([A-Za-z]{1,20})\b", flat, re.I)
@@ -275,6 +284,53 @@ def signal_out(record: Mapping[str, Any], *, v5: bool) -> dict[str, Any]:
         return {"matched_icp_signal": record["matched_icp_signal"], "description": record["description"],
                 "date": record["date"], "url": record["url"]}
     return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+_PAGE_HEAD_CHARS = 6000
+_MD_PREFIX = re.compile(r"^\s{0,3}(?:#{1,6}\s+|[*_>\-]+\s+)")
+
+
+def page_event_description(text: Any, name: str, website: str, icp: Mapping[str, Any], idx: int, description: str,
+                           aliases: Any = ()) -> str:
+    """v102: the page's own statement of the event, for a description that does not name the event kind.
+
+    A news feed can pair an article's URL with another page's title: on 10-11 ICP8 geoSurge's blog page carried the
+    <title> of a different post, the row said "When brands disappear in AI ..." and the judge failed it ("source does
+    not establish the required intent") although the page's own headline and first sentence state the launch - the
+    same event qualified 9 of 12 times on-chain from the wire copy.  When the description lacks the criterion's event
+    words and the top of the page has a sentence that names the company with those words, this returns the page's
+    headline line (when it names the company) plus that sentence; '' otherwise (nothing changes)."""
+
+    try:
+        from .roster import CATEGORY_WORDS
+        category = criteria.category(icp, idx)
+    except Exception:  # noqa: BLE001 - an aid, never a dependency
+        return ""
+    words = CATEGORY_WORDS.get(category)
+    if not words or category == "HIRING" or criteria.is_hiring(icp, idx):
+        return ""
+    pattern = re.compile(words, re.I)
+    if pattern.search(str(description or "")):
+        return ""
+    heading, sentence = "", ""
+    for raw in str(text or "")[:_PAGE_HEAD_CHARS].split("\n"):
+        line = " ".join(_MD_PREFIX.sub("", raw).replace("**", "").split())
+        if len(line) < 20:
+            continue
+        if raw.lstrip().startswith("#") and not heading and len(line) <= 220 and company_named(name, website, line, aliases):
+            heading = line.rstrip(" #.")
+        for part in re.split(r"(?<=[.!?])\s+", line):
+            part = part.strip()
+            if 30 <= len(part) <= 320 and pattern.search(part) and company_named(name, website, part, aliases):
+                sentence = part
+                break
+        if sentence:
+            break
+    if not sentence:
+        return ""
+    if heading and sm.normalize_text(heading) not in sm.normalize_text(sentence):
+        return f"{heading}. {sentence}"
+    return sentence
 
 
 def verify_signal(signal: Mapping[str, Any], *, company: Mapping[str, Any], icp: Mapping[str, Any],
@@ -381,6 +437,21 @@ def verify_signal(signal: Mapping[str, Any], *, company: Mapping[str, Any], icp:
         description = _fit_description(cleaned or f"{name}: {snippet}")
         report.repaired.append((name, "ungrounded signal words removed from description"))
     description = _fit_description(complete_partial_tail(description, text))
+    try:                                                    # v107: page furniture cut from the description itself
+        unfurnished = idm.strip_page_chrome(description)
+    except Exception:  # noqa: BLE001
+        unfurnished = description
+    if unfurnished and unfurnished != description and not idm.is_posting_url(url) and \
+            sm.description_grounding(unfurnished, text) >= 0.4:
+        description = _fit_description(unfurnished)
+        report.repaired.append((name, "page furniture cut from the description"))
+    try:
+        rebuilt = page_event_description(text, name, website, icp, idx, description, company.get("aliases") or ())
+    except Exception:  # noqa: BLE001
+        rebuilt = ""
+    if rebuilt and not idm.is_posting_url(url):
+        description = _fit_description(rebuilt)
+        report.repaired.append((name, "description rebuilt from the page headline (title named no event)"))
     reason = sm.negation_reason(description, snippet)
     if reason:
         drop(reason, "signal_negated")

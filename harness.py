@@ -35,6 +35,7 @@ try:
     from . import admission, bonus, diagnostics, gates, governor, llm, lock, preflight
     from . import reverify as reverify_module
     from . import scout as scout_module
+    from . import eventgrade
     from . import intent_details as details_module
     from . import scorer_mirror as sm
     from .arena_tools import STRATEGY as _STRATEGY, ArenaTools
@@ -47,6 +48,7 @@ except ImportError:
     details_module = importlib.import_module(f"{_pkg}.intent_details")
     reverify_module = importlib.import_module(f"{_pkg}.reverify")
     scout_module = importlib.import_module(f"{_pkg}.scout")
+    eventgrade = importlib.import_module(f"{_pkg}.eventgrade")
     sm = importlib.import_module(f"{_pkg}.scorer_mirror")
     _tools_mod = importlib.import_module(f"{_pkg}.arena_tools")
     _STRATEGY, ArenaTools = _tools_mod.STRATEGY, _tools_mod.ArenaTools
@@ -254,6 +256,31 @@ def _evidence_for(row: Mapping[str, Any], report: Any) -> list[dict[str, Any]]:
     return [e for e in items if (e.get("index"), e.get("url")) in urls]
 
 
+def _bonus_paragraph_guard(chosen: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], notes: dict) -> None:
+    """v112: a bonus signal is kept only with a model-written paragraph the local review accepted.
+
+    A verified bonus lifts a qualified row from 54 to 80, but a row whose paragraph fails the judge's review scores
+    nothing.  When the writer fell back to the template for a row that carries a bonus signal, the bonus signal is
+    taken out and the paragraph is written again for the primary event alone."""
+
+    dropped: list[str] = []
+    for row in chosen:
+        if not (row.get("_flags") or {}).get("paragraph_fallback"):
+            continue
+        signals = row.get("intent_signals") or []
+        if not any(isinstance(s.get("matched_icp_signal"), int) and s["matched_icp_signal"] >= 1 for s in signals):
+            continue
+        row["intent_signals"] = [s for s in signals if s.get("matched_icp_signal") in (0, None)]
+        row["_flags"].pop("bonus", None)
+        key = sm.company_name_key(row.get("company_name"))
+        again = details_module.write_paragraphs([row], icp, evidence={key: _evidence_for(row, report)},
+                                                model_name=PARAGRAPH_MODEL)
+        dropped.append(f"{str(row.get('company_name') or '')[:40]}: "
+                       f"{'model paragraph' if again.get('accepted') else 'template'} for the primary event")
+    if dropped:
+        notes["bonus_dropped_for_paragraph"] = dropped
+
+
 def _refresh_fallbacks(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any]) -> None:
     for row in rows:
         signals = _evidence_for(row, report)
@@ -267,14 +294,30 @@ def _reverify(rows: list[dict[str, Any]], icp: Mapping[str, Any]) -> tuple[list[
 
     kept, notes = reverify_module.rerank([strip_internal(r) for r in rows], icp)
     contested = {str(site) for site in (notes or {}).get("contested") or []}
+    blanked = {str(site) for site in (notes or {}).get("linkedin_blanked") or []}
+    adopted = (notes or {}).get("website_adopted") or {}
     by_site = {str(r.get("company_website") or ""): r for r in rows}
     out = []
     for match in kept:
-        row = by_site.pop(str(match.get("company_website") or ""), None)
+        site = str(match.get("company_website") or "")
+        move = adopted.get(site) if isinstance(adopted, Mapping) else None
+        row = by_site.pop(str(move.get("from") or "") if isinstance(move, Mapping) else site, None)
         if row is None:
             continue
+        if isinstance(move, Mapping):
+            # v105: the re-check named the company's real website; the row follows it (see reverify.rerank)
+            old_host = sm.registrable_host(str(row.get("company_website") or ""))
+            row["company_website"], row["company_linkedin"] = site, ""
+            if move.get("employee_count"):
+                row["employee_count"] = str(move["employee_count"])
+            claim = row.get("required_attribute")
+            if isinstance(claim, Mapping) and old_host and sm.registrable_host(str(claim.get("evidence_url") or "")) == old_host:
+                row.pop("required_attribute", None)          # a quote read on the wrong site proves nothing
+        if str(row.get("company_website") or "") in blanked:
+            row["company_linkedin"] = ""          # v102c: the re-check contradicted the slug, not the company
         if str(row.get("company_website") or "") in contested:
             row.setdefault("_flags", {})["rank_last"] = True
+            row["_flags"]["recheck_mismatch"] = True
         out.append(row)
     return out, notes
 
@@ -295,12 +338,42 @@ def _rv_reasons(notes: Mapping[str, Any]) -> dict[str, str]:
     for entry in (notes or {}).get("companies") or []:
         if isinstance(entry, Mapping):
             why = entry.get("reason") or entry.get("error") or entry.get("overall") or ""
-            out[str(entry.get("company") or "?")[:60]] = f"{entry.get('overall') or ''}: {str(why)[:160]}".strip(": ")
+            extra = ""
+            if entry.get("identity_code"):
+                extra += f" [identity {entry.get('identity_code')}, observed {entry.get('observed_domain')}]"
+            if entry.get("website_adopted"):
+                extra += f" [website adopted: {entry.get('website_adopted')}]"
+            if entry.get("linkedin_blanked"):
+                extra += " [LinkedIn slug blanked]"
+            out[str(entry.get("company") or "?")[:60]] = (f"{entry.get('overall') or ''}: {str(why)[:160]}".strip(": ") + extra)
     return out
 
 
 def _reverify_step(chosen: list[dict[str, Any]], rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any],
                    clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """v102: the re-check step, then a row it contradicted on a fit dimension is not sent beside another row.
+
+    On-chain (10-09 and 10-11) the rows our re-check called a mismatch and we sent anyway qualified 0 times in 58
+    (ClearJet, Cohere, Ivee, soCash, Auger, ...); beside a qualifier each such row costs 10 points.  Alone it stays:
+    an ICP score cannot go below zero."""
+
+    final, notes = _reverify_step_inner(chosen, rows, report, icp, clock, limit)
+    def _has_bonus(r: Mapping[str, Any]) -> bool:
+        return any(isinstance(s.get("matched_icp_signal"), int) and s["matched_icp_signal"] >= 1
+                   for s in r.get("intent_signals") or [])
+
+    contested = [r for r in final if (r.get("_flags") or {}).get("recheck_mismatch")]
+    held = [r for r in contested if not _has_bonus(r)]      # v111: a bonus row is worth 80 against a 10-point risk
+    if len(held) < len(contested):
+        notes["contested_kept_for_bonus"] = [str(r.get("company_name")) for r in contested if _has_bonus(r)]
+    if held and len(held) < len(final):
+        final = [r for r in final if not any(r is h for h in held)]
+        notes["withheld_contested"] = [str(r.get("company_name")) for r in held]
+    return final, notes
+
+
+def _reverify_step_inner(chosen: list[dict[str, Any]], rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any],
+                         clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """(the rows to submit, notes).  A company the re-check drops leaves the output even when nothing is left.
     With time to spare, admission runs again over the verified rows minus every dropped company, and the new picks
     get their paragraph and one re-check of their own."""
@@ -408,6 +481,10 @@ def run_icp(icp: dict) -> list[dict]:
         LAST_REPORT["verify"] = report.counts()
         LAST_REPORT["verify_drops"] = report.details()
         LAST_REPORT["verified"] = [r.get("company_name") for r in rows]
+        try:                                        # v110: one cheap call grades each row's cited announcement
+            LAST_REPORT["eventgrade"] = eventgrade.grade(rows, icp) if rows else {}
+        except Exception as exc:  # noqa: BLE001 - grading is optional
+            LAST_REPORT["eventgrade"] = {"error": type(exc).__name__}
         if rows and time.monotonic() < clock.paid_cutoff and (rescue or gov.headroom() < BONUS_MIN_HEADROOM_USD):
             LAST_REPORT["bonus"] = {"skipped": "rescue" if rescue else "headroom %.3f" % gov.headroom()}
         elif rows and time.monotonic() < clock.paid_cutoff:
@@ -437,6 +514,10 @@ def run_icp(icp: dict) -> list[dict]:
             evidence = {sm.company_name_key(r.get("company_name")): _evidence_for(r, report) for r in chosen}
             LAST_REPORT["paragraph"] = details_module.write_paragraphs(chosen, icp, evidence=evidence,
                                                                        model_name=PARAGRAPH_MODEL)
+            try:
+                _bonus_paragraph_guard(chosen, report, icp, LAST_REPORT["paragraph"])
+            except Exception as exc:  # noqa: BLE001 - the rows stay as the writer left them
+                LAST_REPORT["paragraph"]["bonus_guard_error"] = type(exc).__name__
             locker.lock(chosen)
         if REVERIFY_ENABLED and locker.locked and time.monotonic() < clock.paid_cutoff - 30.0:
             final, LAST_REPORT["reverify"] = _reverify_step(chosen, rows, report, icp, clock, limit)

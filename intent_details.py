@@ -235,6 +235,56 @@ def states_date(text: Any, value: Any) -> bool:
     return any(form.casefold() in flat for form in forms)
 
 
+# --- page furniture glued to an event description (v107) --------------------------------------------------------------
+# A press-wire or investor-relations page hands its headline back with the page furniture around it:
+#   "First Horizon Hires Scott Serpico as Senior Vice President, Head of Product Accessibility Statement Skip Navigation
+#    First Horizon Hires ... News provided by First Horizon Corporation Jul 23, 2026, 18:00 ET Share this article ..."
+#   "Remitly Appoints Sebastian J. Gunningham as Chief Executive Officer | Remitly Global, Inc Back to news releases ..."
+# Both reached the paragraph, and the judge failed both paragraphs.  The event text is what stands before the furniture.
+_PAGE_CHROME_RE = re.compile(
+    r"\b(?:accessibility statement|skip navigation|skip to (?:main )?content|news provided by|share this article|"
+    r"share to x|share on (?:x|twitter|facebook|linkedin)|back to (?:all )?(?:news|press)(?: releases?)?(?: list)?(?: page)?|"
+    r"continue reading|read more|view all (?:news|press releases)|download (?:the )?pdf|print this page|email alerts?|"
+    r"news releases? \d{1,2} [a-z]{3,9} \d{4})\b", re.I)
+_TITLE_BAR_RE = re.compile(r"\s(?:[|•·]|::)\s")
+_HEADING_GLUE_RE = re.compile(r"\s#{1,6}\s")
+_CHROME_MIN_WORDS = 5
+
+
+def strip_page_chrome(text: Any) -> str:
+    """The description without page furniture: a "Headline | Site name" title keeps its headline side, a glued markdown
+    heading is cut, and the text before the first furniture phrase is kept when at least five words stand there
+    (otherwise the text after the last one).  Only cuts, never invents; a text that would be left with fewer than five
+    words is returned unchanged."""
+
+    flat = " ".join(str(text or "").split())
+    if not flat:
+        return flat
+    best = flat
+    parts = [p.strip(" -|•·") for p in _TITLE_BAR_RE.split(best) if p.strip(" -|•·")]
+    if len(parts) > 1:
+        long_parts = [p for p in parts if len(p.split()) >= _CHROME_MIN_WORDS and not _PAGE_CHROME_RE.match(p)]
+        if long_parts:
+            best = long_parts[0]
+    glue = _HEADING_GLUE_RE.search(best)
+    if glue and len(best[:glue.start()].split()) >= _CHROME_MIN_WORDS:
+        best = best[:glue.start()].strip(" -|•·,;:")
+    found = _PAGE_CHROME_RE.search(best)
+    if found:
+        head = best[:found.start()].strip(" -|•·,;:")
+        if len(head.split()) >= _CHROME_MIN_WORDS:
+            best = head
+        else:
+            last = None
+            for last in _PAGE_CHROME_RE.finditer(best):
+                pass
+            tail = best[last.end():].strip(" -|•·,;:") if last is not None else ""
+            if len(tail.split()) >= _CHROME_MIN_WORDS:
+                best = tail
+    best = " ".join(best.split())
+    return best if len(best.split()) >= _CHROME_MIN_WORDS else flat
+
+
 def _clause(company_name: str, description: str) -> str:
     """'<Name> raised ...' from a description that may or may not name the company."""
 
@@ -243,7 +293,7 @@ def _clause(company_name: str, description: str) -> str:
         return ""
     if sm.company_name_key(desc.split(" ")[0]) == sm.company_name_key(company_name) or \
             desc.casefold().startswith(company_name.casefold()) or \
-            sm.company_name_key(company_name) in sm.company_name_key(" ".join(desc.split()[:8])):
+            sm.company_name_key(company_name) in sm.company_name_key(" ".join(desc.split()[:16])):
         return desc
     first = desc.split(" ", 1)[0]
     if first.casefold() in _LEADING_VERBS:
@@ -337,6 +387,10 @@ def _short(text: str, limit: int = 220) -> str:
 # on the two wordings: sentence case 6 of 6, pasted headline 4 of 6 (it fails natural_paragraph).
 _HEADLINE_RULE = ("Do not paste a headline: write the event as a normal sentence in sentence case, with capital letters "
                   "only on names (companies, people, products, places).")
+_HEADLINE_VERBS = frozenset("""
+announces launches unveils introduces releases debuts expands invests raises secures closes opens names appoints hires
+joins acquires completes signs wins adds extends enters selects achieves earns receives becomes promotes elects taps
+""".split())
 _MONTH_WORDS = frozenset("january february march april may june july august september october november december".split())
 _PLAIN_CAP_RE = re.compile(r"^[A-Z][a-z]+$")
 _SMALL_WORDS = frozenset("with from into over amid after than that this upon onto near plus your their".split())
@@ -406,7 +460,12 @@ def headline_fix(text: Any, *, name: str = "", reference: str = "") -> tuple[str
             elif word in _HEADLINE_COMMON or word in lower_ref:
                 targets.append(i)
         if sum(1 for i in targets if len(tokens[i].strip(_EDGE + ".")) >= 3) < 2:
-            return 0
+            # v107: "<Company> Appoints Jane Doe as Chief Executive Officer" has one common word only - the verb right
+            # after the company's name.  That verb is lowered; names and titles keep their capitals.
+            first_i, first_core = run[0]
+            before = tokens[first_i - 2].strip(_EDGE).rstrip(".").casefold() if first_i >= 2 else ""
+            if not (targets == [first_i] and first_core.casefold() in _HEADLINE_VERBS and before in name_words):
+                return 0
         for i in targets:
             tokens[i] = re.sub(r"[A-Z]", lambda m: m.group(0).lower(), tokens[i], count=1)
         return len(targets)
@@ -465,7 +524,7 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
     primary = next((i for i, s in enumerate(signals)
                     if s.get("index", s.get("matched_icp_signal")) == 0), 0)
     for position, signal in enumerate(signals):
-        desc = str(signal.get("description") or "")
+        desc = strip_page_chrome(signal.get("description") or "")
         key = sm.normalize_text(desc)[:80]
         if not desc or key in seen:
             continue
@@ -480,6 +539,8 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
         desc = strip_relative(desc)
         clause = _clause(name, _short(desc, 220 if len(signals) <= 1 else 140))
         when = human_date(signal.get("date")) if signal.get("date_visible", True) else ""
+        if re.match(r"(?:On|In|As of|Effective|During|Following)\s", clause):      # v112: no capital after "that"
+            clause = clause[0].lower() + clause[1:]
         sentence = (f"A source dated {when} reports that {clause}." if when and when.casefold() not in clause.casefold()
                     else f"{clause}.")
         if _FIRST_PERSON_RE.match(" ".join(desc.split())):
@@ -909,10 +970,12 @@ def write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
         if text:
             company["intent_details"] = text
             notes["accepted"] += 1
+            company.setdefault("_flags", {}).pop("paragraph_fallback", None)
         else:
             company["intent_details"] = fallback_paragraph(company_name=str(company.get("company_name") or ""),
                                                            icp=icp, signals=evidence.get(key, []))
             notes["fallback"] += 1
+            company.setdefault("_flags", {})["paragraph_fallback"] = True
             if len(notes.setdefault("rejected", [])) < 8:
                 notes["rejected"].append(f"{str(company.get('company_name') or '')[:40]}: {rule[:100]}")
     return notes

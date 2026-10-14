@@ -1309,6 +1309,16 @@ def _run_all(companies, icp, *, model: str):
         return list(pool.map(lambda c: _ask(build_prompt(c, icp), model=model), companies))
 
 
+def host_carries_name(domain: Any, name_key: Any) -> bool:
+    """Is the first label of this host the company's name (key form), bare or with a short affix ('getacme', 'acmehq')?"""
+
+    label = str(domain or "").split(".")[0].replace("-", "").lower()
+    squashed = str(name_key or "").replace(" ", "").lower()
+    if len(squashed) < 4 or not label:
+        return False
+    return label == squashed or (squashed in label and len(label) - len(squashed) <= 4)
+
+
 def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_client_factory=None,
            timeout: float = TIMEOUT_S, model: str = MODEL) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Drop only a name/website mismatch; rank other contradictions last (``notes['contested']``); adopt the
@@ -1345,9 +1355,47 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
                     company = renamed
                     decision = decide(verdict, company, icp)
                     identity = decision["identity"]
+        # v105: when our website is wrong the re-check names the right one - and the company used to be dropped.
+        # On 10-11 ICP8 the funding lane guessed geosurge.com for geoSurge (an empty page); the re-check observed
+        # geosurge.ai in four runs and each time the company was dropped, although that site qualified 9 of 12 times
+        # on-chain.  The observed website is adopted when the observed NAME is ours and the observed host carries
+        # that name; the LinkedIn slug (read from the wrong site) is blanked and the size bucket follows the
+        # observation when the ICP allows it.  The same verdict then decides again.
+        if (identity["decision"] == MISMATCH and identity.get("reason_code") == "identity_mismatch"
+                and identity.get("observed_domain") and identity.get("submitted_domain")
+                and identity.get("observed_domain") != identity.get("submitted_domain")
+                and identity.get("observed_name") and identity.get("observed_name") == identity.get("submitted_name")
+                and host_carries_name(identity.get("observed_domain"), identity.get("submitted_name"))):
+            moved = dict(company, company_website="https://%s/" % identity["observed_domain"], company_linkedin="")
+            bucket = _observed_bucket(verdict.get("observed_employee_count"))
+            if bucket and bucket in sm.icp_buckets(icp):
+                moved["employee_count"] = bucket
+            redo = decide(verdict, moved, icp)
+            if redo["identity"]["decision"] == MATCH:
+                was = str(company.get("company_website") or "")
+                entry["website_adopted"] = f"{was} -> {moved['company_website']}"
+                notes.setdefault("website_adopted", {})[moved["company_website"]] = {
+                    "from": was, "employee_count": moved.get("employee_count") if bucket else ""}
+                company, decision, identity = moved, redo, redo["identity"]
+        # v102c: an identity mismatch on the SAME website can only come from the LinkedIn slug (or the name rule a slug
+        # switches on).  The judge accepts an empty company_linkedin and binds the company through its homepage; a
+        # wrong slug is what fails.  So the slug is blanked and the company stays (geoSurge, 10-11 ICP8: observed
+        # domain geosurge.ai = submitted, dropped in two runs; the judge qualified it 9 of 12 times with no slug).
+        if (identity["decision"] == MISMATCH and identity.get("reason_code") == "identity_mismatch"
+                and identity.get("observed_domain") and identity.get("observed_domain") == identity.get("submitted_domain")
+                and str(company.get("company_linkedin") or "").strip()):
+            bare = dict(company, company_linkedin="")
+            redo = decide(verdict, bare, icp)
+            if redo["identity"]["decision"] != MISMATCH:
+                entry["linkedin_blanked"] = True
+                notes.setdefault("linkedin_blanked", []).append(str(company.get("company_website") or ""))
+                company, decision, identity = bare, redo, redo["identity"]
         entry.update(overall=decision["overall"], identity=decision["identity"]["decision"],
                      dimensions=decision["dimensions"], reason=decision["reason"],
                      failure_class=decision.get("failure_class", ""))
+        if identity["decision"] == MISMATCH:
+            entry["identity_code"] = str(identity.get("reason_code") or "")
+            entry["observed_domain"] = str(identity.get("observed_domain") or "")[:80]
         notes["companies"].append(entry)
         if decision["overall"] == MISMATCH and identity["decision"] == MISMATCH:
             entry["dropped"] = True
