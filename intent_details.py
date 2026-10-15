@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os as _os
 import re
 import unicodedata
 from datetime import date
@@ -63,6 +64,53 @@ _BILATERAL_RE = re.compile(r"\bagreement\b|\bsign(?:s|ed|ing)?\b|\bjoint\b|\bco-
 _UNIT_SPLIT_RE = re.compile(r"(?<=[.!?][\"'’”])\s+|(?<=[.!?])\s+")
 _FIRST_PERSON_RE = re.compile(r"^\W*(?:\S+\s+){0,3}?(?:[Ww]e|[Ww]e['’](?:re|ve|ll|d)|[Oo]ur|[Oo]urs|I['’](?:m|ve)|[Mm]y)\b")
 
+#: ARENA_STRIP_CHROME (on; 0 restores the parent exactly).
+#:
+#: A page reader hands a signal description back with the headline glued to its own markdown heading and to site
+#: chrome.  Three of our own 10-13 rows carried it: "... Grid Resilience | S&C Electric # S&C Expands U.S. ...",
+#: "BayCom Corp Announces ... Apr 23, 2026 4:30 PM Eastern Daylight Time # BayCom Corp Announces ... Share ---",
+#: and a stage quote opening "Ok, Thanks Series A ...".  The judge's paragraph rule is "natural prose, not
+#: headings, bullet lists, field labels".  Heading marks, bold marks and table bars go; cookie-banner and share
+#: chrome goes; a headline repeated after its own heading is cut at the repeat.  Ported from the arena-2026-10-13
+#: fleet tree (v100g) and extended with the chrome our own reader produces.
+_MD_MARK_RE = re.compile(r"(?:^|\s)#{1,6}(?=\s|$)|\*\*|__|(?<=\s)\|(?=\s)")
+_CHROME_RE = re.compile(
+    r"^(?:ok,?\s*thanks|accept(?:\s+all)?(?:\s+cookies)?|got\s+it|dismiss|skip\s+to\s+(?:main\s+)?content)\b[\s,.:|-]*"
+    r"|\bshare\s*-{2,}\s*"
+    r"|\b\d{1,2}:\d{2}\s*(?:AM|PM)\s+[A-Z][a-z]+\s+(?:Daylight|Standard)\s+Time\b\s*",
+    re.I,
+)
+
+
+def strip_chrome_enabled() -> bool:
+    return str(_os.environ.get("ARENA_STRIP_CHROME", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def strip_markdown_dup(text: Any) -> str:
+    """The description without markdown heading marks, site chrome, or a headline repeated after its own heading."""
+
+    flat = " ".join(str(text or "").split())
+    if not strip_chrome_enabled():
+        return flat
+    parts = [p.strip(" -|") for p in re.split(r"\s#{1,6}\s|\s#{1,6}$|^#{1,6}\s", flat) if p.strip(" -|")]
+    if len(parts) > 1:
+        head = parts[0]
+        key = head.casefold()[:40]
+        rest = [p for p in parts[1:] if not p.casefold().startswith(key) and not key.startswith(p.casefold()[:40])]
+        flat = " ".join([head] + rest)
+    # "Headline | Site Name": a short trailing brand segment after a bar is page chrome, not part of the event
+    m = re.match(r"^(.*?\S)\s+\|\s+([^|]{2,60})$", flat)
+    if m and len(m.group(1).split()) >= 6 and len(m.group(2).split()) <= 5:
+        flat = m.group(1)
+    flat = _MD_MARK_RE.sub(" ", flat)
+    flat = _CHROME_RE.sub(" ", flat)
+    words = flat.split()
+    for n in range(6, len(words) // 2 + 1):
+        if words[:n] == words[n:2 * n]:
+            flat = " ".join(words[n:])
+            break
+    return " ".join(flat.split()).strip(" -|,")
+
 _ATS_HOST_RE = re.compile(r"(?:^|\.)(?:greenhouse\.io|ashbyhq\.com|lever\.co|myworkdayjobs\.com|workable\.com|smartrecruiters\.com|"
                           r"bamboohr\.com|recruitee\.com|jobvite\.com|icims\.com|breezy\.hr|teamtailor\.com|pinpointhq\.com)$", re.I)
 _POSTING_PATH_RE = re.compile(r"[?&]gh_jid=|/(?:careers?|jobs?|positions?|openings?|vacanc\w*)/[^?#]*[\w-]{4,}", re.I)
@@ -85,6 +133,35 @@ _LOC_RES = (re.compile(r"\*\*Location:?\*\*:?\s*(?P<v>[^*]{2,120}?)\s*-?\s*(?=\*
             re.compile(r"\bLocation\s+(?!Type\b)(?P<v>[^*]{2,120}?)\s+(?=Employment\s+Type|Location\s+Type|Department|Compensation|Team\b)"))
 _DEPT_RES = (re.compile(r"\*\*Department:?\*\*:?\s*(?P<v>[^*]{2,80}?)\s*-?\s*(?=\*\*|$)"),
              re.compile(r"\bDepartment:?\s+(?P<v>[^*:]{2,80}?)(?=\s+(?:Compensation|Overview|Employment\s+Type|Location|Team|Apply)\b|\s*$)"))
+
+
+#: ARENA_PERSONAL_POST_ATTRIBUTION (on; 0 restores the parent exactly).
+#:
+#: 10-13 forensic, our own row: Scowtt was the ONE row the judge actively rejected at intent_details rather than
+#: failed to verify.  The paragraph said "Scowtt announced a strategic partnership with LiveRamp"; the source was a
+#: linkedin.com/posts/ URL -- an individual's post reading "We're excited to announce ...".  The judge checks every
+#: fact against the cited evidence, and a person's post does not support "<company> announced".  A post under
+#: linkedin.com/posts/, /pulse/ or /feed/update/ is attributed to the post, the way a first-person quote already is.
+_PERSONAL_POST_HOST_RE = re.compile(r"^(?:[a-z]{2,3}\.)?linkedin\.com$", re.I)
+_PERSONAL_POST_PATHS = ("/posts/", "/pulse/", "/feed/update/")
+
+
+def personal_post_attribution_enabled() -> bool:
+    return str(_os.environ.get("ARENA_PERSONAL_POST_ATTRIBUTION", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def is_personal_post_url(url: Any) -> bool:
+    """A LinkedIn post or article by a person, which cannot stand as the company's own announcement."""
+
+    if not personal_post_attribution_enabled():
+        return False
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    return bool(_PERSONAL_POST_HOST_RE.match(host)) and parts.path.lower().startswith(_PERSONAL_POST_PATHS)
 
 
 def is_posting_url(url: Any) -> bool:
@@ -301,6 +378,50 @@ def _clause(company_name: str, description: str) -> str:
     return f"{company_name} {desc}"
 
 
+#: ARENA_OFFERING_FOCUS (on; falsy restores this tree's original phrase exactly).
+#:
+#: `_icp_focus` splits product_service at " that ", so an ICP whose product_service opens "A company that develops,
+#: owns, or operates utility-scale energy assets..." collapses to the bare words "a company", and then EVERY
+#: paragraph on that ICP closes "... own work on a company."  The phrase also reaches the model as
+#: `offering_phrase`, so drafted paragraphs are damaged too, not only the deterministic fallbacks.  Verified still
+#: live on THIS tree: of the 40 ICPs published across 10-09..10-12 it fires on arena-2026-10-10 ICP 0, and when it
+#: fires it damages every row on that ICP (our Avantus row failed intent_details on exactly that clause).
+#: The guard substitutes the ICP's own sub_industry, then its industry, and otherwise returns the head unchanged.
+_GENERIC_FOCUS = frozenset({"company", "companies", "business", "businesses", "organization", "organisation",
+                            "firm", "provider", "vendor", "platform", "solution", "service", "product"})
+_OFFERING_FOCUS_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def offering_focus_guard_enabled() -> bool:
+    """On unless ARENA_OFFERING_FOCUS is explicitly falsy."""
+
+    raw = str(_os.environ.get("ARENA_OFFERING_FOCUS") or "").strip().lower()
+    return raw not in _OFFERING_FOCUS_FALSE if raw else True
+
+
+def _generic_focus(phrase: str) -> bool:
+    """True when the phrase names no offering at all -- a bare 'a company', never 'a software platform'."""
+
+    core = re.sub(r"^(?:a|an|the)\s+", "", " ".join(str(phrase or "").split()).lower()).strip(" ,.;:")
+    return core in _GENERIC_FOCUS
+
+
+def _lead_lower(phrase: str) -> str:
+    return (phrase[0].lower() + phrase[1:]) if len(phrase) > 1 and phrase[1].islower() else phrase
+
+
+def _focus_or_industry(head: str, icp: Mapping[str, Any]) -> str:
+    """The head, unless it collapsed to a bare generic noun; then the ICP's own sub_industry, then its industry."""
+
+    if not (offering_focus_guard_enabled() and _generic_focus(head)):
+        return head
+    for alt in (icp.get("sub_industry"), icp.get("industry")):
+        alt = " ".join(str(alt or "").split()).rstrip(" ,.;:")
+        if alt and not _generic_focus(alt):
+            return _lead_lower(alt[:110].rsplit(" ", 1)[0] if len(alt) > 110 else alt)
+    return head
+
+
 def _icp_focus(icp: Mapping[str, Any]) -> str:
     product = " ".join(str(icp.get("product_service") or "").split())
     if product:
@@ -310,9 +431,10 @@ def _icp_focus(icp: Mapping[str, Any]) -> str:
         head = re.split(r",|;| that | which | used to | to help | for ", product, maxsplit=1)[0].strip()
         if len(head) > 110:
             head = head[:110].rsplit(" ", 1)[0]
-        return head.rstrip(" ,.;:") or product[:110].rsplit(" ", 1)[0]
+        return _focus_or_industry(head.rstrip(" ,.;:") or product[:110].rsplit(" ", 1)[0], icp)
     prompt = " ".join(str(icp.get("prompt") or "").split())
-    return (prompt[:110].rsplit(" ", 1)[0] if len(prompt) > 110 else prompt) or "the buyer's offering"
+    return _focus_or_industry(
+        (prompt[:110].rsplit(" ", 1)[0] if len(prompt) > 110 else prompt) or "the buyer's offering", icp)
 
 
 _CLOSINGS = {
@@ -543,9 +665,11 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
             clause = clause[0].lower() + clause[1:]
         sentence = (f"A source dated {when} reports that {clause}." if when and when.casefold() not in clause.casefold()
                     else f"{clause}.")
-        if _FIRST_PERSON_RE.match(" ".join(desc.split())):
+        personal = is_personal_post_url(signal.get("url"))
+        if personal or _FIRST_PERSON_RE.match(" ".join(desc.split())):
             body = " ".join(desc.split()).strip("\"'“” ").rstrip(".")
-            sentence = f'A source dated {when} reports that "{body}."' if when else f'A source reports that "{body}."'
+            src = "A LinkedIn post" if personal else "A source"
+            sentence = f'{src} dated {when} reports that "{body}."' if when else f'{src} reports that "{body}."'
         sentence = _CONTROL_RE.sub(" ", sentence)
         try:
             sentence = headline_fix(sentence, name=name, reference=_signal_reference(signals))[0]
@@ -807,6 +931,7 @@ A reviewer will check every sentence ONLY against the verified evidence provided
 1. One natural paragraph per company, plain prose, 2-4 sentences and at most 600 characters, no headings, bullets, labels or scores.
 2. State EVERY verified signal with the date of its SOURCE, phrased as a report: "A report dated August 12, 2026 says Acme raised a $12 million Series A." A publication date is not an event date: write "On <date>, <company> did X" ONLY when the verbatim_quote itself gives that date for the event. Every fact (amounts, places, products, people, customers, stages) must appear in that signal's verbatim_quote; leave out anything the quote does not state, even if it is in the description. A job posting is not a hire, an announced plan is not a completed expansion. A quote written in the first person ("we", "our") is attributed to its source, never restated as the company's own words.
 2b. Never paste a headline. Write the event as a normal sentence in sentence case, with capital letters only on names (companies, people, products, places): "Acme invests in U.K. growth with a new London hub", not "Acme Invests in U.K. Growth with New London Hub".
+2c. A source whose URL is under linkedin.com/posts/, linkedin.com/pulse/ or linkedin.com/feed/update/ is a PERSON's post, not a company announcement. Never write "<company> announced" from such a source; write "A LinkedIn post dated <date> says ..." and quote or closely paraphrase the post.
 3. Do not invent recency, urgency, budget, pain, tools, purchases or buying intent. Never use relative-time words such as recent, recently, newly, just, latest, this year or last month: give the absolute date and name its source ("On September 3, 2026, Acme announced ..." or "A report dated September 3, 2026 says ..."). Commercial implications only as clearly conditional inference, in one sentence using may or could.
 4. The ICP's product/service describes what the TARGET company itself builds or sells (its own offering); it is not something sold to the company. In one conditional clause, say what the verified activity may mean for that own offering and name it with the icp offering_phrase or a close paraphrase ("This funding may help Acme expand its <offering_phrase>."). Never describe the company as needing, buying, adopting or subscribing to a platform, vendor or tool; never say it may evaluate, benefit from, need or show interest in tools or platforms, or create opportunities for vendors, providers or solutions. And do not echo the ICP's wording or filters: never restate the company's funding stage ("Series C+"), employee count ("51-200 employees"), country, region, industry label or the time window unless the verbatim_quote itself states it.
 5. Combine sources that describe the same event; do not repeat one event twice.
@@ -923,8 +1048,62 @@ def write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
                      timeout: float = 0.0, http_client_factory=None) -> dict[str, Any]:
     """Attach a checked paragraph to every company IN PLACE; each company falls back to the template alone."""
 
+    return _write_paragraphs(companies, icp, evidence=evidence, model_name=model_name,
+                             timeout=timeout, http_client_factory=http_client_factory)
+
+
+#: ARENA_SIGNAL_QUOTE_GUARD (on; falsy restores the unguarded model path exactly).
+#:
+#: The writer's own rules forbid stating any fact that is not inside a signal's verbatim quote.  A signal that
+#: arrives with a title, a date and an EMPTY quote therefore leaves the model nothing it is permitted to say, and
+#: it writes "No signals are available for this company at this time." -- a sentence that exists in no file of
+#: this tree -- so the row dies at the LAST gate having passed the other seven.  Defakto died exactly that way on
+#: both 10-10 entries that carried it.  The judge's own paragraph review accepts a clause supported by "their
+#: verbatim_quote, description or date", which is precisely what `fallback_paragraph` produces from descriptions
+#: and dates, so a company with no quoted signal is held back from the model call and keeps the deterministic
+#: paragraph instead.  A no-op whenever any signal carries a quote: 1,850 of 1,852 published rows.
+_SIGNAL_QUOTE_GUARD_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def signal_quote_guard_enabled() -> bool:
+    """On unless ARENA_SIGNAL_QUOTE_GUARD is explicitly falsy."""
+
+    raw = str(_os.environ.get("ARENA_SIGNAL_QUOTE_GUARD") or "").strip().lower()
+    return raw not in _SIGNAL_QUOTE_GUARD_FALSE if raw else True
+
+
+def has_quoted_signal(signals: list) -> bool:
+    """True when at least one verified signal carries verbatim quote text the writer may restate."""
+
+    return any(str((signal or {}).get("quote") or "").strip() for signal in signals or [])
+
+
+def _apply_fallback(companies: list, icp: Mapping[str, Any], evidence: Mapping[str, Any], notes: dict) -> None:
+    """The deterministic paragraph, counted exactly as the model path counts its own fallbacks."""
+
+    for company in companies or []:
+        key = sm.company_name_key(company.get("company_name"))
+        company["intent_details"] = fallback_paragraph(company_name=str(company.get("company_name") or ""),
+                                                       icp=icp, signals=evidence.get(key, []))
+        notes["fallback"] = notes.get("fallback", 0) + 1
+
+
+def _write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
+                      evidence: Mapping[str, list[Mapping[str, Any]]], model_name: str,
+                      timeout: float = 0.0, http_client_factory=None) -> dict[str, Any]:
     notes: dict[str, Any] = {"companies": len(companies), "model": model_name, "accepted": 0, "fallback": 0}
     if not companies:
+        return notes
+    held: list[dict[str, Any]] = []
+    if signal_quote_guard_enabled():
+        held = [c for c in companies
+                if not has_quoted_signal(list(evidence.get(sm.company_name_key(c.get("company_name")), [])))]
+        if held:
+            held_ids = {id(c) for c in held}
+            companies = [c for c in companies if id(c) not in held_ids]
+            notes["held_no_quote"] = len(held)
+    if not companies:
+        _apply_fallback(held, icp, evidence, notes)
         return notes
     drafts = _write(companies, icp, evidence=evidence, model_name=model_name)
     if drafts is None:
@@ -978,10 +1157,13 @@ def write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
             company.setdefault("_flags", {})["paragraph_fallback"] = True
             if len(notes.setdefault("rejected", [])) < 8:
                 notes["rejected"].append(f"{str(company.get('company_name') or '')[:40]}: {rule[:100]}")
+    _apply_fallback(held, icp, evidence, notes)
     return notes
 
 
 __all__ = ["fallback_paragraph", "review_paragraph", "covers_signals", "write_paragraphs", "human_date",
+           "signal_quote_guard_enabled", "has_quoted_signal",
+           "offering_focus_guard_enabled",
            "states_date",
            "parse_paragraph_rows", "MAX_CHARS", "is_posting_url", "posting_title", "posting_fields",
            "posting_quote", "posting_description", "is_field_dump", "relative_wording", "strip_relative"]

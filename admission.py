@@ -338,6 +338,40 @@ def _admit(pool: list[Mapping[str, Any]], icp: Mapping[str, Any], cap: int) -> t
     return chosen, best_ev
 
 
+# crown18 (ARENA_LIVE_CELL_FILTER): a failed row beside a qualifier costs 2.5 cell points; alone it costs nothing (the
+# cell floors at zero).  Published 2026-10-14, ICP 5 (the one paying cell): fal, a lowercase one-token name with no
+# LinkedIn record, failed identity for all 5 senders (Loop, Kong and Liner, one-token names WITH a LinkedIn record,
+# qualified or failed on other gates).  Three of our entries sent fal beside Gradial / SkanAI.  Checked against all 345
+# rows of that round before use: the rule touches 0 qualified rows.  A "personal LinkedIn post as primary signal" rule
+# was tried and dropped: it would have flagged 11 qualified rows (Knowledgehook 6, Atomic Industries 5).  The filter
+# runs on the admission POOL, so _admit refills the slot from the next-best row; a risky row alone still goes.
+_LOWER_TOKEN_RE = re.compile(r"[a-z0-9]{2,6}")
+
+
+def live_cell_filter_enabled() -> bool:
+    import os
+    return str(os.environ.get("ARENA_LIVE_CELL_FILTER", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def penalty_risk(row: Mapping[str, Any]) -> str:
+    """Why this row is a likely penalty beside a qualifier ('' when it is not)."""
+
+    name = str(row.get("company_name") or "").strip()
+    if _LOWER_TOKEN_RE.fullmatch(name) and not str(row.get("company_linkedin") or "").strip():
+        return "lowercase one-token name with no LinkedIn record"
+    return ""
+
+
+def withhold_penalty_rows(pool: list, icp: Mapping[str, Any]) -> tuple[list, list[str]]:
+    """(rows kept, 'name: why' for each row withheld).  Nothing is withheld unless a strong, risk-free row stays."""
+
+    judged = [(r, penalty_risk(r)) for r in pool]
+    strong = [r for r, why in judged if not why and _tier(r) in SEND_TIERS and (not staged(icp) or stage_backed(r, icp))]
+    if not strong:
+        return list(pool), []
+    return [r for r, why in judged if not why], [f"{str(r.get('company_name') or '')[:40]}: {why}" for r, why in judged if why]
+
+
 def select(rows: list[Mapping[str, Any]], icp: Mapping[str, Any], *, limit: int = 5) -> tuple[list[dict], dict]:
     """(chosen rows in rank order, notes): a fit-proven row (tier A/B/C) with q*v >= LONE_MIN_QV always goes in, any
     other row only when it raises the expected score, up to the cap.  On a staged ICP a row without stage evidence
@@ -360,6 +394,10 @@ def select(rows: list[Mapping[str, Any]], icp: Mapping[str, Any], *, limit: int 
         notes["conflicts"] = dropped
     if twins:
         notes["same_site"] = twins
+    if live_cell_filter_enabled() and len(pool) >= 2:            # crown18: see withhold_penalty_rows
+        pool, held = withhold_penalty_rows(pool, icp)
+        if held:
+            notes["withheld_live_cell"] = held
     bare = [r for r in pool if staged(icp) and not stage_backed(r, icp)]
     named = [str(r.get("company_name")) for r in pool if staged(icp) and not has_stage_evidence(r) and stage_backed(r, icp)]
     if named:

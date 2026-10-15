@@ -25,7 +25,35 @@ MAX_TOKENS = 4096
 MAX_MESSAGES = 128
 MAX_CONTENT_CHARS = 32_000
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-STATUS_RETRIES = 2
+# crown18: three retries with a doubling pause (2-5 s, 4-10 s, 8-20 s) instead of two short ones.  On 2026-10-14 our
+# runs in the 04-06Z window lost the model path for minutes at a time (see harness.discovery_outage); two 2-5 s
+# retries never outlasted it.  Transport errors and timeouts are still never retried.
+STATUS_RETRIES = 3
+RETRY_SLEEP_CAP_S = 30.0
+# crown18: a TRANSPORT error (timeout, connect, protocol) is retried twice as well.  The parent never retried one
+# ("a paid call is never abandoned while the broker still runs it"), and that is the one code difference between
+# the lineages that ran in the 10-14 04:26-05:29Z window: the s32 trees (phoex A/B, 20 runs, `transport_left = 3`)
+# all completed; our four v100 trees collapsed 8 of 28 runs (9-57 calls, no fetch, empty output).  The broker may
+# still complete and bill an abandoned call; a duplicate chat call costs cents, an empty ICP costs the cell.
+TRANSPORT_RETRIES = 2
+# Only a FAST transport failure (connection refused / reset, broken pipe - the broker not answering) is retried; a
+# call that ran for most of the 175 s client timeout before failing is a hung call and is not repeated, so one
+# model call can never consume three client timeouts of the ICP's clock.
+TRANSPORT_RETRY_MAX_ELAPSED_S = 60.0
+_TRANSPORT_ERROR_NAMES = ("Timeout", "Transport", "Connect", "Protocol", "ReadError", "WriteError", "NetworkError",
+                          "PoolTimeout", "ConnectionReset", "BrokenPipe")
+_now = time.monotonic
+
+
+def _transport_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    return any(part in name for part in _TRANSPORT_ERROR_NAMES)
+
+
+def _retry_sleep(done: int) -> float:
+    """The pause before retry number ``done + 1``: 2-5 s doubling each time, at most RETRY_SLEEP_CAP_S."""
+
+    return min(RETRY_SLEEP_CAP_S, random.uniform(2.0, 5.0) * (2 ** max(0, int(done))))
 BASE_URL = "http://openrouter.ai/api/v1/chat/completions"
 _FIELDS = frozenset({"model", "messages", "temperature", "max_tokens", "top_p", "stop", "seed", "response_format",
                      "reasoning", "include_reasoning"})
@@ -80,6 +108,7 @@ def chat(messages: list[dict], *, model: str, max_tokens: int = 1500, temperatur
     c_max = gv.llm_cmax(model, prompt_chars, body["max_tokens"])
     gov = gv.current()
     retries = STATUS_RETRIES
+    transport_left = TRANSPORT_RETRIES
     while True:
         token = None
         if gov is not None:
@@ -91,16 +120,21 @@ def chat(messages: list[dict], *, model: str, max_tokens: int = 1500, temperatur
                 _note(f"{purpose}: refused {exc}")
                 return None
         status, document, cost = 0, None, None
+        started = _now()
         try:
             with LLM_SLOTS:
                 status, document = _post(body)
             if status == 200 and isinstance(document, dict):
                 cost = gv.llm_cost(model, document.get("usage"))
-        except Exception as exc:  # noqa: BLE001 - transport errors and timeouts are never retried
+        except Exception as exc:  # noqa: BLE001
             _note(f"{purpose}: {type(exc).__name__}")
             if gov is not None:
                 gov.release(token, None)
-            return None
+            if transport_left <= 0 or not _transport_error(exc) or _now() - started > TRANSPORT_RETRY_MAX_ELAPSED_S:
+                return None
+            transport_left -= 1                       # crown18: see TRANSPORT_RETRIES
+            SLEEP(_retry_sleep(TRANSPORT_RETRIES - transport_left - 1))
+            continue
         if gov is not None:
             gov.release(token, cost if status == 200 else 0.0)
         STATS["calls"] += 1
@@ -126,7 +160,7 @@ def chat(messages: list[dict], *, model: str, max_tokens: int = 1500, temperatur
         if status not in RETRY_STATUSES or retries <= 0:
             return None
         retries -= 1
-        SLEEP(random.uniform(2.0, 5.0))
+        SLEEP(_retry_sleep(STATUS_RETRIES - retries - 1))
 
 
 def _note(text: str) -> None:

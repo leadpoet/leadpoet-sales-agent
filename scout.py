@@ -847,6 +847,23 @@ def _homepage_state(tools: Any, host: str, name: str) -> str:
     return "stub" if len((title + text).strip()) < _STUB_CHARS else "unknown"
 
 
+def article_host_guard_enabled() -> bool:
+    import os as _os_mod
+    return str(_os_mod.environ.get("ARENA_ARTICLE_HOST_GUARD", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def _host_carries_name(host: str, name: str) -> bool:
+    """Does the host's label carry a distinctive token (3+ letters) of the company's name?"""
+
+    label = str(host or "").split(".")[0].replace("-", "").lower()
+    if not label:
+        return True
+    tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9]+", str(name or "")) if len(t) >= 3 and t.lower() not in _NAME_NOISE]
+    compact = "".join(t.lower() for t in re.findall(r"[A-Za-z0-9]+", str(name or "")))
+    # 'skan.ai' for SkanAI, 'fal.ai' for fal: the host label is the name or the name's head.
+    return any(t in label for t in tokens) or (len(compact) >= 3 and compact in label) or (len(label) >= 3 and label in compact)
+
+
 def resolve(tools: Any, cand: Mapping[str, Any]) -> dict[str, Any]:
     """Domain, LinkedIn, size bucket, HQ and industry for one candidate, cheapest source first."""
 
@@ -937,6 +954,15 @@ def resolve(tools: Any, cand: Mapping[str, Any]) -> dict[str, Any]:
                 domain = ""
             else:
                 LAST.setdefault("domains_unnamed", []).append(f"{name}: {domain}")
+    if article_host_guard_enabled() and domain and article_host and domain == article_host \
+            and not _host_carries_name(domain, name) and _homepage_state(tools, domain, name) != "names":
+        # crown18: the candidate's website is the host of the article that named it, the host carries no part of the
+        # company's name and its homepage does not name the company - it is the publisher, not the company.  Our 10-14
+        # ICP 3 row "IEA" went out with company_website ibmadison.com (a Madison business magazine); identity,
+        # industry, size and attribute all came back unavailable.  No website is better than a publisher's: the
+        # row is then dropped at verification instead of sent as a penalty.
+        LAST.setdefault("domains_article_host", []).append(f"{name}: {domain}")
+        domain = ""
     website = ("https://" + domain + "/") if domain else ""
     linkedin, source = homepage_linkedin(tools, website), "homepage"
     if not linkedin:

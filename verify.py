@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os as _os
 import re
 from datetime import date
 from typing import Any, Mapping, Optional
@@ -398,6 +399,8 @@ def verify_signal(signal: Mapping[str, Any], *, company: Mapping[str, Any], icp:
         drop("company name not in evidence page", "signal_name_not_on_page")
         return None
 
+    # crown18: the champion's v107 strip_page_chrome below cuts the glued headline chrome; our crown16
+    # strip_markdown_dup is not applied in series with it.
     description = " ".join(sm.strip_prompt_controls(signal.get("description") or "").split())
     snippet = " ".join(sm.strip_prompt_controls(signal.get("snippet") or "").split())
     why_now = " ".join(sm.strip_prompt_controls(signal.get("why_now") or "").split())
@@ -452,6 +455,11 @@ def verify_signal(signal: Mapping[str, Any], *, company: Mapping[str, Any], icp:
     if rebuilt and not idm.is_posting_url(url):
         description = _fit_description(rebuilt)
         report.repaired.append((name, "description rebuilt from the page headline (title named no event)"))
+    if namesake_guard_enabled():                                 # crown18: see namesake_risk
+        risk = namesake_risk(name, f"{description} {snippet}", url, website)
+        if risk:
+            drop(f"namesake: {risk}", "namesake")
+            return None
     reason = sm.negation_reason(description, snippet)
     if reason:
         drop(reason, "signal_negated")
@@ -549,6 +557,288 @@ def _paragraph_quote(record: Mapping[str, Any]) -> str:
 # is a round announcement. Offer its first sentence the judge-mirrored stage gate accepts (no provider call).
 _STAGE_SENTENCE_SCAN = 240
 
+# ARENA_STAGE_SENTENCE_SCAN (on; 0 restores the venture-only pre-filter exactly).
+#
+# The pre-filter below decided which cached sentences are even WORTH handing to the stage gate, and it was
+# `scout._ROUND_RE` alone -- which matches pre-seed / pre-series / seed / series a-h and nothing else.  For a
+# Private Equity ICP no sentence can ever match it, so the v95 cached-page sweep ran and could not succeed; for
+# Public the sweep is skipped outright.  Measured on the 2,310 stage-evidence quotes this family has emitted
+# across seven published rounds, that is where the losses are:
+#
+#   * company_stage_evidence decides TWO things, not one.  On the 10-12 champion's own rows, 7 of 8 rows that
+#     carried it passed the judge's stage check and 6 of 7 without it failed; and `admission.py` sends a row with
+#     no stage evidence "only alone", so a missing quote also costs the other four row slots on that ICP.  The
+#     champion used 15 of 50 slots and scored one cell of ten.
+#   * Private Equity: 33 of 33 of our rows and 289 of 337 of the field's carried no stage evidence.  The champion
+#     emitted ZERO rows on 10-12 ICP 4 (Real Estate / Private Equity) while spending $0.53 there.
+#
+# The patterns are read off the quotes that actually PASSED the judge, not invented: of 7 passing Private Equity
+# quotes, 6 name "private equity" outright ("... is owned by private equity investor AEA Investors", "Private
+# equity firm TowerBrook Capital Partners has acquired a majority stake in ...", "a portfolio company of OMERS
+# Private Equity"), and the Public ones are ticker lines ("Fiserv, Inc. (NASDAQ: FISV)", "Payoneer (Nasdaq:
+# PAYO)", "Bread Financial (NYSE: BFH)").
+#
+# This only widens which sentences are TESTED.  Every candidate still has to pass scout.stage_quote_ok (verbatim
+# on the page, fetchable host, names the company, proves the stage), the judge's own deterministic
+# gates.stage_evidence_ok, and for Public the first_party/wire source_kind check at emit time.  Nothing that was
+# rejected before can be emitted now, so the change cannot admit a proof the gate would refuse.
+_PE_STAGE_RE = re.compile(
+    r"\bprivate\s+equity\b"
+    r"|\bportfolio\s+company\s+of\b"
+    r"|\b(?:acquired|owned|backed|held)\s+by\b(?:\s+\S+){0,6}\s+(?:capital|partners|equity|holdings|group|management)\b"
+    r"|\b(?:majority|controlling)\s+(?:stake|interest|investment|ownership)\b"
+    r"|\brecapitaliz(?:ation|ed)\b|\btake[-\s]private\b|\bbuyout\b",
+    re.I,
+)
+_PUBLIC_STAGE_RE = re.compile(
+    r"\((?:NASDAQ|NYSE(?:\s+American)?|AMEX|ASX|TSX|TSXV|LSE|CBOE|OTCQX|OTCQB)\s*[:.]\s*[A-Z][A-Z.\-]{0,6}\)"
+    r"|\b(?:listed|trades|traded)\s+on\s+(?:the\s+)?(?:NASDAQ|NYSE|ASX|TSX|LSE|London\s+Stock\s+Exchange)\b"
+    r"|\bticker\s+symbol\b",
+    re.I,
+)
+
+
+# ARENA_STAGE_OWNERSHIP_GUARD (on; 0 restores the parent exactly).
+#
+# 10-13 forensic, our own row: Santander Consumer USA on a Public ICP went out with a stage quote "(NYSE: SC)" lifted
+# from a 2021 release whose URL reads ".../Santander-Consumer-USA-Holdings-Inc.-Agrees-to-Be-Taken-Private-by-
+# Santander-Holdings-USA-Inc/" -- the very page announcing its delisting.  The judge's stage criterion is explicit:
+# "check chronology before selecting evidence: first seek a completed acquisition/current parent, IPO/listing change
+# ... An older quote does not establish the current stage when later-round or completed-ownership evidence exists."
+# Four of our nine failed rows that round were companies whose true stage was an ownership state the ICP did not ask
+# for (taken private, sponsor-owned, never venture-backed).  This guard withholds a Public or venture stage quote whose
+# own URL slug, quote, or page head announces that the company was taken private, acquired, delisted, or is a
+# wholly-owned subsidiary.  It is deliberately passive-voice only ("acquired BY", "to be acquired") so a company
+# announcing ITS OWN acquisition of someone else is untouched, and it never runs on a Private Equity ICP, where
+# sponsor ownership is the thing being proved.
+_OWNERSHIP_CHANGE_RE = re.compile(
+    r"\btaken?[-\s]private\b|\bgo(?:es|ing)?[-\s]private\b|\bprivati[sz](?:ed|ation)\b"
+    r"|\b(?:agree[sd]?|agreement|definitive agreement)\s+to\s+be\s+acquired\b|\bto\s+be\s+acquired\s+by\b"
+    r"|\b(?:has\s+been|was|were|is\s+being|will\s+be|been)\s+acquired\s+by\b"
+    r"|\bwholly[-\s]owned\s+subsidiary\b|\bdelist(?:ed|ing)\b"
+    r"|\bcompleted\s+(?:its\s+|the\s+)?(?:merger|sale)\s+(?:with|to)\b",
+    re.I,
+)
+_OWNERSHIP_HEAD_CHARS = 600
+
+
+# crown18 (ARENA_NAMESAKE_GUARD): three of our 10-14 rows carried evidence about a DIFFERENT company that the loose
+# name match accepted -- Acorn (an LMS) with "Acorn Health Expands Autism Diagnostic Evaluations", Earned (a wealth
+# firm) with Rain's "Raises $75 Million Series B" (the page says "earned wage access"), Digital Matter with "Matter
+# raises $35 million" (an e-bike maker).  Each is a 10-point penalty beside a qualifier.  A quote or signal text is
+# at risk when, on a page that is not the company's own site, (1) a multi-word name appears only in part, or (2) the
+# name is immediately followed by an industry noun that makes a different company's name.  0 restores the parent's
+# acceptance exactly.
+_NAME_SUFFIX_WORDS = frozenset("""
+inc ltd llc corp corporation group co company companies holdings technologies technology labs ai software systems
+solutions global international limited plc gmbh sa ag bv srl pty pte ventures partners""".split())
+_HEADLINE_VERBS = frozenset("""
+raises raised secures secured announces announced launches launched expands expanded closes closed completes
+completed names named appoints appointed opens opened acquires acquired partners partnered joins joined unveils
+unveiled introduces introduced receives received wins won reports reported signs signed adds added hires hired taps
+tapped selects selected earns earned achieves achieved releases released debuts debuted enters entered extends
+extended lands landed nabs nabbed bags scores welcomes brings gets celebrates marks reaches hits becomes grows
+to and of for with in on at the a an is has will its their from into by as new today now
+january february march april may june july august september october november december""".split())
+
+
+# Industry nouns that turn "<Name> <Noun>" into another company's name in a DIFFERENT line of business ("Acorn
+# Health" for an LMS, "Earned Wage Access" for a wealth firm).  Product names after the company ("Liner Model API",
+# "Myriota AssetHawk"), the name suffixes above, and the company's own longer form ("KERV Interactive") must not
+# fire: tech-flavoured words (interactive, digital, networks, systems, software ...) are deliberately absent.
+# Checked on the 345 published 10-14 rows: with this list the guard touches 0 qualified rows.
+_ORG_NOUNS = frozenset("""
+health healthcare hospital clinic clinical medical dental pharma pharmaceuticals therapeutics biosciences capital bank
+banking insurance energy oil gas mining foods beverage motors automotive realty properties wealth wage markets
+construction shipping maritime rail solar wind water power legal""".split())
+
+
+def namesake_guard_enabled() -> bool:
+    return str(_os.environ.get("ARENA_NAMESAKE_GUARD", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def namesake_risk(name: str, text: str, url: str = "", website: str = "") -> str:
+    """Why ``text`` may be about a namesake rather than ``name`` ('' when it reads as this company)."""
+
+    name, text = str(name or "").strip(), " ".join(str(text or "").split())
+    if not name or not text:
+        return ""
+    try:
+        page_host = sm.registrable_host(str(url or "")) or ""
+        own_host = sm.registrable_host(str(website or "")) or ""
+    except Exception:  # noqa: BLE001
+        page_host, own_host = "", ""
+    first_party = bool(own_host) and (page_host == own_host or page_host.endswith("." + own_host))
+    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", name) if t.lower() not in _NAME_SUFFIX_WORDS] or \
+        re.findall(r"[A-Za-z0-9]+", name)
+    if not tokens:
+        return ""
+    full = re.compile(r"(?<![A-Za-z0-9])" + r"[\W_]{0,3}".join(re.escape(t) for t in tokens) + r"(?![A-Za-z0-9])", re.I)
+    if not first_party and len(tokens) > 1 and not full.search(text):
+        return f"the text names only part of '{name}'"
+    if not first_party:
+        for m in full.finditer(text):
+            after = text[m.end():m.end() + 40]
+            nxt = re.match(r"[\s,]*([A-Z][a-z]+)", after)
+            if nxt and nxt.group(1).lower() in _ORG_NOUNS and nxt.group(1).lower() not in {t.lower() for t in tokens}:
+                return f"'{name}' is followed by '{nxt.group(1)}' - a longer name"
+    # A third rule - a capitalised name occurring only as a lowercase common word - was tried and dropped: on the
+    # 10-14 rows it flagged a qualified Writer row; Earned is already caught above ("Earned Wage").
+    return ""
+
+
+def stage_ownership_guard_enabled() -> bool:
+    return str(_os.environ.get("ARENA_STAGE_OWNERSHIP_GUARD", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def ownership_change(url: str, quote: str, page_text: str) -> str:
+    """The phrase announcing a change of ownership on this evidence, from its URL slug, the quote, or the page head."""
+
+    slug = re.sub(r"[-_/+.%]+", " ", str(url or ""))
+    for field in (slug, str(quote or ""), str(page_text or "")[:_OWNERSHIP_HEAD_CHARS]):
+        m = _OWNERSHIP_CHANGE_RE.search(field)
+        if m:
+            return " ".join(m.group(0).split()).lower()
+    return ""
+
+
+# ARENA_SIGNAL_MIRROR_DEDUPE (on; 0 restores the parent exactly).
+#
+# 10-13 forensic, our own row: S&C Electric went out with the SAME press release twice -- once from sandc.com and
+# once from a mirror at elsi.com -- because the per-signal dedupe key is the host, and the two hosts differ.  A
+# duplicate signal buys nothing (the writer's rule 5 folds same-event sources anyway) and spends one of the row's
+# signal slots.  This collapses signals whose description text matches, keeping the company's own copy when one of
+# the pair is first-party, and the lower ICP-signal index so a primary never becomes a bonus.
+def signal_mirror_dedupe_enabled() -> bool:
+    return str(_os.environ.get("ARENA_SIGNAL_MIRROR_DEDUPE", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def dedupe_mirrors(signals: list[dict[str, Any]], website: str) -> list[dict[str, Any]]:
+    """Verified signals with same-text copies on different hosts collapsed to one."""
+
+    if not signal_mirror_dedupe_enabled() or len(signals) < 2:
+        return signals
+    try:
+        own = sm.registrable_host(website) if website else ""
+    except Exception:  # noqa: BLE001
+        own = ""
+
+    def is_own(s: Mapping[str, Any]) -> bool:
+        try:
+            return bool(own) and sm.registrable_host(str(s.get("url") or "")) == own
+        except Exception:  # noqa: BLE001
+            return False
+
+    kept: list[dict[str, Any]] = []
+    first: dict[str, dict[str, Any]] = {}
+    for s in signals:
+        key = sm.normalize_text(str(s.get("description") or ""))[:80]
+        prev = first.get(key) if key else None
+        if prev is None:
+            if key:
+                first[key] = s
+            kept.append(s)
+            continue
+        winner, loser = (s, prev) if (is_own(s) and not is_own(prev)) else (prev, s)
+        if winner is s:
+            kept[kept.index(prev)] = s
+            first[key] = s
+        try:
+            winner["matched_icp_signal"] = min(int(winner.get("matched_icp_signal") or 0),
+                                               int(loser.get("matched_icp_signal") or 0))
+        except (TypeError, ValueError):
+            pass
+    return kept
+
+
+def stage_sentence_scan_enabled() -> bool:
+    return str(_os.environ.get("ARENA_STAGE_SENTENCE_SCAN", "1")).strip().lower() not in ("0", "false", "no")
+
+
+# crown17 (ARENA_STAGE_SCAN_ORDER): the cache sweep below read the first 12 own-site / wire pages in cache INSERTION
+# order and stopped.  Local replay of 10-13 ICP 7 (Series C+, cloud security): the cache held 368 pages, 56 of them
+# own/wire; Cyberhaven's PR Newswire Series C copy, its own Series C release and its own Series D release sat at
+# own/wire #17, #30 and #56 - every one passes _stage_quote_on_page - and the row went out with a single aggregator
+# proof (vestbee) instead, one failed fetch away from a bare row.  Wire releases of OTHER companies (Horizon3,
+# Chainguard ...) had used up the 12 slots.  With the flag on the sweep reads the company's own pages first, then
+# wire releases whose URL names the company, then the rest, and may read further (the pages are cached: no call);
+# accepted entries go out own site / wire first.  0 restores the parent sweep exactly.
+STAGE_SCAN_PAGES = 12
+STAGE_SCAN_PAGES_ORDERED = 40
+_URL_SEP_RE = re.compile(r"[^a-z0-9]+")
+_SCAN_NAME_NOISE = frozenset({"inc", "corp", "company", "group", "holdings", "labs", "technologies", "technology",
+                              "systems", "software", "solutions", "security", "global", "international", "data",
+                              "cloud", "networks", "digital", "health", "energy", "capital", "partners", "services"})
+
+
+def stage_scan_order_enabled() -> bool:
+    return str(_os.environ.get("ARENA_STAGE_SCAN_ORDER", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def _name_tokens(name: str) -> list[str]:
+    try:
+        key = sm.company_name_key(name)
+    except Exception:  # noqa: BLE001
+        key = str(name or "").lower()
+    return [t for t in re.findall(r"[a-z0-9]+", str(key).lower()) if len(t) >= 4 and t not in _SCAN_NAME_NOISE]
+
+
+def name_in_url(name: str, url: str) -> bool:
+    """A distinctive token of the company's name appears in the URL (a wire release about THIS company)."""
+
+    slug = _URL_SEP_RE.sub("", str(url or "").lower())
+    return any(tok in slug for tok in _name_tokens(name))
+
+
+def host_tier(url: str, own: str, wire_hosts: Any) -> int:
+    """0 the company's own site, 1 a wire host, 2 anything else."""
+
+    try:
+        host = sm.registrable_host(str(url)) or ""
+    except Exception:  # noqa: BLE001
+        return 2
+    if own and (host == own or host.endswith("." + own)):
+        return 0
+    if any(host == w or host.endswith("." + w) for w in (wire_hosts or ())):
+        return 1
+    return 2
+
+
+def order_cached_pages(items: list, *, name: str, own: str, wire_hosts: Any) -> list:
+    """The cache for the stage sweep: own-site pages first, then wire releases whose URL names the company, then
+    the rest in cache order.  A pure reordering - nothing is added or dropped."""
+
+    own_site, named_wire, rest = [], [], []
+    for page_url, cached in items:
+        tier = host_tier(page_url, own, wire_hosts)
+        if tier == 0:
+            own_site.append((page_url, cached))
+        elif tier == 1 and name_in_url(name, str(page_url)):
+            named_wire.append((page_url, cached))
+        else:
+            rest.append((page_url, cached))
+    return own_site + named_wire + rest
+
+
+def stage_sentence_candidate(sentence: str, stage: str, scout: Any) -> bool:
+    """Is this cached sentence worth handing to the stage gate for this ICP stage?
+
+    Venture stages keep `scout._ROUND_RE` exactly.  A Private Equity or Public stage, which that regex can never
+    match, gets the pattern its own passing quotes use.  A false positive here costs one gate evaluation on text
+    already in memory -- no fetch, no model call.
+    """
+
+    if scout._ROUND_RE.search(sentence):
+        return True
+    if not stage_sentence_scan_enabled():
+        return False
+    want = sm.normalize_stage(stage) if stage else ""
+    if want == "private equity":
+        return bool(_PE_STAGE_RE.search(sentence))
+    if want == "public":
+        return bool(_PUBLIC_STAGE_RE.search(sentence))
+    return False
+
 
 def _stage_quote_on_page(text: str, *, name: str, stage: str, url: str, website: str, scout: Any) -> str:
     """The first sentence of this cached page that scout.stage_quote_ok accepts, or ''."""
@@ -560,7 +850,7 @@ def _stage_quote_on_page(text: str, *, name: str, stage: str, url: str, website:
     # sentence is cut (scout.trim_quote_chrome).
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", body[:40000])[:_STAGE_SENTENCE_SCAN]:
         sentence = " ".join(sentence.split())
-        if not 8 <= len(sentence.split()) <= 80 or not scout._ROUND_RE.search(sentence):
+        if not 8 <= len(sentence.split()) <= 80 or not stage_sentence_candidate(sentence, stage, scout):
             continue
         try:
             sentence = scout.trim_quote_chrome(sentence, name)
@@ -776,10 +1066,16 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
                                      website=website, scout=_scout)
         if found:
             candidates.append((str(signal["url"]), found))
-    if want and want != "public":
+    if want and (want != "public" or stage_sentence_scan_enabled()):
         # v95: every page already fetched for this company (its own site, or a newswire copy that names it) is scanned
         # for a sentence naming the round - zero cost.  The 10-06 winner's "stagex" did this; on 10-03/05/06 winners
         # sent 3-5 evidenced rows on the paying ICPs while this family sent 1-3 and withheld verified companies.
+        #
+        # ARENA_STAGE_SENTENCE_SCAN also lets the sweep run on a PUBLIC ICP, which it skipped entirely.  The sweep
+        # only visits the company's own site and wire hosts, which is exactly the first_party/wire set the Public
+        # emit check below already demands, so a ticker line it finds there is admissible by construction; one
+        # found anywhere else is still withheld by that check.  Our Public rows carried no stage evidence 52% of
+        # the time against the field's 37%.
         try:
             own = sm.registrable_host(website) if website else ""
         except Exception:  # noqa: BLE001
@@ -790,8 +1086,13 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
             WIRE_HOSTS = ()
         seen_urls = {u for u, _ in candidates}
         scanned = 0
-        for page_url, cached in list(getattr(tools, "pages", {}).items()):
-            if scanned >= 12 or len(candidates) >= 8:
+        ordered_scan = stage_scan_order_enabled()
+        page_items = list(getattr(tools, "pages", {}).items())
+        if ordered_scan:   # crown17: the company's own pages and its named wire releases before anyone else's
+            page_items = order_cached_pages(page_items, name=name, own=own, wire_hosts=WIRE_HOSTS)
+        scan_cap = STAGE_SCAN_PAGES_ORDERED if ordered_scan else STAGE_SCAN_PAGES
+        for page_url, cached in page_items:
+            if scanned >= scan_cap or len(candidates) >= 8:
                 break
             if cached is None or not getattr(cached, "ok", False) or page_url in seen_urls:
                 continue
@@ -815,6 +1116,17 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
         # v99: only when the company has NO quote at all (see STAGE_EVIDENCE_KEEP) - a free feed story is read for one.
         candidates.extend(_feed_round_quotes(tools, _scout, name=name, stage=stage, website=website, report=report,
                                              skip={u for u, _ in candidates}))
+    if stage_scan_order_enabled() and len(candidates) > 1:
+        # crown17: the company's own page and wire releases go out ahead of an aggregator copy (stable sort).
+        try:
+            own_host = sm.registrable_host(website) if website else ""
+        except Exception:  # noqa: BLE001
+            own_host = ""
+        try:
+            from .sourcetype import WIRE_HOSTS as _wire_hosts
+        except Exception:  # noqa: BLE001
+            _wire_hosts = ()
+        candidates = sorted(candidates, key=lambda c: host_tier(c[0], own_host, _wire_hosts))
     for cand_url, cand_quote in candidates:
         if len(out) >= sm.STAGE_EVIDENCE_MAX:
             break
@@ -855,6 +1167,20 @@ def stage_evidence(raw: Mapping[str, Any], *, name: str, stage: str, tools: Aren
         page = _page_for(tools, cand_url)
         if not page.ok:
             continue
+        if stage_ownership_guard_enabled() and (stage_key == "public" or want in _VENTURE_STAGES):
+            changed = ownership_change(cand_url, cand_quote, page.text)
+            if changed:
+                report.repaired.append((name, f"stage evidence withheld (page announces '{changed}'): {cand_url[:80]}"))
+                if stats is not None:
+                    stats["ownership_change"] = changed
+                continue
+        if namesake_guard_enabled():                             # crown18: see namesake_risk
+            risk = namesake_risk(name, cand_quote, cand_url, website)
+            if risk:
+                report.repaired.append((name, f"stage evidence withheld (namesake: {risk}): {cand_url[:80]}"))
+                if stats is not None:
+                    stats["namesake"] = risk
+                continue
         try:
             why = _scout.stage_quote_ok(cand_quote, page.text, name=name, stage=stage, url=cand_url, website=website)
             judged = gates.stage_evidence_ok(stage, cand_quote, url=cand_url,
@@ -1094,6 +1420,7 @@ def verify_company(raw: Mapping[str, Any], *, icp: Mapping[str, Any], tools: Are
         codes = sorted({d[3] for d in report.dropped_signals[first_drop:]})
         drop("no verifiable intent signal (%s)" % (", ".join(codes) or "no candidate signal"))
         return None
+    signals = dedupe_mirrors(signals, website)
     has_primary = any(s["matched_icp_signal"] == 0 for s in signals)
     if not has_primary:
         drop("no index-0 (primary) intent signal: an unverified primary is a -10 false positive")

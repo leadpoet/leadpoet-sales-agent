@@ -419,6 +419,48 @@ def _reverify_step_inner(chosen: list[dict[str, Any]], rows: list[dict[str, Any]
     return final, notes
 
 
+# crown18 (ARENA_DISCOVERY_RETRY): on 2026-10-14 eleven execute runs in the whole field ended in under 300 s with fewer
+# than 60 provider calls and no page fetch; ten were ours (crown17 four, including its ICP 5: 120 s, 15 calls, 0 rows,
+# while the byte-identical crown17b took 723 s, 172 calls and sent 5 rows).  All eleven started 04:23-06:39Z; none of
+# the 199 runs before 04h did.  The path: llm.chat returns None after its short retries, scout records "no reply",
+# discovery yields no candidates, and run_icp returned [] with ~15 minutes of paid window unused.  When discovery
+# found NOTHING and the model path reported errors, wait and run discovery again (twice at most) while the paid cutoff
+# and the scout budget leave room.  A dead ICP (model fine, nothing found) never retries; 0 restores the single pass.
+DISCOVERY_RETRY_WAITS = (45.0, 120.0)
+DISCOVERY_RETRY_MARGIN_S = 240.0
+DISCOVERY_RETRY_SPEND_FRACTION = 0.3
+
+
+def discovery_retry_enabled() -> bool:
+    return str(os.environ.get("ARENA_DISCOVERY_RETRY", "1")).strip().lower() not in ("0", "false", "no")
+
+
+def _spent_usd(tools: Any) -> float:
+    try:
+        return float(tools.spend_usd())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def discovery_outage(drafts: Any, scout_module: Any, tools: Any, clock: Any, wait_s: float) -> str:
+    """'' unless discovery produced nothing because the model path failed and a second pass still fits."""
+
+    if drafts or not discovery_retry_enabled():
+        return ""
+    last = getattr(scout_module, "LAST", {}) or {}
+    errors = [str(e) for e in (last.get("llm_errors") or []) if str(e) != "deadline"]
+    if not errors or last.get("candidates") or last.get("drafts"):
+        return ""
+    if time.monotonic() + wait_s + DISCOVERY_RETRY_MARGIN_S >= clock.paid_cutoff:
+        return ""
+    try:
+        if float(tools.spend_usd()) >= DISCOVERY_RETRY_SPEND_FRACTION * float(scout_module.BUDGET_USD):
+            return ""
+    except Exception:  # noqa: BLE001 - an unreadable ledger is no reason to spend again
+        return ""
+    return f"{len(errors)} model errors ({errors[0][:40]}), no candidates"
+
+
 def run_icp(icp: dict) -> list[dict]:
     """Return up to LAB_ARENA_COMPANY_LIMIT companies for one ICP (the last locked list)."""
 
@@ -466,7 +508,20 @@ def run_icp(icp: dict) -> list[dict]:
         drafts: list[dict[str, Any]] = []
         held = _hold_calls(tools)
         try:
+            budget0, spend0 = float(scout_module.BUDGET_USD), _spent_usd(tools)
             drafts = scout_module.run_scout(icp, tools, limit=DRAFT_LIMIT, run_timeout=discovery_s)
+            for attempt, wait_s in enumerate(DISCOVERY_RETRY_WAITS, start=1):   # crown18: see discovery_outage
+                why = discovery_outage(drafts, scout_module, tools, clock, wait_s)
+                if not why:
+                    break
+                LAST_REPORT.setdefault("discovery_retries", []).append({"attempt": attempt, "wait_s": wait_s, "why": why})
+                _log(f"discovery found nothing after a model-path outage ({why}); pass {attempt + 1} in {wait_s:.0f}s")
+                time.sleep(wait_s)
+                # The second pass spends what the first left of the scout budget, never a fresh window.
+                scout_module.BUDGET_USD = max(0.10, budget0 - (_spent_usd(tools) - spend0))
+                drafts = scout_module.run_scout(
+                    icp, tools, limit=DRAFT_LIMIT,
+                    run_timeout=max(90.0, clock.paid_cutoff - DISCOVERY_RETRY_MARGIN_S - time.monotonic()))
         except Exception as exc:  # noqa: BLE001
             agent_exc = exc
             LAST_REPORT["scout_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
