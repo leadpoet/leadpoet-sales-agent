@@ -1,0 +1,191 @@
+"""Read run-bound receipts and verify structured company-fact provenance."""
+
+from pathlib import Path
+import hashlib
+import json
+import re
+from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
+
+import budget_guard
+import deepline
+from linkedin_receipts import _domain_key, _entity, identity_page
+
+
+FUNDING_TOOL = "aviato_get_company_funding_rounds"
+INVISIBLE = re.compile("[\u00ad\u200b\u200c\u200d\u2060\ufeff]")  # Soft hyphens and zero-width characters.
+TYPOGRAPHY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-"})
+# Fields of a structured record that describe other companies or members, never this company.
+EMBEDDED = frozenset({"similarOrganizations", "affiliatedPages", "employeeCount", "logo", "logos", "photo",
+                      "profilePicture", "coverPicture", "backgroundCover", "backgroundCovers"})
+
+
+def quote_form(text):
+    return " ".join(INVISIBLE.sub("", str(text)).translate(TYPOGRAPHY).split())
+
+
+def record_text(row):
+    """A structured record's quotable text: its own fields, never the profiles of other companies it embeds."""
+    return json.dumps({k: v for k, v in row.items() if k not in EMBEDDED}, sort_keys=True, ensure_ascii=False)
+
+
+def content_kind(row, receipt):
+    """Use adapter classification; an agent-recorded web observation is never a captured page."""
+    if receipt.get("provider") == "public_web":
+        return "unverified"
+    if "content_kind" in row:
+        return row["content_kind"]
+    if (receipt.get("provider") == "scrapingdog" and receipt.get("operation") == "scrape"
+            and row.get("signal") == "web_page"):
+        return "captured_page"  # Legacy adapter receipts saved only the scrape body.
+    return "search_excerpt" if row.get("snippet") else "unverified"
+
+
+def source_date(row):
+    """Read dates without guessing locale; undated pages stay observations."""
+    date = next((row.get(k) for k in ("evidence_date", "date", "published_date", "publishedDate", "publication_date") if row.get(k)), None)
+    if not date and isinstance(row.get("metadata"), dict):
+        date = next((row["metadata"].get(k) for k in ("publishedTime", "article:published_time", "datePublished") if row["metadata"].get(k)), None)
+    if isinstance(date, str) and "T" in date:
+        try:
+            # Python 3.9 only accepts 3/6 fractional digits. Subsecond
+            # precision cannot change the publication's local calendar date.
+            timestamp = re.sub(r"(T\d{2}:\d{2}:\d{2}\.)(\d+)(?=Z?$|[+-]\d{2}:\d{2}$)",
+                               lambda match: match[1] + match[2].ljust(6, "0")[:6], date)
+            date = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            pass  # Validation reports malformed metadata; never invent a date.
+    if isinstance(date, str) and re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", date):
+        candidates = set()
+        for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                candidates.add(datetime.strptime(date, fmt).date().isoformat())
+            except ValueError:
+                pass
+        if len(candidates) == 1:
+            date = candidates.pop()  # Ambiguous or invalid dates remain untrusted.
+    basis = row.get("evidence_date_basis") or row.get("date_basis") or ("published" if date else "observed_current")
+    return date, basis
+
+
+def request_fingerprint(provider, request):
+    ignored = {"spend", "timeout_seconds", "entity_type", "output_file"}
+    if provider == "deepline":
+        ignored.update({"limit", "input", "name", "op", "q"})
+    payload = {k: v for k, v in request.items() if k not in ignored}
+    encoded = json.dumps([provider, payload], sort_keys=True, ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def read_receipt(run_file, route_id):
+    """Read a saved response without dispatching or changing accounting."""
+    if not isinstance(route_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", route_id):
+        raise ValueError("invalid route ID")
+    run_file = Path(run_file).resolve(strict=True)
+    path = run_file.parent / "receipts" / (route_id + ".json")
+    body = budget_guard.read_object(path)
+    if body.get("run_fingerprint") != budget_guard.run_fingerprint(run_file):
+        raise ValueError("saved response belongs to another run or lacks run identity; preserve it and reconcile its origin")
+    document = budget_guard.read_object(run_file)
+    routes = document.get("routes", []) + document.get("stop_audit", {}).get("route_frontier", [])
+    if not any(isinstance(route, dict) and route.get("route_id") == route_id for route in routes):
+        raise ValueError("saved response has no planned route in this run")
+    for route in routes:
+        if isinstance(route, dict) and route.get("route_id") == route_id:
+            if any(route.get(key) != body.get(key) for key in ("request_fingerprint", "provider")):
+                raise ValueError("saved response does not match this route's request/provider; preserve it and reconcile its origin")
+    return {"route_id": route_id, "receipt_file": str(path), "result": body}
+
+
+def web_passage(run_file, document, evidence, *, require_excerpt=False):
+    """Verify captured web provenance, not whether its meaning satisfies the ICP."""
+    source = evidence.get("source", {})
+    saved = read_receipt(run_file, source.get("route_id"))["result"]
+    normalized = saved
+    if saved.get("provider") == "deepline":
+        normalized, _ = deepline.normalize_response(saved["attempt"]["request"], saved["provider_response"])
+    rows = normalized.get("results", [])
+    if (saved.get("receipt_status") != "complete" or saved.get("status") not in {"ok", "partial"}
+            or any(source.get(k) != saved.get(k) for k in ("provider", "operation", "tool"))):
+        raise ValueError("qualification evidence requires a matching completed successful source receipt")
+    if saved.get("provider") == "public_web":
+        raise ValueError("required web evidence needs a tool-captured page, not an agent-recorded passage. Use tyche_lookup with ScrapingDog scrape or a Deepline page reader, then reuse its ref. Keep this observation for discovery; do not rewrite it.")
+    structured = bool(rows) and all(r.get("content_kind") == "structured_record" for r in rows)
+    if structured and not require_excerpt:
+        return  # Company/profile/funding qualifications retain their specialized checks.
+    pages = rows if structured else [r for r in rows if content_kind(r, saved) == "captured_page"]
+    if not pages:
+        raise ValueError("selected source has no captured source body; search excerpts and unverified records cannot qualify. Capture the page with tyche_lookup or keep the requirement unknown")
+    def url_key(value):
+        parsed = urlsplit(value or "")
+        return urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path.rstrip("/"), parsed.query, ""))
+    selected = url_key(evidence.get("evidence_url", evidence.get("url")))
+    matched = [r for r in pages if url_key(r.get("evidence_url") or r.get("url") or
+               (r.get("company_linkedin_url") if structured else None)) == selected]
+    passages = [r.get("evidence_text") or r.get("text") or
+                ((r.get("snippet") or record_text(r)) if structured else None) for r in matched]
+    if structured:
+        passages += [record_text(r) for r in matched]
+    if any(isinstance(p, str) and re.match(r"\s*Internal Error \(\)\s*(?:\n|$)", p) for p in passages):
+        raise ValueError("selected web observation is a tool error, not source text; keep the requirement unknown or select a successfully read source")
+    excerpt = quote_form(evidence.get("evidence_text", evidence.get("text")) or "")
+    if not excerpt or not any(isinstance(p, str) and excerpt in quote_form(p) for p in passages):
+        raise ValueError("required web evidence must quote captured source text at the selected URL: copy one "
+                         "contiguous passage of at most 1,000 characters exactly as captured, keeping its wording "
+                         "and hyphenation (no ellipses, joins or corrections); put interpretation in claim")
+    date = evidence.get("evidence_date", evidence.get("date"))
+    basis = evidence.get("evidence_date_basis", evidence.get("date_basis"))
+    if not any(basis == source_date(row)[1] and (source_date(row)[0] is None or date == source_date(row)[0]) for row in matched):
+        raise ValueError("source date/date_basis must match captured metadata; undated pages use observed_current, with event_date separately supported by the passage")
+
+
+def funding_record(run_file, document, company, evidence):
+    """Verify one captured funding row; the LLM still judges the requested stage."""
+    if run_file is None:
+        raise ValueError("structured funding evidence requires the saved run and receipts")
+    source = evidence.get("source", {})
+    index = source.get("result_index")
+    if (source.get("provider") != "deepline" or source.get("operation") != "execute"
+            or source.get("tool") != FUNDING_TOOL or type(index) is not int or index < 0):
+        raise ValueError("select a saved structured funding result with its exact result index")
+    saved = read_receipt(run_file, source.get("route_id"))["result"]
+    routes = [r for r in document.get("routes", []) if r.get("route_id") == source["route_id"]]
+    if (len(routes) != 1 or any(saved.get(k) != source.get(k) or routes[0].get(k) != source.get(k)
+                               for k in ("provider", "operation", "tool"))
+            or saved.get("receipt_status") != "complete" or saved.get("status") not in {"ok", "partial"}
+            or routes[0].get("provider_status") != saved.get("status")):
+        raise ValueError("structured funding evidence requires a completed successful receipt")
+    request = saved.get("attempt", {}).get("request", {})
+    if request.get("operation") != "execute" or request.get("tool") != FUNDING_TOOL:
+        raise ValueError("captured request does not match the funding tool")
+    if request_fingerprint("deepline", request) != saved.get("request_fingerprint"):
+        raise ValueError("captured funding request does not match its saved fingerprint")
+    identifier = (request.get("payload", {}).get("website") or request.get("payload", {}).get("linkedinUrl")
+                  or request.get("payload", {}).get("linkedinURL"))
+    linkedin = _entity(identifier, "company")
+    domain = _domain_key(identifier) if not linkedin else None
+    if not (linkedin and linkedin == _entity(identity_page(company), "company")
+            or domain and domain == _domain_key(company.get("domain"))):
+        raise ValueError("funding request must identify this company by its website or LinkedIn URL")
+    raw = saved.get("provider_response")
+    if not isinstance(raw, dict) or "body" not in raw:
+        raise ValueError("structured funding evidence requires the captured provider response")
+    normalized, _ = deepline.normalize_response(request, raw)
+    rows = normalized.get("results", [])
+    if normalized.get("status") not in {"ok", "partial"} or index >= len(rows):
+        raise ValueError("selected funding result is absent from the captured response")
+    row = rows[index]
+    if (row.get("error") not in (None, False, "", [], {}) or row.get("errors") not in (None, False, "", [], {})
+            or row.get("success") is False or row.get("ok") is False
+            or deepline._structured_status(row) in deepline._FAILURE_STATUSES):
+        raise ValueError("selected funding result is a provider error, not funding evidence")
+    if (row.get("domain") and _domain_key(row["domain"]) != _domain_key(company.get("domain"))
+            or row.get("company_linkedin_url") and _entity(row["company_linkedin_url"], "company") != _entity(identity_page(company), "company")):
+        raise ValueError("funding response identifies a different company")
+    if not row.get("stage") or not row.get("evidence_date") or not row.get("evidence_text"):
+        raise ValueError("funding record must contain a stage, announcement date and supporting text")
+    for field, expected in (("date", row["evidence_date"]), ("date_basis", "published"),
+                            ("text", row["evidence_text"])):
+        if evidence.get(field) != expected:
+            raise ValueError(f"structured funding {field} must match the captured record; put interpretation in claim")
+    return row
