@@ -1,4 +1,16 @@
-"""Proof-source admissibility and press-release datelines, written from the judge's stated rules."""
+"""Loop s22: proof-source admissibility and press-release datelines, written from the judge's stated rules.
+
+1. The judge keeps an explicit proof-source qualifier of the ICP's intent signal (upstream 5fc93688, prompts/_common.py
+   PART A): when the signal asks for "a press release, product page, or company announcement", an independent article is
+   not one of those sources.  d19 (09-25 bank) ICP 008 asked for "a press release, investor post, or product update" and
+   Feldera's FinSMEs article came back contradicted: an unverified primary costs 10 raw points (-2 per ICP).
+2. A press release is dated by its body dateline ("San Francisco, CA - April 22, 2025 - ..."), not by page metadata.
+   d19 Deck: datePublished 2026-02-27 in the page head, dateline 2025-04-22 in the body -> outside the 365-day window,
+   contradicted, -2 per ICP.
+
+Only a KNOWN independent publisher is excluded: unknown hosts (a partner's page, an investor's post, a trade body) stay,
+because a wrong exclusion loses a company while a wrong inclusion costs the same penalty the s19 build already risked.
+"""
 
 from __future__ import annotations
 
@@ -129,7 +141,8 @@ def source_kind(url: Any, company_domain: Any = "", company_name: Any = "") -> s
 
 
 def admissible(url: Any, company_domain: Any, company_name: Any, signal: Any) -> bool:
-    """False only when the ICP names its proof sources, independent coverage is not among them, and the URL is a known."""
+    """False only when the ICP names its proof sources, independent coverage is not among them, and the URL is a known
+    independent publisher (or a LinkedIn page that is not the company's own)."""
 
     kinds = allowed_kinds(signal)
     if kinds is None:
@@ -143,7 +156,8 @@ def admissible(url: Any, company_domain: Any, company_name: Any, signal: Any) ->
 
 
 def prefer_own_source(url: Any, company_domain: Any, company_name: Any, signal: Any) -> bool:
-    """On a source-restricted."""
+    """Loop s23 (d20 Starcloud: a unite.ai article while its Business Wire release was in hand): on a source-restricted
+    ICP an unrecognised third-party host is worth one swap attempt for the company's own release or a wire copy."""
 
     return allowed_kinds(signal) is not None and source_kind(url, company_domain, company_name) == "unknown"
 
@@ -165,20 +179,20 @@ _EVENT_WORDS = {"FUNDING": "raises funding round", "PRODUCT_LAUNCH": "launches",
 
 
 def first_party_row(tools: Any, name: str, domain: str, category: str, *, window_days: int,
-                    category_pattern: Optional[str] = None, own_only: bool = False) -> Optional[dict[str, Any]]:
-    """One bounded search on the company's own domain plus the press wires for the same kind of event; the first row.
-    ``own_only`` searches (and accepts) the company's own domain alone."""
+                    category_pattern: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """One bounded search on the company's own domain plus the press wires for the same kind of event; the first row
+    that names the company and the event words is returned (None on any failure)."""
 
     key = _name_key(name)
     if not key or not domain:
         return None
     query = f"{name} {_EVENT_WORDS.get(category, 'announces')}"
     data = tools.search_web(query, recency_days=max(30, int(window_days)), limit=4,
-                            include_domains=[domain] + ([] if own_only else list(WIRE_HOSTS[:10])), category="")
+                            include_domains=[domain] + list(WIRE_HOSTS[:10]), category="")
     pattern = re.compile(category_pattern, re.I) if category_pattern else None
     for row in (data or {}).get("results") or []:
         url = str(row.get("url") or "")
-        if source_kind(url, domain, name) not in (("first_party",) if own_only else ("first_party", "wire")):
+        if source_kind(url, domain, name) not in ("first_party", "wire"):
             continue
         text = f"{row.get('title') or ''} {row.get('text') or row.get('excerpt') or ''}"
         if key not in _name_key(text[:3000]):
@@ -189,95 +203,46 @@ def first_party_row(tools: Any, name: str, domain: str, category: str, *, window
     return None
 
 
-def _news_rows(tools: Any, domain: str, name: str) -> list[dict[str, Any]]:
-    """The company's free news rows; the name lets the tool fall back to a public news feed when its provider refuses."""
+# Loop v5: how stage-evidence hosts answer the judge's plain HTTPS GET (published rounds, rows whose only evidence was
+# one round-naming entry): PR Newswire 56/58 and GlobeNewswire 23/24 passed stage, the company's own announcement page
+# 155/182, Business Wire 10/29 (its pages time out); advisers' deal pages 1/16 and deal-database profiles 0/4.
+STAGE_HOSTS_FIRST = ("prnewswire.com", "globenewswire.com", "prnewswire.co.uk", "newswire.ca", "thesaasnews.com",
+                     "startupmag.co.uk", "techfundingnews.com", "techcrunch.com", "siliconangle.com", "vcaonline.com",
+                     "fintech.global")
+STAGE_HOSTS_LAST = ("businesswire.com",)
+DEAL_DATABASE_HOSTS = ("mergr.com",)
+_DEAL_PATH_RE = re.compile(r"/(?:transactions?|tombstones?|deals?|credentials|track-record|portfolio(?:-compan(?:y|ies))?|"
+                           r"our-(?:work|deals|transactions|investments))(?:/|$)", re.I)
 
+
+def deal_page(url: Any, company_domain: Any = "") -> bool:
+    """A third-party deal listing: an adviser's tombstone, an investor's portfolio entry or a deal-database profile."""
+
+    host = host_of(url)
+    domain = host_of("https://" + str(company_domain or "").strip().lstrip("/")) if company_domain else ""
+    if not host or (domain and (host == domain or host.endswith("." + domain))):
+        return False
     try:
-        got = tools.search_news(domain, limit=10, company_website=domain, name=name)
-    except TypeError:          # a tool client without the ``name`` argument
-        got = tools.search_news(domain, limit=10, company_website=domain)
-    return (got or {}).get("results") or []
+        path = urlsplit(str(url)).path or ""
+    except ValueError:
+        path = ""
+    return _is(host, DEAL_DATABASE_HOSTS) or bool(_DEAL_PATH_RE.search(path))
 
 
-def first_party_row_free(tools: Any, name: str, domain: str, category: str, *,
-                         category_pattern: Optional[str] = None, own_only: bool = False) -> Optional[dict[str, Any]]:
-    """v97: the same lookup as first_party_row from the company's FREE news rows: a row on its own domain (or a press
-    wire) whose title or excerpt names the company and carries the event's vocabulary.  Costs nothing, so it runs
-    before the paid search and still runs when the dollar budget is spent (10-06 ICP4: three right-stage companies were
-    dropped as "proof source not admissible" after the budget ran out)."""
+def stage_host_rank(url: Any, company_domain: Any = "") -> int:
+    """0 the company's own domain, 1 a wire or funding-news host that answers a plain GET, 2 any other host,
+    3 a deal listing, 4 a host whose pages time out for the judge's fetcher (always cited last)."""
 
-    key = _name_key(name)
-    if not key or not domain:
-        return None
-    try:
-        rows = _news_rows(tools, domain, name)
-    except Exception as exc:  # noqa: BLE001
-        if type(exc).__name__ == "BudgetExhausted":
-            raise
-        return None
-    pattern = re.compile(category_pattern, re.I) if category_pattern else None
-    wanted = ("first_party",) if own_only else ("first_party", "wire")
-    best: Optional[dict[str, Any]] = None
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        kind = source_kind(str(row.get("url") or ""), domain, name)
-        if kind not in wanted:
-            continue
-        text = f"{row.get('title') or ''} {row.get('excerpt') or ''}"
-        if kind == "wire" and key not in _name_key(text[:3000]):
-            continue
-        if pattern and not pattern.search(text[:4000]):
-            continue
-        if best is None or (kind == "first_party" and source_kind(str(best.get("url") or ""), domain, name) != "first_party"):
-            best = dict(row, date=row.get("published_date"), text=row.get("excerpt") or "")
-    return best
-
-
-_HEAD_STOP = frozenset({"the", "and", "for", "with", "its", "from", "new", "that", "this", "into", "inc", "press", "release",
-                        "news", "announces", "announced"})
-
-
-def headline_tokens(text: Any) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]+", str(text or "").lower()) if len(w) > 2 and w not in _HEAD_STOP}
-
-
-def wire_copy_row(tools: Any, name: str, domain: str, headline: str) -> Optional[dict[str, Any]]:
-    """v96: the press-wire copy of an announcement the company's own page carries, from the two FREE searches (the
-    company's news rows, then the free web search); the row whose title shares >= 60% of the headline's words.
-
-    The judge scores a signal by its URL alone: on the company's own host (investors.acme.com included) x0.85, any
-    other host x0.90 - 51 against 54 points for the same verified event.  Local 10-06 judge runs: 13 of 13 wire / news
-    primaries that reached the intent check passed it, own-site primaries 33 of 36."""
-
-    want = headline_tokens(headline)
-    if not _name_key(name) or not domain or len(want) < 4:
-        return None
-
-    def pick(rows: Any) -> Optional[dict[str, Any]]:
-        best: Optional[tuple[float, dict[str, Any]]] = None
-        for row in rows or []:
-            if not isinstance(row, dict) or source_kind(str(row.get("url") or ""), domain, name) != "wire":
-                continue
-            have = headline_tokens(row.get("title"))
-            overlap = len(want & have) / len(want) if have else 0.0
-            if overlap >= 0.6 and (best is None or overlap > best[0]):
-                best = (overlap, row)
-        return dict(best[1]) if best else None
-
-    for fetch in (lambda: _news_rows(tools, domain, name),
-                  lambda: tools._free_search(f"{' '.join(str(headline).split())[:160]} press release")):
-        try:
-            found = pick(fetch())
-        except Exception as exc:  # noqa: BLE001
-            if type(exc).__name__ == "BudgetExhausted":
-                raise
-            continue
-        if found:
-            return found
-    return None
+    host = host_of(url)
+    domain = host_of("https://" + str(company_domain or "").strip().lstrip("/")) if company_domain else ""
+    if host and domain and (host == domain or host.endswith("." + domain)):
+        return 0
+    if _is(host, STAGE_HOSTS_LAST):
+        return 4
+    if deal_page(url, company_domain):
+        return 3
+    return 1 if _is(host, STAGE_HOSTS_FIRST) else 2
 
 
 __all__ = ["allowed_kinds", "admissible", "prefer_own_source", "source_kind", "body_dateline", "first_party_row", "proof_clause",
-           "wire_copy_row", "headline_tokens", "first_party_row_free",
-           "WIRE_HOSTS", "NEWS_HOSTS", "ATS_HOSTS"]
+           "WIRE_HOSTS", "NEWS_HOSTS", "ATS_HOSTS", "STAGE_HOSTS_FIRST", "STAGE_HOSTS_LAST", "deal_page", "stage_host_rank"]
