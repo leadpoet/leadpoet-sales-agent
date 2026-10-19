@@ -1,21 +1,4 @@
-"""Deterministic ICP industry-fit matching (ported from the site verifier).
-
-Faithful extraction of the pure matchers from the leadpoet-site sourcing
-verifier's ``adapter.py`` (commits 69b01ae9/c95d5a89 B2B-SaaS evidence,
-ac2538a6 structured industry criteria, a680e218/b7fe23d3 canonical taxonomy):
-
-- ``industry_fit`` — conservative structured-industry match: authoritative
-  Leadpoet taxonomy first, bounded canonical concepts second, and an exact
-  non-generic token fallback only when the taxonomy is silent and the request
-  carries no specific concept beyond the contextual broad ones.
-- ``b2b_saas_evidence`` — B2B SaaS requires BOTH a buyer-audience signal and a
-  software-product signal, grounded in provider labels / description / frozen
-  evidence quote (never the buyer's own request text), and not service-only
-  unless a strong owned-software signal corroborates.
-
-Pure stdlib + the ported ``industry_taxonomy`` module: no network, no LLM, no
-providers — safe for shadow evaluation anywhere in the scoring path.
-"""
+"""Deterministic ICP industry-fit matching (ported from the site verifier)."""
 
 from __future__ import annotations
 
@@ -113,16 +96,7 @@ def b2b_saas_evidence(
     candidate_description: Any,
     candidate_evidence_quote: Any,
 ) -> dict[str, Any]:
-    """Require both buyer audience and software product evidence for B2B SaaS.
-
-    A broad provider label such as ``Software Development`` is useful product
-    evidence but is not proof that the company sells to businesses. Conversely,
-    an industry such as ``Financial Services`` should not hide explicit evidence
-    that the company sells a software product to businesses. Only the provider
-    labels, company description, and source quote are considered; the requested
-    attribute text and model explanation are deliberately excluded because they
-    can merely repeat the buyer's request.
-    """
+    """Require both buyer audience and software product evidence for B2B SaaS."""
 
     sources = {
         "industry": _normalized_text(candidate_industry),
@@ -193,14 +167,7 @@ def industry_fit(
     candidate_description: Any = None,
     candidate_evidence_quote: Any = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Match provider labels to a structured buyer industry conservatively.
-
-    Exact Leadpoet parent/subindustry labels use the repository's authoritative
-    taxonomy. Provider-specific labels fall back to bounded semantic aliases
-    and, only for unknown or broad-only requests, exact non-generic tokens. The
-    downstream source-grounded intent verifier and required-attribute evidence
-    remain mandatory publication gates.
-    """
+    """Match provider labels to a structured buyer industry conservatively."""
 
     requested_text = _normalized_text(requested)
     candidate_values = (candidate_industry, candidate_subindustry)
