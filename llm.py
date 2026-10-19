@@ -97,6 +97,8 @@ def build_body(messages: list[dict], *, model: str, max_tokens: int, temperature
         if key in _FIELDS and key not in body:
             body[key] = value
     if model == "anthropic/claude-sonnet-5.5":
+        # Adaptive thinking is mandatory and defaults to high; keep room for the visible reply.
+        body.setdefault("reasoning", {"effort": "low"})
         # Sonnet 5.5 does not accept sampling controls; historical models keep their request shape.
         for key in ("temperature", "top_p", "top_k"):
             body.pop(key, None)

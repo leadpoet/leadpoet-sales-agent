@@ -1,5 +1,6 @@
 """Offline checks for model selection, request compatibility, and spend accounting."""
 
+import copy
 import importlib
 import json
 from pathlib import Path
@@ -80,7 +81,49 @@ class CurrentModelsTest(unittest.TestCase):
                 with mock.patch.object(llm, "TRANSPORT", transport):
                     self.assertEqual(scout.llm_json("Evidence.", model=model, max_tokens=7000), {"companies": []})
                 self.assertEqual(captured, [scout.chat_body("Evidence.", 7000, model)])
-                self.assertNotIn("reasoning", captured[0])  # Preserve the provider default.
+                if model == SONNET:
+                    self.assertEqual(captured[0]["reasoning"], {"effort": "low"})
+                else:
+                    self.assertNotIn("reasoning", captured[0])
+
+    def test_reasoning_default_preserves_explicit_settings_and_is_idempotent(self):
+        messages = [{"role": "user", "content": "Evidence."}]
+        for explicit in (None, {"effort": "high", "exclude": True}, {}):
+            with self.subTest(explicit=explicit):
+                extra = {} if explicit is None else {"reasoning": explicit}
+                original = copy.deepcopy(extra)
+                first = llm.build_body(messages, model=SONNET, max_tokens=1500, extra=extra)
+                self.assertEqual(first["reasoning"], {"effort": "low"} if explicit is None else explicit)
+                self.assertEqual(extra, original)
+                second = llm.build_body(first["messages"], model=first["model"],
+                                        max_tokens=first["max_tokens"], extra=first)
+                self.assertEqual(second, first)
+        for model in (GEMINI, "google/gemini-2.5-flash", "anthropic/claude-sonnet-4.5"):
+            with self.subTest(model=model):
+                self.assertEqual(llm.build_body(messages, model=model, max_tokens=1500),
+                                 {"model": model, "messages": messages, "temperature": 0.0, "max_tokens": 1500})
+
+    def test_governor_reserves_final_wire_limits_and_settles_once(self):
+        gov = governor.Governor(cap_usd=3.94)
+        governor.install(gov)
+        expected_cmax = governor.llm_cmax(SONNET, 32_000, 4096)
+        def transport(body):
+            self.assertEqual(body["reasoning"], {"effort": "low"})
+            self.assertEqual(body["max_tokens"], 4096)
+            self.assertEqual(len(body["messages"][0]["content"]), 32_000)
+            self.assertEqual(list(gov.inflight.values()), [expected_cmax])
+            return 200, {"choices": [{"message": {"content": "ok"}}], "usage": {"cost": 0.0123}}
+        with mock.patch.object(llm, "TRANSPORT", transport), mock.patch.object(governor, "refresh"), \
+                mock.patch.object(gov, "acquire", wraps=gov.acquire) as acquire, \
+                mock.patch.object(gov, "release", wraps=gov.release) as release:
+            self.assertEqual(llm.chat([{"role": "user", "content": "x" * 35_000}],
+                                      model=SONNET, max_tokens=9000), "ok")
+        acquire.assert_called_once_with(expected_cmax, provider="openrouter", closing=False)
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[1], 0.0123)
+        self.assertEqual(gov.inflight, {})
+        self.assertAlmostEqual(gov.committed(), 0.0123)
+        self.assertAlmostEqual(llm.STATS["cost_usd"], 0.0123)
 
     def test_new_prices_reserve_and_settle_governed_calls(self):
         for model, input_rate, output_rate in ((GEMINI, 0.30e-6, 2.50e-6), (SONNET, 2e-6, 10e-6)):
