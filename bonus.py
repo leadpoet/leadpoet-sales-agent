@@ -16,7 +16,7 @@ from . import llm
 from . import scorer_mirror as sm
 from .arena_tools import BudgetExhausted
 
-MODEL = "google/gemini-2.5-flash"
+MODEL = "google/gemini-3.5-flash-lite"
 MAX_NEWS_ROWS = 4
 MAX_PAID_SEARCHES = 5           # v108: paid bonus searches per ICP (one per row), $0.010 each
 PAID_RESULT_ROWS = 3            # pages read from one paid search

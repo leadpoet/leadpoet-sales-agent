@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from . import criteria
 from . import llm
 
-MODEL = "google/gemini-2.5-flash"
+MODEL = "google/gemini-3.5-flash-lite"
 BATCH = 12
 HEADLINE_CHARS = 300
 GRADES = ("strong", "weak", "none")

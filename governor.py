@@ -39,6 +39,8 @@ SNAPSHOT_REFRESH_S = 15.0
 SNAPSHOT_MIN_DRIFT_USD = 0.02
 # OpenRouter per-token prices (USD) for the models this bundle calls; unknown models use FALLBACK_CALL_CMAX_USD.
 MODEL_PRICES = {
+    "google/gemini-3.5-flash-lite": (0.30e-6, 2.50e-6, 0.0),
+    "anthropic/claude-sonnet-5.5": (2.0e-6, 10.0e-6, 0.0),
     "google/gemini-2.5-flash": (0.30e-6, 2.50e-6, 0.0),
     "google/gemini-2.5-flash-lite": (0.10e-6, 0.40e-6, 0.0),
     "anthropic/claude-sonnet-4.5": (3.0e-6, 15.0e-6, 0.0),
