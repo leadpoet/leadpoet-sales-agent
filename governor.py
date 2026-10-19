@@ -1,8 +1,9 @@
 """Per-ICP spend governor and run clock.
 
 Spend: a provider call may start only when the projected spend of this ICP -- committed spend + the maximum cost of
-every call in flight + the maximum cost of the new call -- stays within the ICP cap ($0.74 by default across all
-attempts, under the judge's $0.80-per-qualified-company rule; the 09-29 brief's per-ICP ceiling).  Committed spend is the host's last quota snapshot (successful plus
+every call in flight + the maximum cost of the new call -- stays within the ICP cap. The host's existing quota
+fields set the allowance, less the original $0.06 safety margin ($0.74 for legacy rounds, $3.94 for flat-$4 rounds).
+Without a valid allowance, the legacy cap remains. Committed spend is the host's last quota snapshot (successful plus
 unresolved sourcing cost of every attempt, plus UNRESOLVED_CALL_PAD_USD per unresolved call because the host reserves
 $0 for a dynamically priced Deepline call in flight) plus this attempt's own spend booked since that read; before the
 first read it is the earlier attempts' spend plus this attempt's own spend.  Own spend books each call at its reported
@@ -168,6 +169,9 @@ class Governor:
                  max_inflight: int = MAX_INFLIGHT, clock: Optional[Clock] = None) -> None:
         self.cap = float(cap_usd)
         self.mode_cap = float(cap_usd)
+        self._mode_limit_usd = math.inf
+        self.allowance_usd = 0.80
+        self.cap_margin_usd = max(0.0, self.allowance_usd - self.cap)
         self.reserve = float(reserve_usd)
         self.max_inflight = int(max_inflight)
         self.clock = clock
@@ -206,7 +210,22 @@ class Governor:
 
     def set_mode_cap(self, usd: float) -> None:
         with self._cond:
-            self.mode_cap = max(0.0, min(self.cap, float(usd)))
+            self._mode_limit_usd = max(0.0, float(usd))
+            self.mode_cap = min(self.cap, self._mode_limit_usd)
+
+    def adopt_quota(self, snap: Any) -> None:
+        """Keep the existing safety margin below a valid host allowance; missing values keep the last cap."""
+
+        cost = snap.get("sourcing_cost") if isinstance(snap, dict) else None
+        if not isinstance(cost, dict):
+            return
+        caps = [cost.get(key) for key in ("admission_cap_microusd", "per_qualified_pair_cap_microusd")]
+        if not all(type(value) is int and value >= 0 for value in caps):
+            return
+        with self._cond:
+            self.allowance_usd = min(4_000_000, *caps) / 1_000_000
+            self.cap = max(0.0, self.allowance_usd - self.cap_margin_usd)
+            self.mode_cap = min(self._mode_limit_usd, self.cap)
 
     def marker(self) -> float:
         """Own spend booked so far; take it before a snapshot read and pass it to note_snapshot."""
@@ -347,7 +366,9 @@ def refresh(force: bool = False, now: Optional[float] = None) -> bool:
             return False
         gov.reading, gov.last_read, marker = True, now, gov.own_done
     try:
-        usd = snapshot_committed(read_snapshot())
+        snap = read_snapshot()
+        gov.adopt_quota(snap)
+        usd = snapshot_committed(snap)
         if usd is None:
             return False
         gov.note_snapshot(usd, marker)
@@ -359,13 +380,16 @@ def refresh(force: bool = False, now: Optional[float] = None) -> bool:
             gov.reading = False
 
 
-def read_prior(max_wait_s: float = 20.0, sleep=time.sleep) -> tuple[Optional[float], bool]:
+def read_prior(max_wait_s: float = 20.0, sleep=time.sleep, *, gov: Optional[Governor] = None) -> tuple[Optional[float], bool]:
     """Earlier attempts' spend: re-read the snapshot until no call is in flight (bounded).  (usd, settled)."""
 
     deadline = time.monotonic() + max_wait_s
     last: Optional[float] = None
     while True:
-        usd, inflight = snapshot_spend(read_snapshot())
+        snap = read_snapshot()
+        if gov is not None:
+            gov.adopt_quota(snap)
+        usd, inflight = snapshot_spend(snap)
         if usd is None:
             return last, False
         last = usd
