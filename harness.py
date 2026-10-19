@@ -116,6 +116,10 @@ PARAGRAPH_ENABLED = _strategy_number("intent_paragraph", 1, 0, 1) >= 1
 ICP_SPEND_CAP_USD = _strategy_number("icp_spend_cap_usd", 1.60, 0.0, 4.0)
 COMPLETION_HOLDBACK_USD = _strategy_number("completion_holdback_usd", 0.08, 0.0, 1.0)
 RESEARCH_CAP_USD = round(max(0.0, ICP_SPEND_CAP_USD - COMPLETION_HOLDBACK_USD), 4)
+# Keep the existing $0.08 distance below the host allowance for late charges.
+HOST_SPEND_MARGIN_USD = 0.08
+# No readable allowance must not grant more than the previous total cap.
+LEGACY_SPEND_CAP_USD = 0.72
 QUOTA_READS_MAX = 16
 START_READ_RETRIES = 2
 START_READ_BACKOFF_S = 1.5
@@ -1129,6 +1133,7 @@ def refresh_spend(tools: Any) -> float:
         except Exception:
             pass
     if isinstance(cost, dict):
+        _set_spend_caps(tools, cost)
         settled = snapshot_settled(cost)
         LAST_REPORT["spend_basis"] = "host_settled" if settled else "host"
         try:
@@ -1168,6 +1173,22 @@ def snapshot_settled(cost: Mapping[str, Any]) -> bool:
         return False
 
 
+def _set_spend_caps(tools: Any, cost: Mapping[str, Any] | None = None) -> None:
+    """Use this run's host allowance; keep the last valid cap when a read lacks it."""
+
+    total = getattr(tools, "_total_cap_usd", min(ICP_SPEND_CAP_USD, LEGACY_SPEND_CAP_USD))
+    if isinstance(cost, Mapping):
+        caps = [cost.get(key) for key in ("admission_cap_microusd", "per_qualified_pair_cap_microusd")]
+        if all(type(value) is int and value >= 0 for value in caps):
+            allowance = min(ICP_SPEND_CAP_USD * 1_000_000, *caps)
+            total = max(0.0, allowance - HOST_SPEND_MARGIN_USD * 1_000_000) / 1_000_000
+    research = round(max(0.0, total - COMPLETION_HOLDBACK_USD), 6)
+    tools._total_cap_usd = total
+    tools._phase_cap_usd = total if getattr(tools, "_holdback_released", False) else research
+    tools.spend_cap_usd = 0.0 if getattr(tools, "_unknown_start", False) else tools._phase_cap_usd
+    LAST_REPORT["caps_usd"] = {"research": research, "total": total}
+
+
 def arm_spend_guard(tools: Any) -> float:
     """s32 C1: research cap + host re-read hook + one read NOW, so a retry sees what earlier attempts spent.
 
@@ -1175,8 +1196,9 @@ def arm_spend_guard(tools: Any) -> float:
     closed -- the cap is $0 (no paid call) until a host read succeeds; every refused call re-reads (10 s cooldown)."""
 
     try:
-        tools.spend_cap_usd = RESEARCH_CAP_USD
-        tools._phase_cap_usd = RESEARCH_CAP_USD
+        tools._total_cap_usd = min(ICP_SPEND_CAP_USD, LEGACY_SPEND_CAP_USD)
+        tools._holdback_released = False
+        _set_spend_caps(tools)
         tools.spend_refresh = lambda: refresh_spend(tools)
     except Exception:
         pass
@@ -1206,7 +1228,6 @@ def arm_spend_guard(tools: Any) -> float:
     except Exception:
         pass
     LAST_REPORT["start_spend_usd"] = round(float(spend), 4)
-    LAST_REPORT["caps_usd"] = {"research": RESEARCH_CAP_USD, "total": ICP_SPEND_CAP_USD}
     return spend
 
 
@@ -1214,9 +1235,8 @@ def release_holdback(tools: Any) -> None:
     """s32 C1: the paragraph and final re-checks may use the holdback, never more than the total."""
 
     try:
-        tools._phase_cap_usd = ICP_SPEND_CAP_USD
-        if not getattr(tools, "_unknown_start", False):
-            tools.spend_cap_usd = ICP_SPEND_CAP_USD
+        tools._holdback_released = True
+        _set_spend_caps(tools)
     except Exception:
         pass
 
