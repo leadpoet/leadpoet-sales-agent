@@ -168,8 +168,8 @@ def _print_gates() -> dict[str, str]:
 
 
 LEAN_CAP_USD = 0.40
-# Rescue mode (earlier attempts spent the cap): one qualified company clears the $0.80 rule, so up to $0.78 in all.
-RESCUE_CEILING_USD = 0.78
+# Rescue retains the existing $0.02 distance below the host allowance.
+RESCUE_CAP_MARGIN_USD = 0.02
 RESCUE_MARGIN_USD = 0.03
 RESCUE_RESERVE_USD = 0.02
 RESCUE_POST_SCOUT_USD = 0.03
@@ -184,7 +184,7 @@ def _start_governor(clock: Any, tools: Any) -> Any:
     prior spend within FRUGAL_BELOW_USD of the cap switches to rescue mode."""
 
     gov = governor.Governor(clock=clock)
-    prior, settled = governor.read_prior()
+    prior, settled = governor.read_prior(gov=gov)
     if prior is None:
         gov.set_mode_cap(LEAN_CAP_USD)
     else:
@@ -192,10 +192,11 @@ def _start_governor(clock: Any, tools: Any) -> Any:
         gov.note_snapshot(gov.prior)
         if not settled:
             gov.set_mode_cap(min(gov.cap, gov.prior + LEAN_CAP_USD))
-        elif gov.cap - gov.prior < FRUGAL_BELOW_USD and gov.prior < RESCUE_CEILING_USD - RESCUE_MARGIN_USD:
-            gov.cap = max(gov.cap, RESCUE_CEILING_USD)
+        elif gov.cap - gov.prior < FRUGAL_BELOW_USD and gov.prior < gov.allowance_usd - RESCUE_CAP_MARGIN_USD - RESCUE_MARGIN_USD:
+            gov.cap_margin_usd = RESCUE_CAP_MARGIN_USD
+            gov.cap = max(gov.cap, gov.allowance_usd - RESCUE_CAP_MARGIN_USD)
             gov.reserve = min(gov.reserve, RESCUE_RESERVE_USD)
-            gov.set_mode_cap(RESCUE_CEILING_USD)
+            gov.set_mode_cap(gov.cap)
             LAST_REPORT["rescue"] = True
     _refresh_snapshot(gov, tools)
     LAST_REPORT["prior_spend_usd"] = None if prior is None else round(prior, 4)
@@ -211,7 +212,9 @@ def scout_budget(gov: Any, rescue: bool = False) -> float:
         return max(0.03, float(gov.mode_cap) - float(gov.committed()) - RESCUE_POST_SCOUT_USD)
     if float(gov.mode_cap) - float(gov.prior) < FRUGAL_BELOW_USD:
         return 0.05
-    return max(0.05, min(SCOUT_BUDGET_USD, left))
+    # Preserve the promoted strategy's legacy budget and its fixed reserve as the host allowance grows.
+    budget = SCOUT_BUDGET_USD + max(0.0, gov.allowance_usd - 0.80)
+    return max(0.05, min(budget, left))
 
 
 def _hold_calls(tools: Any) -> int:
@@ -240,6 +243,7 @@ def _refresh_snapshot(gov: Any, tools: Any) -> None:
 
     marker = gov.marker()
     snap = governor.read_snapshot()
+    gov.adopt_quota(snap)
     usd = governor.snapshot_committed(snap)
     if usd is not None:
         gov.note_snapshot(usd, marker)

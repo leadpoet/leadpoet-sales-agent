@@ -33,7 +33,8 @@ Page reads (`arena_tools.py`, `identity.py`): HTML pages go through the sandbox'
 
 Spend and time (`governor.py`): discovery may use the cap minus earlier attempts' spend minus a $0.10 reserve, and
 keeps 30 Deepline calls for the later phases; candidates the triage call rates unlikely wait until after the second
-event pass. At most $0.74 of successful sourcing spend per ICP across attempts ($0.78 in rescue mode), at most six
+event pass. The host quota sets the spend limit across attempts, less a $0.06 safety margin ($0.02 in rescue mode):
+$3.94/$3.98 for flat-$4 rounds, or the unchanged $0.74/$0.78 for legacy rounds. At most six
 provider calls in flight, no provider call after wall-clock minus seven minutes; every model call goes through
 `llm.py` (175-second client timeout, no retry after a timeout).
 
