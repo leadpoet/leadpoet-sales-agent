@@ -57,7 +57,7 @@ except ImportError:
     verify_companies, verify_signal = _verify_mod.verify_companies, _verify_mod.verify_signal
 
 DRAFT_LIMIT = int(_STRATEGY.get("draft_limit") or 8)
-PARAGRAPH_MODEL = str(_STRATEGY.get("paragraph_model") or "anthropic/claude-sonnet-4.5")
+PARAGRAPH_MODEL = str(_STRATEGY.get("paragraph_model") or "anthropic/claude-sonnet-5.5")
 FRUGAL_BELOW_USD = 0.15
 # Spend kept for everything after discovery: bonus rows, paragraphs, the Sonar re-check and one replacement round
 # (about $0.01-0.05 in local runs), plus the governor's closing reserve.

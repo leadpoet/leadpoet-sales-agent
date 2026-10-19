@@ -32,7 +32,7 @@ from . import llm
 from . import scorer_mirror as sm
 from .arena_tools import STRATEGY, BudgetExhausted
 
-MODEL = str(STRATEGY.get("fitproof_model") or "google/gemini-2.5-flash")
+MODEL = str(STRATEGY.get("fitproof_model") or "google/gemini-3.5-flash-lite")
 WINDOW_CHARS = 6000
 MAX_PAGES = 3
 ENOUGH_HOME_SENTENCES = 3

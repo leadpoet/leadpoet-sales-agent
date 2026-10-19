@@ -10,7 +10,7 @@ from typing import Any, Mapping, Optional
 from . import scorer_mirror as sm
 from .arena_tools import STRATEGY, BudgetExhausted, _domain
 
-ROSTER_MODEL = str(STRATEGY.get("roster_model") or "anthropic/claude-sonnet-4.5")
+ROSTER_MODEL = str(STRATEGY.get("roster_model") or "anthropic/claude-sonnet-5.5")
 ROSTER_SIZE = int(STRATEGY.get("roster_size") or 30)
 COMPANY_SEARCH = bool(STRATEGY.get("roster_company_search", 1))
 MAX_ROSTER = 45
