@@ -1,0 +1,148 @@
+"""Best-effort Arena training observations. Missing SDK support never changes an agent result.
+
+The counts describe this agent's direct web egress and worker-socket responses only.
+They do not claim to cover web reads made by a provider or another process.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+from typing import Any
+
+try:  # Older worker images do not mount this optional module.
+    import lab_arena_checkpoint as CHECKPOINT
+except ImportError:
+    CHECKPOINT = None
+
+CONTRACT_VERSION = 1
+STATE_LIMIT_BYTES = 60 * 1024  # Leave room for the SDK's 64 KiB event envelope.
+_lock = threading.Lock()
+_counts: dict[str, int] = {}
+_last_phase_id: int | None = None
+
+
+def reset() -> None:
+    global _last_phase_id
+    with _lock:
+        _counts.clear()
+        _last_phase_id = None
+
+
+def _inc(key: str) -> None:
+    with _lock:
+        _counts[key] = _counts.get(key, 0) + 1
+
+
+def web_attempt() -> None:
+    """A direct egress request passed local guards and consumed a fetch slot."""
+    _inc("web_attempts")
+
+
+def web_failed() -> None:
+    """The request produced no returnable egress result."""
+    _inc("web_failures")
+
+
+def web_result(url: str, result: dict[str, Any]) -> None:
+    """Store the precise body handed back by egress_get, before any page parsing."""
+    _inc("web_results")
+    try:
+        event_id = CHECKPOINT.record_web_fetch(
+            url=url, final_url=result["final_url"], status=result["status"],
+            content_type=result["content_type"], body=result["body"]
+        ) if CHECKPOINT is not None else None
+    except Exception:  # noqa: BLE001 - observation failure must not affect research
+        event_id = None
+    _inc("web_recorded" if isinstance(event_id, int) and not isinstance(event_id, bool) else "web_record_errors")
+
+
+def provider_response(status: int, identity: str, digest: str, body_bytes: int) -> None:
+    """A fully consumed, successful worker-socket response; record only a digest and size."""
+    _inc("provider_2xx_consumed")
+    if not identity:
+        _inc("provider_missing_identity")
+        return
+    try:
+        event_id = CHECKPOINT.record_response_received(
+            call_identity=identity, status=status, body_sha256=digest, body_bytes=body_bytes
+        ) if CHECKPOINT is not None else None
+    except Exception:  # noqa: BLE001
+        event_id = None
+    _inc("provider_acked" if isinstance(event_id, int) and not isinstance(event_id, bool) else "provider_ack_errors")
+
+
+def provider_incomplete() -> None:
+    _inc("provider_stream_incomplete")
+
+
+def _stored_snapshot(name: str, value: Any, depends_on: list[str] | None = None) -> int | None:
+    try:
+        event_id = CHECKPOINT.record_state_snapshot(name, value, depends_on=depends_on) if CHECKPOINT is not None else None
+    except Exception:  # noqa: BLE001
+        event_id = None
+    _inc("state_recorded" if isinstance(event_id, int) and not isinstance(event_id, bool) else "state_record_errors")
+    return event_id if isinstance(event_id, int) and not isinstance(event_id, bool) else None
+
+
+def _size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+
+
+def phase(name: str, rows: list[dict[str, Any]], *, details: dict[str, Any] | None = None) -> None:
+    """Record actual rows at a phase boundary. Split large lists; mark oversized rows explicitly."""
+    global _last_phase_id
+    try:
+        value = {"rows": rows, "details": details or {}}
+        previous = [f"agent:{_last_phase_id}"] if _last_phase_id is not None else None
+        if _size(value) <= STATE_LIMIT_BYTES:
+            event_id = _stored_snapshot(name, value, previous)
+        else:
+            refs: list[dict[str, Any]] = []
+            for index, row in enumerate(rows):
+                size = _size(row)
+                if size <= STATE_LIMIT_BYTES:
+                    row_id = _stored_snapshot(f"{name}.row.{index}", row)
+                    refs.append({"index": index, "event": f"agent:{row_id}" if row_id is not None else None})
+                else:
+                    canonical = json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+                    marker = {"index": index, "overflow": True, "body_bytes": len(canonical),
+                              "sha256": hashlib.sha256(canonical).hexdigest()}
+                    row_id = _stored_snapshot(f"{name}.row_overflow.{index}", marker)
+                    refs.append({**marker, "event": f"agent:{row_id}" if row_id is not None else None})
+                    _inc("state_overflow_rows")
+            manifest = {"row_count": len(rows), "row_events": refs, "details": details or {}}
+            if _size(manifest) > STATE_LIMIT_BYTES:
+                canonical = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+                manifest = {"overflow": True, "body_bytes": len(canonical),
+                            "sha256": hashlib.sha256(canonical).hexdigest(), "row_count": len(rows)}
+                _inc("state_overflow_manifests")
+            row_dependencies = [ref["event"] for ref in refs if ref.get("event")]
+            event_id = _stored_snapshot(name, manifest, (previous or []) + row_dependencies)
+        if event_id is not None:
+            with _lock:
+                _last_phase_id = event_id
+    except Exception:  # noqa: BLE001
+        _inc("state_local_errors")
+
+
+def summary() -> dict[str, Any]:
+    with _lock:
+        counts = dict(_counts)
+    attempts = counts.get("web_attempts", 0)
+    recorded = counts.get("web_recorded", 0)
+    supported = CHECKPOINT is not None and all(callable(getattr(CHECKPOINT, name, None)) for name in (
+        "record_web_fetch", "record_response_received", "record_state_snapshot"))
+    return {"contract_version": CONTRACT_VERSION, "scope": "agent_direct_egress_and_worker_socket",
+            "sdk_available": supported, "web_attempts": attempts,
+            "web_results": counts.get("web_results", 0), "web_recorded": recorded,
+            "web_missing": max(0, attempts - recorded), **counts}
+
+
+def final_summary() -> dict[str, Any]:
+    value = summary()
+    with _lock:
+        previous = [f"agent:{_last_phase_id}"] if _last_phase_id is not None else None
+    _stored_snapshot("training_capture_summary", value, previous)
+    return value

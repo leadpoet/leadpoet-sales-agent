@@ -31,6 +31,12 @@ states every source date the judge admits (a date shown on the page or the page'
 
 Page reads (`arena_tools.py`, `identity.py`): HTML pages go through the sandbox's web egress proxy first and are read with the scorer's visible-text helpers; board APIs, anti-bot walls and failed reads fall back to the Deepline scrape. Provider requests on the worker socket carry only the host's allowlisted headers (`arena_transport.py`).
 
+Training capture is best effort when the worker mounts `lab_arena_checkpoint`. The agent reports exact returned text
+for its direct web egress, a digest and byte count after it fully reads a successful worker-socket response, and its
+discovery, verification, admission, and final row state. The final `training_capture_summary` reports missing direct-web
+records and provider response identity/acknowledgment gaps. This scope does not include web pages fetched inside a
+provider or another process. Older workers without these helpers still run the same research path.
+
 Spend and time (`governor.py`): discovery may use the cap minus earlier attempts' spend minus a $0.10 reserve, and
 keeps 30 Deepline calls for the later phases; candidates the triage call rates unlikely wait until after the second
 event pass. The host quota sets the spend limit across attempts, less a $0.06 safety margin ($0.02 in rescue mode):
