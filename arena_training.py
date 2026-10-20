@@ -137,6 +137,8 @@ def summary() -> dict[str, Any]:
     return {"contract_version": CONTRACT_VERSION, "scope": "agent_direct_egress_and_worker_socket",
             "sdk_available": supported, "web_attempts": attempts,
             "web_results": counts.get("web_results", 0), "web_recorded": recorded,
+            "web_no_result": max(0, attempts - counts.get("web_results", 0)),
+            "web_capture_missing": max(0, counts.get("web_results", 0) - recorded),
             "web_missing": max(0, attempts - recorded), **counts}
 
 

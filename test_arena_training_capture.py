@@ -127,6 +127,7 @@ class ArenaTrainingCaptureTest(unittest.TestCase):
         second = agent_tools.egress_get("https://example.org/page")
         self.assertEqual(second, first)
         self.assertEqual(training.summary()["web_missing"], 1)
+        self.assertEqual(training.summary()["web_capture_missing"], 1)
         agent_tools.close()
 
     def test_phase_rows_split_without_silent_prefix_loss_and_summary_is_explicit(self):
@@ -141,6 +142,17 @@ class ArenaTrainingCaptureTest(unittest.TestCase):
         self.assertEqual(summary["contract_version"], 1)
         self.assertEqual(summary["web_missing"], 0)
         self.assertEqual(self.checkpoint.states[-1][0], "training_capture_summary")
+
+    def test_egress_transport_failure_is_not_misreported_as_capture_failure(self):
+        def handler(request):
+            raise httpx.ConnectError("offline", request=request)
+        agent_tools = tools_module.ArenaTools(post=lambda *_: {})
+        agent_tools._egress_factory = lambda: httpx.Client(transport=httpx.MockTransport(handler))
+        self.assertIsNone(agent_tools.egress_get("https://example.org/page"))
+        counts = training.summary()
+        self.assertEqual((counts["web_attempts"], counts["web_results"], counts["web_no_result"]), (1, 0, 1))
+        self.assertEqual(counts["web_capture_missing"], 0)
+        agent_tools.close()
 
     def test_oversized_single_row_is_marked_with_digest(self):
         row = {"proof": "z" * 70_000}
