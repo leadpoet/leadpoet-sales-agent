@@ -18,9 +18,11 @@ except ImportError:
 
 CONTRACT_VERSION = 1
 STATE_LIMIT_BYTES = 60 * 1024  # Leave room for the SDK's 64 KiB event envelope.
+MAX_DEPENDENCIES = 32  # The mounted SDK rejects a longer depends_on list.
 _lock = threading.Lock()
 _counts: dict[str, int] = {}
 _last_phase_id: int | None = None
+_pending_ids: list[int] = []
 
 
 def reset() -> None:
@@ -28,11 +30,21 @@ def reset() -> None:
     with _lock:
         _counts.clear()
         _last_phase_id = None
+        _pending_ids.clear()
 
 
 def _inc(key: str) -> None:
     with _lock:
         _counts[key] = _counts.get(key, 0) + 1
+
+
+def _record_result(success_key: str, error_key: str, event_id: Any) -> None:
+    success = type(event_id) is int and event_id >= 0
+    with _lock:
+        key = success_key if success else error_key
+        _counts[key] = _counts.get(key, 0) + 1
+        if success:
+            _pending_ids.append(event_id)
 
 
 def web_attempt() -> None:
@@ -55,7 +67,7 @@ def web_result(url: str, result: dict[str, Any]) -> None:
         ) if CHECKPOINT is not None else None
     except Exception:  # noqa: BLE001 - observation failure must not affect research
         event_id = None
-    _inc("web_recorded" if isinstance(event_id, int) and not isinstance(event_id, bool) else "web_record_errors")
+    _record_result("web_recorded", "web_record_errors", event_id)
 
 
 def provider_response(status: int, identity: str, digest: str, body_bytes: int) -> None:
@@ -70,7 +82,7 @@ def provider_response(status: int, identity: str, digest: str, body_bytes: int) 
         ) if CHECKPOINT is not None else None
     except Exception:  # noqa: BLE001
         event_id = None
-    _inc("provider_acked" if isinstance(event_id, int) and not isinstance(event_id, bool) else "provider_ack_errors")
+    _record_result("provider_acked", "provider_ack_errors", event_id)
 
 
 def provider_incomplete() -> None:
@@ -90,39 +102,81 @@ def _size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
+def _boundary_dependencies(name: str, base: list[str], observed_ids: list[int]) -> tuple[list[str], bool]:
+    """Join completed observations through bounded barriers, without ordering the observations themselves."""
+    refs = list(base)
+    remaining = [f"agent:{event_id}" for event_id in observed_ids]
+    if len(refs) + len(remaining) <= MAX_DEPENDENCIES:
+        return refs + remaining, True
+    batch_index = 0
+    while remaining:
+        count = MAX_DEPENDENCIES - len(refs)
+        batch, remaining = remaining[:count], remaining[count:]
+        barrier_id = _stored_snapshot(
+            f"{name}.barrier.{batch_index}",
+            {"completed_observation_count": len(batch), "meaning": "completed_before_boundary"},
+            refs + batch)
+        if barrier_id is None:
+            _inc("boundary_dependency_errors")
+            return list(base), False
+        refs = [f"agent:{barrier_id}"]
+        batch_index += 1
+    return refs, True
+
+
+def _completed_boundary_inputs() -> tuple[list[str], list[int]]:
+    with _lock:
+        previous = [f"agent:{_last_phase_id}"] if _last_phase_id is not None else []
+        return previous, list(_pending_ids)
+
+
+def _finish_boundary(event_id: int | None, observed_ids: list[int], linked: bool) -> None:
+    global _last_phase_id
+    if event_id is None:
+        return
+    with _lock:
+        _last_phase_id = event_id
+        if linked:
+            captured = set(observed_ids)
+            _pending_ids[:] = [item for item in _pending_ids if item not in captured]
+
+
 def phase(name: str, rows: list[dict[str, Any]], *, details: dict[str, Any] | None = None) -> None:
     """Record actual rows at a phase boundary. Split large lists; mark oversized rows explicitly."""
-    global _last_phase_id
     try:
         value = {"rows": rows, "details": details or {}}
-        previous = [f"agent:{_last_phase_id}"] if _last_phase_id is not None else None
+        previous, observed_ids = _completed_boundary_inputs()
         if _size(value) <= STATE_LIMIT_BYTES:
-            event_id = _stored_snapshot(name, value, previous)
+            dependencies, linked = _boundary_dependencies(name, previous, observed_ids)
+            event_id = _stored_snapshot(name, value, dependencies or None)
         else:
             refs: list[dict[str, Any]] = []
+            row_tail: str | None = None
             for index, row in enumerate(rows):
                 size = _size(row)
                 if size <= STATE_LIMIT_BYTES:
-                    row_id = _stored_snapshot(f"{name}.row.{index}", row)
+                    row_id = _stored_snapshot(f"{name}.row.{index}", row, [row_tail] if row_tail else None)
                     refs.append({"index": index, "event": f"agent:{row_id}" if row_id is not None else None})
                 else:
                     canonical = json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
                     marker = {"index": index, "overflow": True, "body_bytes": len(canonical),
                               "sha256": hashlib.sha256(canonical).hexdigest()}
-                    row_id = _stored_snapshot(f"{name}.row_overflow.{index}", marker)
+                    row_id = _stored_snapshot(f"{name}.row_overflow.{index}", marker,
+                                              [row_tail] if row_tail else None)
                     refs.append({**marker, "event": f"agent:{row_id}" if row_id is not None else None})
                     _inc("state_overflow_rows")
+                if row_id is not None:
+                    row_tail = f"agent:{row_id}"
             manifest = {"row_count": len(rows), "row_events": refs, "details": details or {}}
             if _size(manifest) > STATE_LIMIT_BYTES:
                 canonical = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
                 manifest = {"overflow": True, "body_bytes": len(canonical),
                             "sha256": hashlib.sha256(canonical).hexdigest(), "row_count": len(rows)}
                 _inc("state_overflow_manifests")
-            row_dependencies = [ref["event"] for ref in refs if ref.get("event")]
-            event_id = _stored_snapshot(name, manifest, (previous or []) + row_dependencies)
-        if event_id is not None:
-            with _lock:
-                _last_phase_id = event_id
+            base = previous + ([row_tail] if row_tail else [])
+            dependencies, linked = _boundary_dependencies(name, base, observed_ids)
+            event_id = _stored_snapshot(name, manifest, dependencies or None)
+        _finish_boundary(event_id, observed_ids, linked)
     except Exception:  # noqa: BLE001
         _inc("state_local_errors")
 
@@ -143,8 +197,9 @@ def summary() -> dict[str, Any]:
 
 
 def final_summary() -> dict[str, Any]:
+    previous, observed_ids = _completed_boundary_inputs()
+    dependencies, linked = _boundary_dependencies("training_capture_summary", previous, observed_ids)
     value = summary()
-    with _lock:
-        previous = [f"agent:{_last_phase_id}"] if _last_phase_id is not None else None
-    _stored_snapshot("training_capture_summary", value, previous)
+    event_id = _stored_snapshot("training_capture_summary", value, dependencies or None)
+    _finish_boundary(event_id, observed_ids, linked)
     return value

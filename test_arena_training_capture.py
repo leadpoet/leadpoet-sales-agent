@@ -3,6 +3,8 @@
 import hashlib
 import importlib
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -22,20 +24,33 @@ class FakeCheckpoint:
         self.receipts = []
         self.states = []
         self.fail_web = False
+        self.fail_state_names = set()
+        self.events = {}
+        self.lock = threading.Lock()
+
+    def _id(self, depends_on=None):
+        with self.lock:
+            event_id = len(self.events)
+            assert len(depends_on or []) <= 32
+            assert all(int(ref.removeprefix("agent:")) < event_id for ref in depends_on or [])
+            self.events[event_id] = list(depends_on or [])
+            return event_id
 
     def record_web_fetch(self, **kwargs):
         self.web.append(kwargs)
         if self.fail_web:
             raise OSError("checkpoint unavailable")
-        return len(self.web)
+        return self._id()
 
     def record_response_received(self, **kwargs):
         self.receipts.append(kwargs)
-        return len(self.receipts)
+        return self._id()
 
     def record_state_snapshot(self, name, value, *, depends_on=None):
+        if name in self.fail_state_names:
+            return None
         self.states.append((name, value, depends_on))
-        return len(self.states)
+        return self._id(depends_on)
 
 
 class ChunkStream(httpx.SyncByteStream):
@@ -161,6 +176,46 @@ class ArenaTrainingCaptureTest(unittest.TestCase):
         self.assertEqual(name, "after_verification.row_overflow.0")
         self.assertTrue(marker["overflow"])
         self.assertEqual(training.summary()["state_overflow_rows"], 1)
+
+    def test_many_rows_and_parallel_observations_keep_dependencies_bounded(self):
+        def one_observation(index):
+            if index % 2:
+                training.web_result(f"https://example.org/{index}", {
+                    "status": 200, "final_url": f"https://example.org/{index}",
+                    "content_type": "text/plain", "body": str(index)})
+            else:
+                training.provider_response(200, "sha256:" + f"{index:064x}",
+                                           "sha256:" + hashlib.sha256(str(index).encode()).hexdigest(), 1)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(one_observation, range(80)))
+        observed_ids = set(self.checkpoint.events)
+        rows = [{"company_name": f"Company {i}", "proof": "x" * 2000} for i in range(40)]
+        training.phase("after_discovery", rows)
+        self.assertEqual(self.checkpoint.states[-1][0], "after_discovery")
+        self.assertGreater(len([name for name, _, _ in self.checkpoint.states if ".barrier." in name]), 1)
+        terminal_id = max(self.checkpoint.events)
+        reachable = set()
+        def visit(event_id):
+            if event_id in reachable:
+                return
+            reachable.add(event_id)
+            for reference in self.checkpoint.events[event_id]:
+                visit(int(reference.removeprefix("agent:")))
+        visit(terminal_id)
+        self.assertTrue(observed_ids.issubset(reachable))
+        self.assertEqual(reachable, set(self.checkpoint.events))
+        self.assertEqual(training.summary().get("boundary_dependency_errors", 0), 0)
+
+    def test_failed_phase_keeps_completed_observations_for_next_boundary(self):
+        training.web_result("https://example.org/1", {"status": 200, "final_url": "https://example.org/1",
+                            "content_type": "text/plain", "body": "one"})
+        web_id = max(self.checkpoint.events)
+        self.checkpoint.fail_state_names.add("after_discovery")
+        training.phase("after_discovery", [])
+        self.checkpoint.fail_state_names.clear()
+        training.phase("after_verification", [])
+        final_id = max(self.checkpoint.events)
+        self.assertIn(f"agent:{web_id}", self.checkpoint.events[final_id])
 
     def test_no_draft_harness_run_keeps_result_and_records_boundaries(self):
         fake_tools = SimpleNamespace(call_budget=10, remaining=lambda: 10, deadline=None,
