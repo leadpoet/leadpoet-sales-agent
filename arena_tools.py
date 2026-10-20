@@ -469,7 +469,7 @@ class ArenaTools:
         try:
             client = self._egress_http()
             if client is None:
-                arena_training.web_failed()
+                arena_training.web_failed(url, "client_unavailable")
                 return None
             with client.stream("GET", url) as response:
                 chunks: list[bytes] = []
@@ -483,8 +483,8 @@ class ArenaTools:
                           "content_type": str(response.headers.get("content-type") or "").lower(), "body": body}
                 arena_training.web_result(url, result)
                 return result
-        except Exception:
-            arena_training.web_failed()
+        except Exception as exc:
+            arena_training.web_failed(url, type(exc).__name__)
             with self._lock:
                 self.egress["errors"] += 1
             return None

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from datetime import datetime, timezone
 from typing import Any
 
 try:  # Older worker images do not mount this optional module.
@@ -52,9 +53,14 @@ def web_attempt() -> None:
     _inc("web_attempts")
 
 
-def web_failed() -> None:
-    """The request produced no returnable egress result."""
+def web_failed(url: str, error_class: str) -> None:
+    """The request produced no result; keep only its URL, time, and failure class."""
     _inc("web_failures")
+    event_id = _stored_snapshot("web_fetch_failure", {
+        "url": url, "observed_at": datetime.now(timezone.utc).isoformat(),
+        "error_class": error_class[:80],
+    })
+    _record_result("web_failures_recorded", "web_failure_record_errors", event_id)
 
 
 def web_result(url: str, result: dict[str, Any]) -> None:
@@ -192,6 +198,7 @@ def summary() -> dict[str, Any]:
             "sdk_available": supported, "web_attempts": attempts,
             "web_results": counts.get("web_results", 0), "web_recorded": recorded,
             "web_no_result": max(0, attempts - counts.get("web_results", 0)),
+            "web_failures_recorded": counts.get("web_failures_recorded", 0),
             "web_capture_missing": max(0, counts.get("web_results", 0) - recorded),
             "web_missing": max(0, attempts - recorded), **counts}
 

@@ -160,13 +160,22 @@ class ArenaTrainingCaptureTest(unittest.TestCase):
 
     def test_egress_transport_failure_is_not_misreported_as_capture_failure(self):
         def handler(request):
-            raise httpx.ConnectError("offline", request=request)
+            raise httpx.ConnectError("private diagnostic text", request=request)
         agent_tools = tools_module.ArenaTools(post=lambda *_: {})
         agent_tools._egress_factory = lambda: httpx.Client(transport=httpx.MockTransport(handler))
         self.assertIsNone(agent_tools.egress_get("https://example.org/page"))
         counts = training.summary()
         self.assertEqual((counts["web_attempts"], counts["web_results"], counts["web_no_result"]), (1, 0, 1))
         self.assertEqual(counts["web_capture_missing"], 0)
+        self.assertEqual(counts["web_failures_recorded"], 1)
+        name, value, _ = self.checkpoint.states[-1]
+        self.assertEqual(name, "web_fetch_failure")
+        self.assertEqual(value["url"], "https://example.org/page")
+        self.assertEqual(value["error_class"], "ConnectError")
+        self.assertNotIn("private diagnostic text", str(value))
+        failure_id = max(self.checkpoint.events)
+        training.phase("after_discovery", [])
+        self.assertIn(f"agent:{failure_id}", self.checkpoint.events[max(self.checkpoint.events)])
         agent_tools.close()
 
     def test_oversized_single_row_is_marked_with_digest(self):
