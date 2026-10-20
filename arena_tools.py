@@ -17,6 +17,7 @@ from urllib.parse import quote_plus, unquote, urljoin, urlsplit
 import httpx
 
 from . import diagnostics
+from . import arena_training
 from . import gates
 from . import governor
 from . import scorer_mirror as sm
@@ -463,10 +464,12 @@ class ArenaTools:
             if self.deadline is not None and started + EGRESS_TIMEOUT_S > self.deadline:
                 return None
             self.egress["fetches"] += 1
+        arena_training.web_attempt()
         size = 0
         try:
             client = self._egress_http()
             if client is None:
+                arena_training.web_failed(url, "client_unavailable")
                 return None
             with client.stream("GET", url) as response:
                 chunks: list[bytes] = []
@@ -476,9 +479,12 @@ class ArenaTools:
                     if size >= EGRESS_MAX_RESPONSE_BYTES or time.monotonic() - started > 2 * EGRESS_TIMEOUT_S:
                         break
                 body = b"".join(chunks)[:EGRESS_MAX_RESPONSE_BYTES].decode(response.encoding or "utf-8", "replace")
-                return {"status": response.status_code, "final_url": str(response.url),
-                        "content_type": str(response.headers.get("content-type") or "").lower(), "body": body}
-        except Exception:
+                result = {"status": response.status_code, "final_url": str(response.url),
+                          "content_type": str(response.headers.get("content-type") or "").lower(), "body": body}
+                arena_training.web_result(url, result)
+                return result
+        except Exception as exc:
+            arena_training.web_failed(url, type(exc).__name__)
             with self._lock:
                 self.egress["errors"] += 1
             return None

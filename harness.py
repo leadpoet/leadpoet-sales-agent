@@ -32,7 +32,7 @@ if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
 try:
-    from . import admission, bonus, diagnostics, gates, governor, llm, lock, preflight
+    from . import admission, arena_training, bonus, diagnostics, gates, governor, llm, lock, preflight
     from . import reverify as reverify_module
     from . import scout as scout_module
     from . import eventgrade
@@ -42,9 +42,9 @@ try:
     from .verify import announced_schema, strip_internal, verify_companies, verify_signal
 except ImportError:
     _pkg = os.path.basename(_HERE)
-    admission, bonus, diagnostics, gates, governor, llm, lock, preflight = (
+    admission, arena_training, bonus, diagnostics, gates, governor, llm, lock, preflight = (
         importlib.import_module(f"{_pkg}.{m}") for m in
-        ("admission", "bonus", "diagnostics", "gates", "governor", "llm", "lock", "preflight"))
+        ("admission", "arena_training", "bonus", "diagnostics", "gates", "governor", "llm", "lock", "preflight"))
     details_module = importlib.import_module(f"{_pkg}.intent_details")
     reverify_module = importlib.import_module(f"{_pkg}.reverify")
     scout_module = importlib.import_module(f"{_pkg}.scout")
@@ -470,6 +470,7 @@ def run_icp(icp: dict) -> list[dict]:
 
     if not isinstance(icp, dict):
         raise TypeError("icp must be a dict")
+    arena_training.reset()
     clock = governor.Clock()
     limit = _company_limit()
     LAST_REPORT.clear()
@@ -533,6 +534,9 @@ def run_icp(icp: dict) -> list[dict]:
             _release_calls(tools, held)
         LAST_REPORT["scout"] = dict(getattr(scout_module, "LAST", {}) or {})
         LAST_REPORT["drafts"] = len(drafts)
+        arena_training.phase("after_discovery", drafts, details={"count": len(drafts),
+                              "drops": LAST_REPORT["scout"].get("drops", {}),
+                              "error_type": type(agent_exc).__name__ if agent_exc is not None else None})
         if not drafts:
             return _no_companies(agent_exc, tools)
         _refresh_snapshot(gov, tools)
@@ -540,6 +544,8 @@ def run_icp(icp: dict) -> list[dict]:
         LAST_REPORT["verify"] = report.counts()
         LAST_REPORT["verify_drops"] = report.details()
         LAST_REPORT["verified"] = [r.get("company_name") for r in rows]
+        arena_training.phase("after_verification", rows, details={"counts": LAST_REPORT["verify"],
+                              "drops": LAST_REPORT["verify_drops"]})
         try:                                        # v110: one cheap call grades each row's cited announcement
             LAST_REPORT["eventgrade"] = eventgrade.grade(rows, icp) if rows else {}
         except Exception as exc:  # noqa: BLE001 - grading is optional
@@ -555,6 +561,7 @@ def run_icp(icp: dict) -> list[dict]:
         _refresh_snapshot(gov, tools)
         chosen, notes = admission.select(rows, icp, limit=limit)
         LAST_REPORT["admission"] = notes
+        arena_training.phase("after_admission", chosen, details={"verified_count": len(rows), "admission": notes})
         try:
             LAST_REPORT["rows"] = [admission.explain(r, icp) for r in rows]
         except Exception as exc:  # noqa: BLE001 - diagnostics only
@@ -598,6 +605,9 @@ def run_icp(icp: dict) -> list[dict]:
                                 "egress": dict(getattr(tools, "egress", None) or {})}
         LAST_REPORT["seconds"] = round(time.monotonic() - clock.t0, 1)
         LAST_REPORT["diagnostics"] = diagnostics.snapshot()
+        arena_training.phase("final", locker.locked, details={"locker": LAST_REPORT["locker"],
+                              "reverify": LAST_REPORT.get("reverify")})
+        LAST_REPORT["training_capture_summary"] = arena_training.final_summary()
         lock.decide("finish", "submit the locked companies", evidence=[f"{len(locker.locked)} companies"])
         governor.install(None)
         _emit_report()

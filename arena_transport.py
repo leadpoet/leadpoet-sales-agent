@@ -8,9 +8,12 @@ request sent here passes through ``ArenaSocketTransport``, which keeps only the 
 from __future__ import annotations
 
 import os
+import hashlib
 from typing import Any, Iterable, Mapping
 
 import httpx
+
+from . import arena_training
 
 # lab_arena.operations.ALLOWED_REQUEST_HEADERS
 ALLOWED_REQUEST_HEADERS = frozenset({
@@ -45,9 +48,55 @@ class ArenaSocketTransport(httpx.BaseTransport):
         kept = allowed_headers(request.headers.multi_items())
         if len(kept) != len(request.headers.multi_items()):
             request.headers = httpx.Headers(kept)
-        return self._inner.handle_request(request)
+        response = self._inner.handle_request(request)
+        if not 200 <= response.status_code < 300:
+            return response
+        identity = response.headers.get("x-leadpoet-call-identity", "")
+        if response.is_stream_consumed:
+            # A test or custom transport may return an already-read Response.
+            try:
+                body = response.content
+            except httpx.ResponseNotRead:
+                arena_training.provider_incomplete()
+            else:
+                arena_training.provider_response(
+                    response.status_code, identity, "sha256:" + hashlib.sha256(body).hexdigest(), len(body))
+        else:
+            response.stream = _ReceiptStream(response.stream, response.status_code, identity)
+        return response
 
     def close(self) -> None:
+        self._inner.close()
+
+
+class _ReceiptStream(httpx.SyncByteStream):
+    """Hash raw response chunks and acknowledge only after their iterator ends normally."""
+
+    def __init__(self, inner: httpx.SyncByteStream, status: int, identity: str) -> None:
+        self._inner, self._status, self._identity = inner, status, identity
+        self._digest = hashlib.sha256()
+        self._size = 0
+        self._complete = False
+        self._closed = False
+
+    def __iter__(self):
+        try:
+            for chunk in self._inner:
+                self._digest.update(chunk)
+                self._size += len(chunk)
+                yield chunk
+            self._complete = True
+            arena_training.provider_response(
+                self._status, self._identity, "sha256:" + self._digest.hexdigest(), self._size)
+        finally:
+            if not self._complete and not self._closed:
+                self._closed = True
+                arena_training.provider_incomplete()
+
+    def close(self) -> None:
+        if not self._complete and not self._closed:
+            self._closed = True
+            arena_training.provider_incomplete()
         self._inner.close()
 
 
