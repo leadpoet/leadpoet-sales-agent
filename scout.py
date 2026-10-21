@@ -1763,6 +1763,8 @@ DISPUTE_CALL_RESERVE = 30
 LATER_RAISE_DAYS = 150
 STALE_EARLY_ROUND_DAYS = int(STRATEGY.get("stale_early_round_days") or 1460)
 STAGE_PROOF_WEAK_HOSTS = bool(STRATEGY.get("stage_proof_weak_hosts", 0))
+# The own-site round search in _search_stage_proof (the yield plan turns it on for the deep tier).
+OWN_ROUND_SEARCH = False
 
 
 def excerpt_listing(name: str, text: str, domain: str = "", url: str = "") -> str:
@@ -2238,6 +2240,29 @@ def _search_stage_proof(tools: Any, name: str, prof: Mapping[str, Any], icp: Map
             hit = scan(url, _page_text(tools, url, str(row.get("excerpt") or "")), str(row.get("published_date") or "")[:10] or None)
             if hit:
                 return hit
+    # One search of the company's own site for the announcement of a round at the ICP's stage when the searches above
+    # named no round.  Its pages go through the same scan, so the round checks below and the freshness and
+    # later-round checks after stage proof apply unchanged.
+    if OWN_ROUND_SEARCH and not best_round and want in _VENTURE and domain and time.monotonic() < deadline:
+        from .stagefirst import _STAGE_PHRASES
+        phrase = (_STAGE_PHRASES.get(want) or ("",))[0]
+        data = None
+        if phrase:
+            try:
+                data = tools.search_web(f'"{plain}" {phrase}', include_domains=[domain], limit=5)
+            except BudgetExhausted:
+                raise
+            except Exception:
+                data = None
+            LAST["own_round_searches"] = LAST.get("own_round_searches", 0) + 1
+        for row in (data or {}).get("results") or []:
+            url = str(row.get("url") or "")
+            if _stage_host_tier(url, domain) != 0:
+                continue
+            scan(url, _page_text(tools, url, str(row.get("excerpt") or "")),
+                 str(row.get("published_date") or "")[:10] or None)
+        if best_round:
+            LAST.setdefault("own_round_found", []).append(f"{name}: {best_round}")
     if owned:
         LAST.setdefault("stage_mismatch", []).append(f"{name}: ownership change ({owned[:80]})")
         # _OWNED_RE is loose ('a portfolio company of <VC>', a founder's earlier exit): only a change of control

@@ -160,8 +160,33 @@ def paid_query(name: str, signal_text: str) -> str:
     return (f'"{" ".join(str(name or "").split())}" ' + " ".join(words[:10])).strip()[:200]
 
 
+# A LinkedIn post, article or feed update speaks for its author; a bonus fact needs a page the company stands behind.
+_LINKEDIN_POST_RE = re.compile(r"^https?://(?:[a-z0-9-]+\.)?linkedin\.com(?::\d+)?/(posts|pulse|feed/update)/([^/?#]*)",
+                               re.I)
+_LINKEDIN_COMPANY_RE = re.compile(r"linkedin\.com/company/([^/?#]+)", re.I)
+
+
+def linkedin_post(url: Any, company_linkedin: Any = "") -> bool:
+    """True for a linkedin.com /posts/, /pulse/ or /feed/update/ page, except a post published by the company's own
+    LinkedIn page (its author slug is the company page's slug)."""
+
+    match = _LINKEDIN_POST_RE.match(str(url or "").strip())
+    if not match:
+        return False
+    page = _LINKEDIN_COMPANY_RE.search(str(company_linkedin or ""))
+    if match.group(1).lower() != "posts" or not page:
+        return True
+    slug, segment = page.group(1).casefold(), match.group(2).casefold()
+    return not (segment.split("_", 1)[0] == slug or segment.startswith(slug.replace("-", "_") + "_"))
+
+
 def _news_candidate(tools: Any, icp: Mapping[str, Any], index: int, name: str, domain: str,
-                    reuse: list[str], paid: Any = None) -> Optional[dict]:
+                    reuse: list[str], paid: Any = None, *, company_linkedin: Any = "",
+                    notes: Optional[dict[str, Any]] = None) -> Optional[dict]:
+    """The first page that proves the bonus criterion: the row's own primary pages, then the company's free news feed,
+    then (when ``paid`` allows) one paid search by name.  A LinkedIn post page (``linkedin_post``) is passed over
+    before it is fetched; ``notes['linkedin_post_skips']`` counts them."""
+
     from .roster import CATEGORY_WORDS, company_news
     from .scout import _CHROME_RE, _fetch_text, event_sentence, find_date
     from .sourcetype import body_dateline
@@ -178,6 +203,10 @@ def _news_candidate(tools: Any, icp: Mapping[str, Any], index: int, name: str, d
         tried = 0
         for url, listed in pages:
             if tried >= most or criteria.url_admissible(icp, index, url, f"https://{domain}/"):
+                continue
+            if linkedin_post(url, company_linkedin):
+                if notes is not None:
+                    notes["linkedin_post_skips"] = notes.get("linkedin_post_skips", 0) + 1
                 continue
             tried += 1
             text = _fetch_text(tools, url)
@@ -275,7 +304,8 @@ def attach(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], tool
                 if criteria.is_hiring(icp, index):
                     found = _hiring_candidate(tools, icp, index, name, domain)
                 else:
-                    found = _news_candidate(tools, icp, index, name, domain, primary_urls, paid)
+                    found = _news_candidate(tools, icp, index, name, domain, primary_urls, paid,
+                                            company_linkedin=row.get("company_linkedin"), notes=notes)
             except BudgetExhausted:
                 notes["stopped"] = "budget"
                 return notes
@@ -283,6 +313,9 @@ def attach(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], tool
                 notes.setdefault("errors", []).append(f"{name[:30]}: {type(exc).__name__}")
                 continue
             if not found:
+                continue
+            if linkedin_post(found.get("url"), row.get("company_linkedin")):
+                notes["linkedin_post_skips"] = notes.get("linkedin_post_skips", 0) + 1
                 continue
             seen = {f"{s.get('matched_icp_signal')}|{s.get('url')}" for s in row.get("intent_signals") or []}
             verified = verify_signal(found, company={"company_name": name, "company_website": website}, icp=icp,
@@ -306,4 +339,4 @@ def attach(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], tool
     return notes
 
 
-__all__ = ["attach", "role_groups", "title_matches", "confirm", "paid_query", "after_dateline"]
+__all__ = ["attach", "role_groups", "title_matches", "confirm", "paid_query", "after_dateline", "linkedin_post"]

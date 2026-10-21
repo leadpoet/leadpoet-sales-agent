@@ -1,4 +1,5 @@
 {
+ "bare_row_fill": 0,
  "call_budget": 190,
  "draft_limit": 8,
  "emit_bound_linkedin": 1,
@@ -10,7 +11,7 @@
  "hiring_companies": 16,
  "hiring_gh_departments": 1,
  "hiring_late_round_days": 548,
- "label": "v100-c18",
+ "label": "v100-c18-yp2",
  "paragraph_model": "anthropic/claude-sonnet-5.5",
  "reverify": 1,
  "roster": 1,

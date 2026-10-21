@@ -20,16 +20,30 @@ from __future__ import annotations
 import itertools
 import re
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from . import criteria
 from . import gates
 from . import scorer_mirror as sm
+from .arena_tools import STRATEGY
 
 # v92: 5 on every ICP (was 3 off the list categories).  10-06: the entries that sent 5 evidenced rows on the
 # REGULATORY_CLEARANCE ICP qualified 2-3 of them; this code sent 2 and qualified 1.
 DEFAULT_CAP = 5
 EVIDENCED_FOR_FILL = 3  # v95: evidenced rows admitted before unproven fit-proven rows may fill the remaining slots
 FILL_TIERS = ("A", "B")  # v95: only rows whose fit is proven on their own site may fill (penalties come from fit)
+# Rows without stage evidence fill the free slots beside EVIDENCED_FOR_FILL evidenced rows only when this is on; a
+# row without stage evidence still goes alone when no evidenced row is admitted.
+BARE_ROW_FILL = bool(STRATEGY.get("bare_row_fill", 0))
+# Rank by the evidence a row carries (``evidence_score``) ahead of the expected-value order (the yield plan turns it
+# on for the deep tier); a row whose announcement does not establish the attribute's change clause still ranks after
+# the others.  Each weight is the fixed log-odds gain of one evidence feature; a feature with weight 0 is reported
+# but does not move the order.
+EVIDENCE_RANK = False
+EVIDENCE_WEIGHTS = {"ra_claim": 1.70, "primary_source": 0.0, "primary_not_linkedin": 0.5, "two_signals": 0.88,
+                    "linkedin": 0.67, "stage_own_site": 0.28}
+_LISTING_HOSTS = ("sec.gov", "nasdaq.com", "nyse.com", "stocktitan.net", "marketscreener.com")
+_EXTRA_WIRE_HOSTS = ("accessnewswire.com",)
 PUBLIC_CAP = 5
 LIST_CAP = 5
 LIST_CATEGORIES = ("FUNDING", "PRODUCT_LAUNCH", "HIRING", "JOBS", "LEADERSHIP_CHANGE")
@@ -252,7 +266,7 @@ def explain(row: Mapping[str, Any], icp: Mapping[str, Any]) -> dict[str, Any]:
             "source": str(flags.get("source") or ""), "conflict": conflict(row),
             "rank_last": bool(flags.get("rank_last")), "round_named": funding_round_named(row, icp),
             "board_only": board_only_event(row, icp), "event_ok": flags.get("event_ok"),
-            "change": flags.get("change_grade")}
+            "change": flags.get("change_grade"), "evidence": round(evidence_score(row), 2)}
 
 
 def expected_score(rows: list[Mapping[str, Any]], icp: Mapping[str, Any]) -> float:
@@ -311,14 +325,80 @@ def has_stage_evidence(row: Mapping[str, Any]) -> bool:
     return bool(row.get("company_stage_evidence")) or bool((row.get("_flags") or {}).get("stage_evidence"))
 
 
+def _host(url: Any) -> str:
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _within(host: str, suffixes: tuple[str, ...]) -> bool:
+    return any(host == s or host.endswith("." + s) for s in suffixes)
+
+
+def _evidence_source(url: Any, website: Any) -> str:
+    """The class of a cited page: own | wire | listing | linkedin | job | news | none."""
+
+    from .sourcetype import ATS_HOSTS, WIRE_HOSTS
+
+    host = _host(url)
+    if not host:
+        return "none"
+    if _within(host, ("linkedin.com",)):
+        return "linkedin"
+    if _within(host, tuple(WIRE_HOSTS) + _EXTRA_WIRE_HOSTS):
+        return "wire"
+    try:
+        path = (urlsplit(str(url)).path or "").lower()
+    except ValueError:
+        path = ""
+    if _within(host, tuple(ATS_HOSTS)) or "/jobs" in path or "/careers" in path or "/job/" in path:
+        return "job"
+    site = sm.registrable_host(str(website or ""))
+    if site and (host == site or host.endswith("." + site) or ("." in host and site.endswith("." + host))):
+        return "own"
+    if _within(host, _LISTING_HOSTS) or host.startswith(("investors.", "ir.")):
+        return "listing"
+    return "news"
+
+
+def evidence_features(row: Mapping[str, Any]) -> dict[str, bool]:
+    """The binary features EVIDENCE_WEIGHTS prices: a required-attribute claim, a company LinkedIn page, two or more
+    cited signals, the primary signal on the company's own site, a newswire or a listing page, the primary signal
+    not on LinkedIn, and the first stage evidence on the company's own site."""
+
+    website = row.get("company_website")
+    signals = [s for s in row.get("intent_signals") or [] if isinstance(s, Mapping)]
+    primary = next((s for s in signals if s.get("matched_icp_signal") in (0, None)), signals[0] if signals else {})
+    primary_kind = _evidence_source(primary.get("url"), website)
+    stage = [s for s in row.get("company_stage_evidence") or [] if isinstance(s, Mapping)]
+    claim = row.get("required_attribute")
+    return {"ra_claim": isinstance(claim, Mapping) and bool(claim),
+            "primary_source": primary_kind in ("own", "wire", "listing"),
+            "primary_not_linkedin": primary_kind != "linkedin",
+            "two_signals": len(signals) >= 2,
+            "linkedin": bool(str(row.get("company_linkedin") or "").strip()),
+            "stage_own_site": bool(stage) and _evidence_source(stage[0].get("url"), website) == "own"}
+
+
+def evidence_score(row: Mapping[str, Any]) -> float:
+    return float(sum(EVIDENCE_WEIGHTS[k] for k, on in evidence_features(row).items() if on))
+
+
 def rank_key(row: Mapping[str, Any], icp: Mapping[str, Any]) -> tuple:
     """Estimated quality; on a staged ICP rows with stage evidence first, then round-named FUNDING rows; a contested
-    row (``rank_last``) and a board-only leadership row last."""
+    row (``rank_last``) and a board-only leadership row last.  With EVIDENCE_RANK a row graded ``none`` on the
+    attribute's change clause follows the rows those keys leave tied, and the evidence score orders them ahead of the
+    expected value."""
 
     est = estimates(row, icp)
-    return (bool((row.get("_flags") or {}).get("rank_last")), (row.get("_flags") or {}).get("event_ok") is False,
+    flags = row.get("_flags") or {}
+    return (bool(flags.get("rank_last")), flags.get("event_ok") is False,
             board_only_event(row, icp) and board_discounted(icp),
             staged(icp) and not stage_backed(row, icp), staged(icp) and not has_stage_evidence(row),
+            EVIDENCE_RANK and str(flags.get("change_grade") or "") == "none",
+            -(round(evidence_score(row), 2) if EVIDENCE_RANK else 0.0),
             -est["q"] * value(row, icp), -est["q"])
 
 
@@ -405,7 +485,7 @@ def select(rows: list[Mapping[str, Any]], icp: Mapping[str, Any], *, limit: int 
     chosen, best_ev = _admit([r for r in pool if not any(r is b for b in bare)], icp, cap)
     if bare and not chosen:
         chosen, best_ev = _admit(bare, icp, 1)
-    elif bare and len(chosen) >= EVIDENCED_FOR_FILL and len(chosen) < cap:
+    elif BARE_ROW_FILL and bare and len(chosen) >= EVIDENCED_FOR_FILL and len(chosen) < cap:
         # v95: three evidenced rows mean the judge can verify this ICP (on-chain 10-02/03/05/06: such ICPs paid 72% of
         # the time, and the unproven rows sent beside them were worth +2.3 points each; beside two evidenced rows
         # +0.3, beside fewer -1.3).  Fit-proven unproven rows then fill the free slots, best first.
@@ -638,4 +718,5 @@ def trim_urls(rows: list[dict[str, Any]], max_urls: int = MAX_INTENT_URLS) -> li
 
 __all__ = ["select", "estimates", "expected_score", "typed_safe", "safety_gaps", "explain", "value", "raw_points",
            "cap_for", "list_type", "conflict", "rank_key", "has_stage_evidence", "funding_round_named",
-           "board_only_event", "stage_backed", "one_per_site", "publisher_site"]
+           "board_only_event", "stage_backed", "one_per_site", "publisher_site", "evidence_features",
+           "evidence_score"]

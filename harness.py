@@ -11,7 +11,8 @@ Pipeline for one ICP (all deadlines from LAB_ARENA_WALL_CLOCK_SECONDS, all spend
      proven conflicts;
   6. lock and checkpoint (lock.py), the reviewed paragraph, the Sonar re-check, and a final lock.  A company the
      re-check drops leaves the output (admission then runs once more without it); if none is left the output is
-     empty.
+     empty.  A row it contests is held back beside other rows, and with time to spare its slot is filled once from
+     the verified rows no re-check has seen.
 ``run_icp`` returns the last locked list.  With nothing locked, a host fault returns [] (an infrastructure failure
 would otherwise leave the assignment incomplete) and our own failure raises for the retry attempt.
 """
@@ -38,6 +39,7 @@ try:
     from . import eventgrade
     from . import intent_details as details_module
     from . import scorer_mirror as sm
+    from . import arena_tools as _tools_mod, roster as roster_module, stagefirst as stagefirst_module, yieldplan
     from .arena_tools import STRATEGY as _STRATEGY, ArenaTools
     from .verify import announced_schema, strip_internal, verify_companies, verify_signal
 except ImportError:
@@ -50,6 +52,9 @@ except ImportError:
     scout_module = importlib.import_module(f"{_pkg}.scout")
     eventgrade = importlib.import_module(f"{_pkg}.eventgrade")
     sm = importlib.import_module(f"{_pkg}.scorer_mirror")
+    roster_module = importlib.import_module(f"{_pkg}.roster")
+    stagefirst_module = importlib.import_module(f"{_pkg}.stagefirst")
+    yieldplan = importlib.import_module(f"{_pkg}.yieldplan")
     _tools_mod = importlib.import_module(f"{_pkg}.arena_tools")
     _STRATEGY, ArenaTools = _tools_mod.STRATEGY, _tools_mod.ArenaTools
     _verify_mod = importlib.import_module(f"{_pkg}.verify")
@@ -179,9 +184,10 @@ RESCUE_POST_SCOUT_USD = 0.03
 BONUS_MIN_HEADROOM_USD = 0.02
 
 
-def _start_governor(clock: Any, tools: Any) -> Any:
+def _start_governor(clock: Any, tools: Any, tier_cap_usd: float | None = None) -> Any:
     """Earlier attempts' spend from the host snapshot.  Unknown or unsettled prior spend lowers the cap; settled
-    prior spend within FRUGAL_BELOW_USD of the cap switches to rescue mode."""
+    prior spend within FRUGAL_BELOW_USD of the cap switches to rescue mode.  ``tier_cap_usd`` (the yield plan's
+    spend cap) lowers the mode cap further; the host allowance still bounds it."""
 
     gov = governor.Governor(clock=clock)
     prior, settled = governor.read_prior(gov=gov)
@@ -199,15 +205,18 @@ def _start_governor(clock: Any, tools: Any) -> Any:
             gov.set_mode_cap(gov.cap)
             LAST_REPORT["rescue"] = True
     _refresh_snapshot(gov, tools)
+    if tier_cap_usd is not None:
+        gov.set_mode_cap(min(float(getattr(gov, "_mode_limit_usd", float("inf"))), float(tier_cap_usd)))
     LAST_REPORT["prior_spend_usd"] = None if prior is None else round(prior, 4)
     LAST_REPORT["prior_settled"] = settled
     return gov
 
 
-def scout_budget(gov: Any, rescue: bool = False) -> float:
-    """Discovery's budget: the strategy budget within what the cap leaves (rescue: the rescue remainder)."""
+def scout_budget(gov: Any, rescue: bool = False, reserve: float = POST_SCOUT_RESERVE_USD) -> float:
+    """Discovery's budget: the strategy budget within what the cap leaves after ``reserve`` (the yield plan's
+    post-discovery reserve; rescue: the rescue remainder)."""
 
-    left = float(gov.mode_cap) - float(gov.committed()) - POST_SCOUT_RESERVE_USD
+    left = float(gov.mode_cap) - float(gov.committed()) - float(reserve)
     if rescue:
         return max(0.03, float(gov.mode_cap) - float(gov.committed()) - RESCUE_POST_SCOUT_USD)
     if float(gov.mode_cap) - float(gov.prior) < FRUGAL_BELOW_USD:
@@ -238,6 +247,65 @@ def _release_calls(tools: Any, held: int) -> None:
             pass
 
 
+def _yield_modules() -> dict[str, Any]:
+    return {"scout": scout_module, "roster": roster_module, "stagefirst": stagefirst_module, "admission": admission,
+            "arena_tools": _tools_mod}
+
+
+def start_plan(icp: Mapping[str, Any], clock: Any, tools: Any) -> tuple[dict[str, Any], Any]:
+    """(the ICP's yield plan for this round's host allowance, its governor).
+
+    The first snapshot refresh in _start_governor adopts the round's Deepline call quota, and in a round without a
+    call cap that ceiling becomes max(current, arena_tools.UNCAPPED_CALL_BUDGET).  So the legacy plan (the lower
+    ceiling) is applied before the governor starts; once the governor holds the host allowance the final plan is
+    applied, and when it raises the ceiling the quota is adopted once more.  When the earlier attempts' spend is
+    unknown or still settling, the governor runs under its lean or retry cap, and the final plan is the legacy one."""
+
+    plan = yieldplan.plan_for(icp)
+    modules = _yield_modules()
+    first = yieldplan.apply(yieldplan.legacy_plan(plan), modules)
+    gov = _start_governor(clock, tools, tier_cap_usd=float(plan["cap_usd"]))
+    plan = yieldplan.for_allowance(plan, gov.allowance_usd)
+    if LAST_REPORT.get("prior_spend_usd") is None or not LAST_REPORT.get("prior_settled"):
+        plan = dict(yieldplan.legacy_plan(plan), regime="legacy")
+    knobs = yieldplan.apply(plan, modules)
+    if knobs.get("arena_tools.UNCAPPED_CALL_BUDGET") != first.get("arena_tools.UNCAPPED_CALL_BUDGET"):
+        _refresh_snapshot(gov, tools)
+    LAST_REPORT["yield_plan"] = {"tier": plan["tier"], "regime": plan["regime"], "cap_usd": plan["cap_usd"],
+                                 "allowance_usd": round(float(gov.allowance_usd), 4),
+                                 "draft_limit": plan.get("draft_limit"),
+                                 "post_scout_reserve_usd": plan.get("post_scout_reserve_usd"),
+                                 "discovery_max_s": plan.get("discovery_max_s"),
+                                 "call_budget": getattr(tools, "call_budget", None), "knobs": knobs}
+    return plan, gov
+
+
+def discovery_reserve(plan: Mapping[str, Any], gov: Any) -> float:
+    """The spend discovery leaves for the later phases: the plan's reserve, but at most a quarter of what the cap still
+    leaves (never below POST_SCOUT_RESERVE_USD), so an attempt that starts with most of the cap spent keeps the
+    promoted discovery budget."""
+
+    raw = plan.get("post_scout_reserve_usd")
+    reserve = POST_SCOUT_RESERVE_USD if raw is None else float(raw)
+    left = float(gov.mode_cap) - float(gov.committed())
+    return min(reserve, max(POST_SCOUT_RESERVE_USD, 0.25 * left))
+
+
+# A plan with ``discovery_max_s`` may run discovery until this share of the wall clock (at most that many seconds) when
+# that is later than the clock's own discovery end; a compressed clock keeps its own end.
+LONG_DISCOVERY_SHARE = 0.5
+
+
+def discovery_end(plan: Mapping[str, Any], clock: Any) -> float:
+    """When discovery stops (a time.monotonic value)."""
+
+    end = float(clock.discovery_end)
+    longest = plan.get("discovery_max_s")
+    if not longest or getattr(clock, "compressed", True):
+        return end
+    return max(end, float(clock.t0) + min(LONG_DISCOVERY_SHARE * float(clock.wall), float(longest)))
+
+
 def _refresh_snapshot(gov: Any, tools: Any) -> None:
     """Re-base the governor on the host's spend and adopt the round's real Deepline call quota (never raises)."""
 
@@ -252,6 +320,15 @@ def _refresh_snapshot(gov: Any, tools: Any) -> None:
             tools.adopt_quota(snap)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _bonus_order(rows: list[dict[str, Any]], icp: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The rows in the order bonus attempts go: admission's own order when it ranks by evidence, else by expected
+    value."""
+
+    if admission.EVIDENCE_RANK:
+        return sorted(rows, key=lambda r: admission.rank_key(r, icp))
+    return sorted(rows, key=lambda r: -admission.estimates(r, icp)["q"] * admission.value(r, icp))
 
 
 def _evidence_for(row: Mapping[str, Any], report: Any) -> list[dict[str, Any]]:
@@ -353,35 +430,90 @@ def _rv_reasons(notes: Mapping[str, Any]) -> dict[str, str]:
     return out
 
 
+def _has_bonus(row: Mapping[str, Any]) -> bool:
+    return any(isinstance(s.get("matched_icp_signal"), int) and s["matched_icp_signal"] >= 1
+               for s in row.get("intent_signals") or [])
+
+
+def _contested(row: Mapping[str, Any]) -> bool:
+    return bool((row.get("_flags") or {}).get("recheck_mismatch"))
+
+
 def _reverify_step(chosen: list[dict[str, Any]], rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any],
                    clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """v102: the re-check step, then a row it contradicted on a fit dimension is not sent beside another row.
 
     On-chain (10-09 and 10-11) the rows our re-check called a mismatch and we sent anyway qualified 0 times in 58
     (ClearJet, Cohere, Ivee, soCash, Auger, ...); beside a qualifier each such row costs 10 points.  Alone it stays:
-    an ICP score cannot go below zero."""
+    an ICP score cannot go below zero.  With time to spare, the slots of the rows held back are filled once
+    (``_refill``)."""
 
-    final, notes = _reverify_step_inner(chosen, rows, report, icp, clock, limit)
-    def _has_bonus(r: Mapping[str, Any]) -> bool:
-        return any(isinstance(s.get("matched_icp_signal"), int) and s["matched_icp_signal"] >= 1
-                   for s in r.get("intent_signals") or [])
-
-    contested = [r for r in final if (r.get("_flags") or {}).get("recheck_mismatch")]
+    checked_sites: set[str] = set()
+    final, notes = _reverify_step_inner(chosen, rows, report, icp, clock, limit, checked_sites=checked_sites)
+    contested = [r for r in final if _contested(r)]
     held = [r for r in contested if not _has_bonus(r)]      # v111: a bonus row is worth 80 against a 10-point risk
     if len(held) < len(contested):
         notes["contested_kept_for_bonus"] = [str(r.get("company_name")) for r in contested if _has_bonus(r)]
     if held and len(held) < len(final):
         final = [r for r in final if not any(r is h for h in held)]
         notes["withheld_contested"] = [str(r.get("company_name")) for r in held]
+        if time.monotonic() < clock.paid_cutoff - REPLACE_MIN_S:
+            try:
+                final, notes["refill"] = _refill(final, rows, checked_sites, report, icp, clock, limit)
+            except Exception as exc:  # noqa: BLE001 - the rows held back stay out; the others go as they are
+                notes["refill"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     return final, notes
 
 
+def _refill(final: list[dict[str, Any]], rows: list[dict[str, Any]], checked_sites: set[str], report: Any,
+            icp: Mapping[str, Any], clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """(the rows to submit, notes): the free slots after rows were held back.  Admission runs once more over the rows
+    kept plus the verified rows whose company no re-check has seen; its picks beyond the kept rows, up to the free
+    slots, get their paragraph and one re-check.  A new pick the re-check drops, or contests while it carries no bonus
+    row, stays out; the kept rows are not changed."""
+
+    def host(row: Mapping[str, Any]) -> str:
+        return sm.registrable_host(_site(row)) or _site(row)
+
+    have = {host(r) for r in final}
+    seen = {sm.registrable_host(site) or site for site in checked_sites}
+    pool = list(final) + [r for r in rows if host(r) not in seen and host(r) not in have]
+    again, adm = admission.select(pool, icp, limit=limit)
+    free = max(0, int(adm.get("cap") or limit) - len(final))
+    new = [r for r in again if host(r) not in have][:free]
+    notes: dict[str, Any] = {"admission": adm, "new": [r.get("company_name") for r in new]}
+    if not new or time.monotonic() >= clock.paid_cutoff - 30.0:
+        return final, notes
+    _refresh_fallbacks(new, report, icp)
+    evidence = {sm.company_name_key(r.get("company_name")): _evidence_for(r, report) for r in new}
+    notes["paragraph"] = details_module.write_paragraphs(new, icp, evidence=evidence, model_name=PARAGRAPH_MODEL)
+    try:
+        _bonus_paragraph_guard(new, report, icp, notes["paragraph"])
+    except Exception as exc:  # noqa: BLE001 - the rows stay as the writer left them
+        notes["paragraph"]["bonus_guard_error"] = type(exc).__name__
+    checked, rv_notes = _reverify(new, icp)
+    added: list[dict[str, Any]] = []
+    for row in checked:
+        if (_contested(row) and not _has_bonus(row)) or host(row) in have:    # a website the re-check moved
+            continue
+        have.add(host(row))
+        added.append(row)
+    notes.update(added=[r.get("company_name") for r in added],
+                 left_out=[r.get("company_name") for r in new if not any(r is a for a in added)],
+                 reasons=_rv_reasons(rv_notes))
+    return final + added, notes
+
+
 def _reverify_step_inner(chosen: list[dict[str, Any]], rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any],
-                         clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                         clock: Any, limit: int, checked_sites: set[str] | None = None
+                         ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """(the rows to submit, notes).  A company the re-check drops leaves the output even when nothing is left.
     With time to spare, admission runs again over the verified rows minus every dropped company, and the new picks
-    get their paragraph and one re-check of their own."""
+    get their paragraph and one re-check of their own.  ``checked_sites`` collects the website of every row sent to
+    a re-check, as it was before the re-check."""
 
+    if checked_sites is not None:
+        checked_sites.update(_site(r) for r in chosen)
     checked, rv_notes = _reverify(chosen, icp)
     dropped = {_site(r) for r in chosen} - {_site(r) for r in checked}
     notes: dict[str, Any] = {"kept": [r.get("company_name") for r in checked],
@@ -403,6 +535,8 @@ def _reverify_step_inner(chosen: list[dict[str, Any]], rows: list[dict[str, Any]
             evidence = {sm.company_name_key(r.get("company_name")): _evidence_for(r, report) for r in fresh}
             replacement["paragraph"] = details_module.write_paragraphs(fresh, icp, evidence=evidence,
                                                                        model_name=PARAGRAPH_MODEL)
+            if checked_sites is not None:
+                checked_sites.update(_site(r) for r in fresh)
             checked_new, rv_new = _reverify(fresh, icp)
             dropped |= {_site(r) for r in fresh} - {_site(r) for r in checked_new}
             done.update({_site(r): r for r in checked_new})
@@ -492,7 +626,8 @@ def run_icp(icp: dict) -> list[dict]:
         random.seed(int(str(os.environ.get("LAB_ARENA_RANDOM_SEED") or "0").strip() or 0))
     except ValueError:
         pass
-    gov = _start_governor(clock, tools)
+    plan, gov = start_plan(icp, clock, tools)
+    draft_limit = int(plan.get("draft_limit") or DRAFT_LIMIT)
     rescue = bool(LAST_REPORT.get("rescue"))
     frugal = gov.mode_cap - gov.prior < FRUGAL_BELOW_USD and not rescue
     governor.install(gov, clock)
@@ -505,16 +640,19 @@ def run_icp(icp: dict) -> list[dict]:
                 evidence=[str(icp.get("icp_id") or ""), str(icp.get("intent_category") or "")])
     try:
         tools.deadline = clock.paid_cutoff
-        scout_module.BUDGET_USD = scout_budget(gov, rescue=rescue)
+        reserve = discovery_reserve(plan, gov)
+        scout_module.BUDGET_USD = scout_budget(gov, rescue=rescue, reserve=reserve)
         LAST_REPORT["scout_budget_usd"] = round(scout_module.BUDGET_USD, 4)
+        LAST_REPORT["scout_reserve_usd"] = round(reserve, 4)
         LAST_REPORT["mode"] = "rescue" if rescue else ("frugal" if frugal else "full")
-        discovery_s = max(60.0, clock.discovery_end - time.monotonic())
+        discovery_s = max(60.0, discovery_end(plan, clock) - time.monotonic())
+        LAST_REPORT["discovery_s"] = round(discovery_s, 1)
         agent_exc: BaseException | None = None
         drafts: list[dict[str, Any]] = []
         held = _hold_calls(tools)
         try:
             budget0, spend0 = float(scout_module.BUDGET_USD), _spent_usd(tools)
-            drafts = scout_module.run_scout(icp, tools, limit=DRAFT_LIMIT, run_timeout=discovery_s)
+            drafts = scout_module.run_scout(icp, tools, limit=draft_limit, run_timeout=discovery_s)
             for attempt, wait_s in enumerate(DISCOVERY_RETRY_WAITS, start=1):   # crown18: see discovery_outage
                 why = discovery_outage(drafts, scout_module, tools, clock, wait_s)
                 if not why:
@@ -525,7 +663,7 @@ def run_icp(icp: dict) -> list[dict]:
                 # The second pass spends what the first left of the scout budget, never a fresh window.
                 scout_module.BUDGET_USD = max(0.10, budget0 - (_spent_usd(tools) - spend0))
                 drafts = scout_module.run_scout(
-                    icp, tools, limit=DRAFT_LIMIT,
+                    icp, tools, limit=draft_limit,
                     run_timeout=max(90.0, clock.paid_cutoff - DISCOVERY_RETRY_MARGIN_S - time.monotonic()))
         except Exception as exc:  # noqa: BLE001
             agent_exc = exc
@@ -553,7 +691,7 @@ def run_icp(icp: dict) -> list[dict]:
         if rows and time.monotonic() < clock.paid_cutoff and (rescue or gov.headroom() < BONUS_MIN_HEADROOM_USD):
             LAST_REPORT["bonus"] = {"skipped": "rescue" if rescue else "headroom %.3f" % gov.headroom()}
         elif rows and time.monotonic() < clock.paid_cutoff:
-            ranked = sorted(rows, key=lambda r: -admission.estimates(r, icp)["q"] * admission.value(r, icp))
+            ranked = _bonus_order(rows, icp)
             LAST_REPORT["bonus"] = bonus.attach(ranked[:BONUS_ROWS], report, icp, tools, verify_signal=verify_signal,
                                                 deadline=clock.paid_cutoff - 60.0, clock=time.monotonic)
         if rows and time.monotonic() < clock.paid_cutoff:
