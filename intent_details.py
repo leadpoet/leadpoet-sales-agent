@@ -646,7 +646,7 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
     primary = next((i for i, s in enumerate(signals)
                     if s.get("index", s.get("matched_icp_signal")) == 0), 0)
     for position, signal in enumerate(signals):
-        desc = strip_page_chrome(signal.get("description") or "")
+        desc = strip_page_chrome(strip_markdown_dup(signal.get("description") or ""))
         key = sm.normalize_text(desc)[:80]
         if not desc or key in seen:
             continue
