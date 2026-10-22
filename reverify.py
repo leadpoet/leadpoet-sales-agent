@@ -1,15 +1,31 @@
-"""Local precheck for the scorer's independent company-fit re-verification."""
+"""Local precheck for the scorer's independent company-fit re-verification.
+
+This module mirrors selected deterministic decisions and sends a bounded
+Perplexity/sonar web check before submission. Contradicted companies are dropped,
+unprovable ones are ranked last, and a name-only identity discrepancy may adopt
+the verifier's observed name. It does not claim full
+lead_scorer._llm_reverify_company parity: the scorer's identity-bound, current
+LinkedIn Company-size refresh and its second schema/identity repair call remain
+server-only. Best effort: transport or parse failure leaves the company untouched.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import json
 import os
 import re
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 
+import httpx
 
-from . import llm
-from . import scorer_mirror as sm
+try:
+    from . import scorer_mirror as sm
+except ImportError:
+    import importlib
+
+    sm = importlib.import_module(f"{os.path.basename(os.path.dirname(os.path.abspath(__file__)))}.scorer_mirror")
 
 MODEL = "perplexity/sonar"
 TIMEOUT_S = 45.0
@@ -22,6 +38,45 @@ SYSTEM_PROMPT = (
     "the requested strict JSON object."
 )
 MATCH, MISMATCH, UNAVAILABLE = "match", "mismatch", "unavailable"
+
+# Dimensions whose failure the scorer does not charge for. `count_penalizable_false_positives`
+# (qualification/scoring/competition.py) counts a row only on a `company_fit` mismatch receipt or a failure reason
+# naming one of ten markers, and an unverifiable or contradicted stage, industry or employee size is in none of
+# them -- only "missing company_stage", "missing industry" and "missing employee_count", which are about an empty
+# field, not a wrong one. Evicting a company over one of these forfeits a qualified row's ~13 points to avoid a
+# cost of zero. See cost.py for the arithmetic and the 2,648 scored positions it was measured on.
+FREE_DIMENSIONS = ("stage", "industry", "employee_size")
+try:
+    from .arena_tools import STRATEGY as _STRATEGY
+except Exception:  # noqa: BLE001 - the standalone loader; the gate then stays off
+    _STRATEGY = {}
+FREE_MISMATCH_KEEPS = bool(_STRATEGY.get("reverify_free_mismatch_keeps", 0))
+
+
+def charged_mismatch(decision: Mapping[str, Any]) -> bool:
+    """Is this MISMATCH one the scorer would charge us for, or one it ignores?
+
+    Identity and the required attribute are charged: a row the judge cannot bind to a company, or whose attribute
+    it will not grant, costs ~3.4 points of the ICP's 100 and has never once qualified (0 of 3,042 published rows
+    on the attribute, 0 of 3,698 on stage).  Geography is charged when it contradicts the ICP ("country mismatch").
+    Stage, industry and employee size are not charged at all, so a mismatch confined to them is a reason to rank a
+    company last, not to throw its slot away.
+
+    With the gate off this returns True for every mismatch, which is what the bundle did before.
+    """
+
+    if str(decision.get("overall")) != MISMATCH:
+        return False
+    if not FREE_MISMATCH_KEEPS:
+        return True
+    identity = decision.get("identity")
+    if isinstance(identity, Mapping) and str(identity.get("decision")) == MISMATCH:
+        return True
+    dimensions = decision.get("dimensions")
+    if not isinstance(dimensions, Mapping):
+        return True
+    return any(str(value) == MISMATCH for name, value in dimensions.items()
+               if name not in FREE_DIMENSIONS)
 LEGAL_SUFFIXES = frozenset({
     "incorporated", "corporation", "company", "limited", "holdings", "group", "inc", "corp", "co", "llc", "ltd",
     "plc", "gmbh", "ag", "sa", "nv", "bv", "oy", "ab", "as", "pty", "pte", "kk", "srl", "spa",
@@ -30,6 +85,7 @@ LINKEDIN_BUCKETS = ("0-1", "2-10", "11-50", "51-200", "201-500", "501-1,000", "1
 OBSERVED_INTERVALS = ((1, "0-1"), (10, "2-10"), (50, "11-50"), (200, "51-200"), (500, "201-500"),
                       (1_000, "501-1,000"), (5_000, "1,001-5,000"), (10_000, "5,001-10,000"))
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,99}$")
+
 
 
 _SERIES_C_PLUS_MATCHING_STAGES = sm._SERIES_C_PLUS
@@ -493,7 +549,11 @@ def _has_affirmed_stage_proof(
 
 
 def _stage_quote_supports_observation(observed: str, quote: str) -> bool:
-    """Sanity-check that a quote names evidence specific to the reported stage."""
+    """Sanity-check that a quote names evidence specific to the reported stage.
+
+    This guard rejects bare category keywords and obvious uncertainty. It does
+    not replace the web verifier's independent company-attribution check.
+    """
 
     text = str(quote or "").strip()
     if not text:
@@ -582,6 +642,7 @@ def _stage_quote_supports_observation(observed: str, quote: str) -> bool:
     return observed_category == latest
 
 
+
 _OWNERSHIP_LEGAL_SUFFIXES = frozenset({
     "co", "company", "corp", "corporation", "inc", "incorporated", "limited", "llc", "ltd", "plc",
 })
@@ -603,7 +664,9 @@ def _subject_is_company(subject_text: str, names: set[tuple[str, ...]]) -> bool:
 
 
 def acquired_stage_quote_supports_company(company_name: Any, observed_company_name: Any, quote: Any) -> bool:
-    """Lead_scorer._acquired_stage_quote_supports_company: completed acquisition /."""
+    """lead_scorer._acquired_stage_quote_supports_company: completed acquisition /
+    current-parent proof whose SUBJECT is this exact company (name or name + legal
+    suffix), not superseded ("later went public"), not conditional."""
 
     if not isinstance(quote, str) or not quote.strip():
         return False
@@ -630,7 +693,8 @@ def acquired_stage_quote_supports_company(company_name: Any, observed_company_na
 
 
 def bound_public_supersession_supports_company(company_name: Any, observed_company_name: Any, quote: Any) -> bool:
-    """Lead_scorer._bound_public_supersession_supports_company: a completed take-private."""
+    """lead_scorer._bound_public_supersession_supports_company: a completed take-private
+    or current delisting whose subject is this company reopens a Public stage."""
 
     if not isinstance(quote, str) or not quote.strip():
         return False
@@ -667,7 +731,10 @@ def bound_public_supersession_supports_company(company_name: Any, observed_compa
 def first_party_ownership_conflicts_with_stage(company_website: Any, company_name: Any,
                                                observed_company_name: Any, observed_stage: str,
                                                attribute_evidence_url: Any, attribute_evidence_quote: Any) -> bool:
-    """Lead_scorer._first_party_ownership_conflicts_with_stage: when the REQUIRED-ATTRIBUTE."""
+    """lead_scorer._first_party_ownership_conflicts_with_stage: when the REQUIRED-ATTRIBUTE
+    evidence sits on the company's own registrable domain and proves (subject-bound)
+    that this company was acquired, a pinned venture stage is UNRESOLVED; a Public
+    stage is reopened only by a completed take-private / current delisting."""
 
     venture_stage = observed_stage in {"seed", "series a", "series b", "series c+"}
     if not venture_stage and observed_stage != "public":
@@ -732,7 +799,7 @@ def linkedin_slug(value: Any) -> str:
 
 
 def evaluate_identity(company: Mapping[str, Any], verdict: Mapping[str, Any]) -> dict[str, str]:
-    """Evaluate_company_identity with the web verdict as the observation."""
+    """evaluate_company_identity with the web verdict as the observation."""
 
     observed_name = verdict.get("observed_company_name", verdict.get("observed_name"))
     observed_site = verdict.get("observed_company_website", verdict.get("observed_website"))
@@ -788,7 +855,22 @@ def apply_verified_homepage_anchor(
     company: Mapping[str, Any],
     homepage_identity: Mapping[str, Any] | None,
 ) -> MutableMapping[str, Any]:
-    """Downgrade an identity mismatch the first-party homepage contradicts."""
+    """Downgrade an identity mismatch the first-party homepage contradicts.
+
+    Mirrors the block added to ``lead_scorer`` in upstream ``25c8a51b``
+    ("Fix contradictory Arena verification and judge failure handling",
+    LIVE on gateway ``91021d8f``). When the web verifier reports a DIFFERENT
+    LinkedIn slug but the server's own fetch of the company homepage yields the
+    exact triplet we submitted, the model's alternate slug is no longer treated
+    as proof of a wrong company. The decision becomes UNAVAILABLE with
+    ``web_linkedin_conflicts_with_verified_homepage`` and a bounded repair pass
+    re-checks it.
+
+    🔹 Strategy consequence: a homepage-anchored slug can no longer cost -10 on
+    a slug disagreement. It is worth 0 at worst. ``verify.py`` already emits
+    ``company_linkedin`` only when the link is read on the company's own
+    homepage, so every slug we submit qualifies for this protection.
+    """
 
     if not isinstance(homepage_identity, Mapping):
         return receipt
@@ -823,8 +905,27 @@ def apply_verified_homepage_anchor(
     return receipt
 
 
+
 def submitted_homepage_anchor(company: Mapping[str, Any]) -> dict[str, str] | None:
-    """The first-party homepage anchor for a company WE emitted, or None."""
+    """The first-party homepage anchor for a company WE emitted, or None.
+
+    ⛳️ LAB-LOG #237 finding 3.  `apply_verified_homepage_anchor` mirrors the
+    scorer's downgrade but had no anchor to work with, so it was never reachable
+    from `rerank` and a slug conflict was EVICTED instead.  The anchor is not a
+    guess: `verify.py:409-423` emits ``company_linkedin`` ONLY when the slug was
+    read as a ``linkedin.com/company/`` link on the company's own homepage
+    (fetched through Firecrawl, whose markdown keeps link targets), and the name
+    was already required to appear on that same page.  So for our own output the
+    submitted triplet IS the first-party triplet the scorer rebuilds server-side
+    from its own fetch of the same homepage.
+
+    ⚠️ The one thing we cannot observe is whether the SCORER's independent fetch
+    succeeds.  Its anchor exists only when its homepage identity check returns
+    MATCH; when that fetch is refused the web verdict's mismatch stands and the
+    company costs -10/goal.  That is the risk this alignment accepts, and it is
+    bounded to the single shape below: same name, same domain, both slugs
+    non-numeric, ours read off the homepage.  Everything else still evicts.
+    """
 
     slug = linkedin_slug(company.get("company_linkedin"))
     domain = canonical_domain(company.get("company_website"))
@@ -838,7 +939,20 @@ MAX_ORGANIZATION_NAME_LENGTH = 200
 
 
 def name_only_mismatch(receipt: Mapping[str, Any]) -> bool:
-    """True when the ONLY thing separating us from the observed company is the name."""
+    """True when the ONLY thing separating us from the observed company is the name.
+
+    Domain and LinkedIn slug are the strong identifiers; when both already agree,
+    a differing name is a naming discrepancy, not a different company. Upstream
+    now says so itself: `8ba01c27` / `e4f29bf1` accept the observed name when it
+    is the `legalName` published in the homepage's JSON-LD Organization record
+    (brand `name` matching ours, same url domain, same sameAs LinkedIn) and
+    upgrade the receipt to MATCH with `verifier_accepted`.
+
+    We cannot mirror that test directly -- we read the homepage as Firecrawl
+    markdown, which drops `<script type="application/ld+json">` -- so instead of
+    guessing at aliases we submit the name the verifier itself observed, which
+    makes the comparison agree outright. See `adopt_observed_name`.
+    """
     if receipt.get("decision") != MISMATCH or receipt.get("reason_code") != "identity_mismatch":
         return False
     domain = receipt.get("submitted_domain")
@@ -852,7 +966,12 @@ def name_only_mismatch(receipt: Mapping[str, Any]) -> bool:
 
 
 def adopt_observed_name(receipt: Mapping[str, Any]) -> str:
-    """The observed name worth submitting instead of ours, or "" to keep ours."""
+    """The observed name worth submitting instead of ours, or "" to keep ours.
+
+    Bounded and injection-screened exactly like the existing rename path: the
+    name reaches the judge's prompt, so an unbounded or instruction-shaped name
+    must never be adopted.
+    """
     raw = " ".join(sm.strip_gateway_controls(receipt.get("observed_name_raw")).split())
     try:
         from .identity import clean_name
@@ -868,7 +987,7 @@ def adopt_observed_name(receipt: Mapping[str, Any]) -> str:
 
 
 def prompt_locator_host(website: str) -> str:
-    """Candidate_company_prompt_identity()["company"]: the PSL registrable domain of the website host."""
+    """candidate_company_prompt_identity()["company"]: the PSL registrable domain of the website host."""
     from urllib.parse import urlparse
 
     host = str(urlparse(website.strip()).hostname or "").casefold()
@@ -1060,7 +1179,7 @@ NON_SUPPLIER_ROLES = frozenset({"customer_user", "internal_function", "third_par
 def industry_evidence_decision(candidate_industry: Any, candidate_subindustry: Any, requested_industry: str,
                                flag: Optional[bool], *, evidence: Optional[Mapping[str, Any]] = None,
                                activity_role: Any = None, web_path: bool = True) -> str:
-    """Lead_scorer._industry_evidence_decision."""
+    """lead_scorer._industry_evidence_decision (audit #210: role-driven on the web path)."""
 
     if not isinstance(candidate_industry, str):
         return UNAVAILABLE
@@ -1124,7 +1243,7 @@ _STAGE_FIELDS = ("observed_company_stage", "stage_matches",
 
 
 def _reported_nothing(verdict: Mapping[str, Any], dimension: str, matches: str) -> bool:
-    """Lead_scorer.py:1780-1787 -- the generic tail: no verdict, no evidence at all."""
+    """lead_scorer.py:1780-1787 -- the generic tail: no verdict, no evidence at all."""
 
     if verdict.get(matches) is not None:
         return False
@@ -1135,7 +1254,8 @@ def _reported_nothing(verdict: Mapping[str, Any], dimension: str, matches: str) 
 
 
 def _industry_unproven(verdict: Mapping[str, Any], icp: Mapping[str, Any]) -> bool:
-    """Lead_scorer.py:1705-1732 (upstream d2f02967)."""
+    """lead_scorer.py:1705-1732 (upstream d2f02967).  A company the verifier proves is a
+    supplier/operator in SOME industry, cited, that is simply not the ICP's industry."""
 
     if not all(field in verdict for field in _INDUSTRY_FIELDS):
         return False
@@ -1155,7 +1275,13 @@ def _industry_unproven(verdict: Mapping[str, Any], icp: Mapping[str, Any]) -> bo
 
 
 def _employee_size_unproven(verdict: Mapping[str, Any]) -> bool:
-    """Lead_scorer.py:1743-1770 (upstream 83cf2073)."""
+    """lead_scorer.py:1743-1770 (upstream 83cf2073).  A cited employee value that is not
+    one of LinkedIn's canonical buckets proves no supported bucket exists.
+
+    NOT mirrored: upstream returns retryable first when its LinkedIn refresh failed
+    (`linkedin_refresh_outcome == "retryable_failure"`).  That cache is the scorer's and
+    is invisible here, so this can call a company clean that upstream retries.  It only
+    reorders our own bundle, never evicts, so the error is bounded."""
 
     if not all(field in verdict for field in _EMPLOYEE_FIELDS):
         return False
@@ -1188,7 +1314,9 @@ def _stage_unproven(verdict: Mapping[str, Any]) -> bool:
 
 
 def _identity_unproven(identity: Mapping[str, Any]) -> bool:
-    """Lead_scorer._is_same_domain_unproven_web_identity (:1609) and."""
+    """lead_scorer._is_same_domain_unproven_web_identity (:1609) and
+    _is_verified_homepage_web_identity_conflict (:1635).  `evidence_source` is implicit
+    -- every receipt this module builds is company_web_reverification."""
 
     if identity.get("decision") != UNAVAILABLE:
         return False
@@ -1211,7 +1339,8 @@ def _identity_unproven(identity: Mapping[str, Any]) -> bool:
 
 def failure_class(verdict: Mapping[str, Any], dims: Mapping[str, str],
                   identity: Mapping[str, Any], icp: Mapping[str, Any]) -> str:
-    """INSUFFICIENT when the platform would class this a clean, non-retryable 0; "" when."""
+    """INSUFFICIENT when the platform would class this a clean, non-retryable 0; "" when
+    it would keep retrying the run.  Mirrors lead_scorer.py:2160-2180."""
 
     incomplete = [name for name, value in dims.items() if value == UNAVAILABLE]
     if identity.get("decision") == UNAVAILABLE:
@@ -1234,6 +1363,13 @@ def _consistent(flag: Optional[bool], canonical: bool) -> str:
 def decide(verdict: Mapping[str, Any], company: Mapping[str, Any], icp: Mapping[str, Any]) -> dict[str, Any]:
     identity = apply_verified_homepage_anchor(
         evaluate_identity(company, verdict), company, submitted_homepage_anchor(company))
+    try:  # brand_name: a name identity.bind read off the homepage (the judge's own match) is not replaced
+        from . import identity as idn
+        if identity.get("reason_code") == "identity_name_differs" and \
+                (idn._reg(identity.get("submitted_domain")), identity.get("submitted_name")) in idn.HOME:
+            identity.update(decision=MATCH, reason_code="verifier_accepted")
+    except Exception:
+        pass
     dims: dict[str, str] = {}
     evidence: dict[str, dict[str, str]] = {}
     bucket = _observed_bucket(verdict.get("observed_employee_count"))
@@ -1287,59 +1423,122 @@ def decide(verdict: Mapping[str, Any], company: Mapping[str, Any], icp: Mapping[
             "reason": str(verdict.get("reason") or "")[:300]}
 
 
-def _ask(prompt: str, *, model: str) -> tuple[Optional[dict], str]:
-    content = llm.chat([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-                       model=model, max_tokens=1200, purpose="reverify")
-    if content is None:
-        return None, "no reply"
-    match = re.search(r"\{.*\}", content or "", re.S)
-    if match is None:
-        return None, "no JSON object in response"
+def _client_and_base(http_client_factory, timeout: float) -> tuple[httpx.AsyncClient, str, dict[str, str]]:
+    arena_mode = bool(str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip())
+    if http_client_factory is not None:
+        return http_client_factory(timeout), "http://openrouter.ai/api/v1", {"Authorization": "Bearer arena-host"}
+    if arena_mode:
+        try:
+            from .arena_transport import arena_openrouter_http_client
+        except ImportError:
+            import importlib
+
+            arena_openrouter_http_client = importlib.import_module(
+                f"{os.path.basename(os.path.dirname(os.path.abspath(__file__)))}.arena_transport").arena_openrouter_http_client
+        return arena_openrouter_http_client(timeout), "http://openrouter.ai/api/v1", {"Authorization": "Bearer arena-host"}
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENROUTER_API_KEY is required outside the Arena")
+    return (httpx.AsyncClient(timeout=httpx.Timeout(timeout)), "https://openrouter.ai/api/v1",
+            {"Authorization": f"Bearer {key}"})
+
+
+async def _ask(client: httpx.AsyncClient, base: str, headers: Mapping[str, str], prompt: str, *, model: str) -> tuple[Optional[dict], str]:
+    body = {"model": model, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            "temperature": 0.0, "max_tokens": 1200}
     try:
+        response = await client.post(base + "/chat/completions", json=body, headers={**headers, "Content-Type": "application/json"})
+        if response.status_code != 200:
+            return None, f"provider HTTP {response.status_code}: {response.text[:120]}"
+        content = response.json()["choices"][0]["message"]["content"]
+        match = re.search(r"\{.*\}", content or "", re.S)
+        if match is None:
+            return None, "no JSON object in response"
         verdict = json.loads(match.group(0))
-    except ValueError:
-        return None, "invalid JSON"
-    return (verdict, "") if isinstance(verdict, dict) else (None, "JSON was not an object")
+        return (verdict, "") if isinstance(verdict, dict) else (None, "JSON was not an object")
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
-def _run_all(companies, icp, *, model: str):
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        return list(pool.map(lambda c: _ask(build_prompt(c, icp), model=model), companies))
+CONCURRENCY = 16   # requests in flight at once; asking each company three times puts 60 in one batch
 
 
-def host_carries_name(domain: Any, name_key: Any) -> bool:
-    """Is the first label of this host the company's name (key form), bare or with a short affix ('getacme', 'acmehq')?"""
+async def _run_all(companies, icp, *, http_client_factory, timeout: float, model: str):
+    client, base, headers = _client_and_base(http_client_factory, timeout)
+    gate = asyncio.Semaphore(CONCURRENCY)
 
-    label = str(domain or "").split(".")[0].replace("-", "").lower()
-    squashed = str(name_key or "").replace(" ", "").lower()
-    if len(squashed) < 4 or not label:
-        return False
-    return label == squashed or (squashed in label and len(label) - len(squashed) <= 4)
+    async def one(company):
+        async with gate:
+            return await _ask(client, base, headers, build_prompt(company, icp), model=model)
+
+    try:
+        return await asyncio.gather(*(one(c) for c in companies))
+    finally:
+        await client.aclose()
+
+
+def _vote(decisions: list[dict[str, Any]]) -> dict[str, Any]:
+    """The majority verdict of several asks: a strict majority of mismatches (a charged one preferred) or of matches
+    decides; anything else is a split, read as unavailable on insufficient evidence."""
+
+    n = len(decisions)
+    mismatches = [d for d in decisions if d["overall"] == MISMATCH]
+    matches = [d for d in decisions if d["overall"] == MATCH]
+    if len(mismatches) * 2 > n:
+        return next((d for d in mismatches if charged_mismatch(d)), mismatches[0])
+    if len(matches) * 2 > n:
+        return matches[0]
+    unavailable = [d for d in decisions if d["overall"] == UNAVAILABLE]
+    if unavailable:
+        return unavailable[0]
+    return dict(decisions[0], overall=UNAVAILABLE, failure_class=INSUFFICIENT, reason="the asks disagreed")
 
 
 def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_client_factory=None,
-           timeout: float = TIMEOUT_S, model: str = MODEL) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop only a name/website mismatch; rank other contradictions last (``notes['contested']``); adopt the
-    observed name."""
+           timeout: float = TIMEOUT_S, model: str = MODEL, asks: int = 1,
+           order_key: Optional[Callable[[Mapping[str, Any]], int]] = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Drop contradicted companies, rank unprovable ones last, adopt the observed name.
+
+    order_key (judgemirror.order_key when the judge_mirror knob is on) breaks ties inside a vote tier before draft
+    order; without it the order is exactly as before.
+
+    asks > 1 puts the same question to the model that many times per company and takes the majority (s58). The
+    verdict moves between asks: on 60 rows the judge had ruled on (10-14..10-19), five asks agreed with themselves on
+    28% of them; agreement with the judge rose from 67% for one ask to 70% for a majority of three and 72% for five,
+    and the share of judge-failed rows still read as a match fell from 19% to 15% and 13%. A majority mismatch is a
+    strong fail sign (9 judge-failed rows against 1 qualified)."""
 
     notes: dict[str, Any] = {"model": model, "companies": []}
     if not companies:
         return companies, notes
+    asks = max(1, int(asks or 1))
+    n = len(companies)
     try:
-        results = _run_all(companies, icp, model=model)
+        flat = asyncio.run(_run_all(list(companies) * asks, icp, http_client_factory=http_client_factory, timeout=timeout,
+                                    model=model))
     except Exception as exc:
         notes["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         return companies, notes
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
-    for index, (company, (verdict, error)) in enumerate(zip(companies, results)):
+    if asks > 1:
+        notes["asks"] = asks
+    ranked: list[tuple[int, int, int, int, dict[str, Any]]] = []
+
+    def _key(company: Mapping[str, Any]) -> int:
+        try:
+            return int(order_key(company)) if order_key is not None else 0
+        except Exception:  # noqa: BLE001 - a ranking hint must never break the re-check
+            return 0
+
+    for index, company in enumerate(companies):
+        answers = [flat[k * n + index] for k in range(asks)]
+        valid = [verdict for verdict, _ in answers if verdict is not None]
         entry: dict[str, Any] = {"company": company.get("company_name")}
-        if verdict is None:
-            entry["error"] = error
+        if not valid:
+            entry["error"] = answers[0][1]
             notes["companies"].append(entry)
-            ranked.append((1, index, company))
+            ranked.append((1, 0, _key(company), index, company))
             continue
+        verdict = valid[0]
         decision = decide(verdict, company, icp)
         identity = decision["identity"]
         adoptable = (identity["decision"] == UNAVAILABLE
@@ -1355,59 +1554,30 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
                     company = renamed
                     decision = decide(verdict, company, icp)
                     identity = decision["identity"]
-        # v105: when our website is wrong the re-check names the right one - and the company used to be dropped.
-        # On 10-11 ICP8 the funding lane guessed geosurge.com for geoSurge (an empty page); the re-check observed
-        # geosurge.ai in four runs and each time the company was dropped, although that site qualified 9 of 12 times
-        # on-chain.  The observed website is adopted when the observed NAME is ours and the observed host carries
-        # that name; the LinkedIn slug (read from the wrong site) is blanked and the size bucket follows the
-        # observation when the ICP allows it.  The same verdict then decides again.
-        if (identity["decision"] == MISMATCH and identity.get("reason_code") == "identity_mismatch"
-                and identity.get("observed_domain") and identity.get("submitted_domain")
-                and identity.get("observed_domain") != identity.get("submitted_domain")
-                and identity.get("observed_name") and identity.get("observed_name") == identity.get("submitted_name")
-                and host_carries_name(identity.get("observed_domain"), identity.get("submitted_name"))):
-            moved = dict(company, company_website="https://%s/" % identity["observed_domain"], company_linkedin="")
-            bucket = _observed_bucket(verdict.get("observed_employee_count"))
-            if bucket and bucket in sm.icp_buckets(icp):
-                moved["employee_count"] = bucket
-            redo = decide(verdict, moved, icp)
-            if redo["identity"]["decision"] == MATCH:
-                was = str(company.get("company_website") or "")
-                entry["website_adopted"] = f"{was} -> {moved['company_website']}"
-                notes.setdefault("website_adopted", {})[moved["company_website"]] = {
-                    "from": was, "employee_count": moved.get("employee_count") if bucket else ""}
-                company, decision, identity = moved, redo, redo["identity"]
-        # v102c: an identity mismatch on the SAME website can only come from the LinkedIn slug (or the name rule a slug
-        # switches on).  The judge accepts an empty company_linkedin and binds the company through its homepage; a
-        # wrong slug is what fails.  So the slug is blanked and the company stays (geoSurge, 10-11 ICP8: observed
-        # domain geosurge.ai = submitted, dropped in two runs; the judge qualified it 9 of 12 times with no slug).
-        if (identity["decision"] == MISMATCH and identity.get("reason_code") == "identity_mismatch"
-                and identity.get("observed_domain") and identity.get("observed_domain") == identity.get("submitted_domain")
-                and str(company.get("company_linkedin") or "").strip()):
-            bare = dict(company, company_linkedin="")
-            redo = decide(verdict, bare, icp)
-            if redo["identity"]["decision"] != MISMATCH:
-                entry["linkedin_blanked"] = True
-                notes.setdefault("linkedin_blanked", []).append(str(company.get("company_website") or ""))
-                company, decision, identity = bare, redo, redo["identity"]
+        match_votes = int(decision["overall"] == MATCH)
+        if len(valid) > 1:
+            decisions = [decision] + [decide(other, company, icp) for other in valid[1:]]
+            votes = collections.Counter(d["overall"] for d in decisions)
+            entry["votes"] = dict(votes)
+            match_votes = votes.get(MATCH, 0)
+            decision = _vote(decisions)
         entry.update(overall=decision["overall"], identity=decision["identity"]["decision"],
                      dimensions=decision["dimensions"], reason=decision["reason"],
                      failure_class=decision.get("failure_class", ""))
-        if identity["decision"] == MISMATCH:
-            entry["identity_code"] = str(identity.get("reason_code") or "")
-            entry["observed_domain"] = str(identity.get("observed_domain") or "")[:80]
         notes["companies"].append(entry)
-        if decision["overall"] == MISMATCH and identity["decision"] == MISMATCH:
+        if decision["overall"] == MISMATCH and charged_mismatch(decision):
             entry["dropped"] = True
             continue
         if decision["overall"] == MISMATCH:
-            entry["contested"] = True
-            notes.setdefault("contested", []).append(str(company.get("company_website") or ""))
+            # A mismatch confined to stage, industry or employee size. The verdict may well be right, and the
+            # row then fails at the judge for nothing: that failure is free, while the slot it fills is one we
+            # almost never manage to fill at all. Kept, and ranked below every company this gate did not fault.
+            entry["kept_free_mismatch"] = True
             tier = 3
         elif decision["overall"] == MATCH:
             tier = 0
         else:
             tier = 1 if decision.get("failure_class") == INSUFFICIENT else 2
-        ranked.append((tier, index, company))
-    ranked.sort(key=lambda item: (item[0], item[1]))
-    return [company for _, _, company in ranked], notes
+        ranked.append((tier, -match_votes, _key(company), index, company))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return [company for _, _, _, _, company in ranked], notes

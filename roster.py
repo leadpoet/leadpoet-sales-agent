@@ -1,4 +1,17 @@
-"""S8 "roster": company-first discovery beside scout's event-first search."""
+"""Loop 20260923T0503Z s8 "roster": company-first discovery beside scout's event-first search.
+
+Why (d7: s7 on the 09-23 ICPs under the company-only judge, upstream 52562079):
+  * event-first search returned companies on 4 of 10 ICPs; the others found no in-bucket subject of an event;
+  * the platform's contextdev_post_news_search is a per-COMPANY lookup (x3): one domain's dated primary stories
+    (title, excerpt, url, published_at) at $0 -- e.g. Moov's Business Wire launch dated the day before the round;
+  * every ICP names one excluded company, the exemplar the ICP was written from (atturra.com for the Sydney
+    consulting ICP, finexio.com for the payments one), so its peers are the pool to search.
+
+Roster asks one strong model for up to ROSTER_SIZE real companies inside the ICP's hard buckets (the exemplar's
+peers first), reads each company's dated news for free, keeps the in-window primary stories whose headline or
+excerpt carries the ICP's intent category, lets one cheap model call confirm which story reports the company's
+own qualifying event, and hands those companies to scout's resolve -> fits -> stage -> draft path.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +23,7 @@ from typing import Any, Mapping, Optional
 from . import scorer_mirror as sm
 from .arena_tools import STRATEGY, BudgetExhausted, _domain
 
-ROSTER_MODEL = str(STRATEGY.get("roster_model") or "anthropic/claude-sonnet-5.5")
+ROSTER_MODEL = str(STRATEGY.get("roster_model") or "anthropic/claude-sonnet-4.5")
 ROSTER_SIZE = int(STRATEGY.get("roster_size") or 30)
 COMPANY_SEARCH = bool(STRATEGY.get("roster_company_search", 1))
 MAX_ROSTER = 45
@@ -19,7 +32,27 @@ NEWS_WORKERS = 4
 EVENT_SEARCH = bool(STRATEGY.get("roster_event_search", 1))
 EVENT_COMPANIES = int(STRATEGY.get("roster_event_companies") or 16)
 SATURATED_ROWS = 8
+# Companies the free lookup said nothing about are searched too, after the saturated ones and only out of
+# spare call budget.  See ``searched_rows``.
+EVENT_THIN = bool(STRATEGY.get("roster_event_thin", 0))
+EVENT_THIN_RESERVE = int(STRATEGY.get("roster_event_thin_reserve") or 60)
+# What the rest of the ICP still needs after research: verification fetches and the contact-free checks.
+EVENT_THIN_SPEND_RESERVE_USD = float(STRATEGY.get("roster_event_thin_reserve_usd") or 0.12)
 CLASSIFY_BATCH_CHARS = 16_000
+
+OWN_NEWS = bool(STRATEGY.get("own_news", 1))
+FOUND_NEWS = bool(STRATEGY.get("found_news", 0))
+
+
+def _ownnews_categories() -> tuple:
+    """The intent categories whose announcements live on the company's own site (ownnews.CATEGORIES)."""
+
+    try:
+        from . import ownnews
+
+        return tuple(ownnews.CATEGORIES)
+    except Exception:  # noqa: BLE001 - without the module the lane simply does not run
+        return ()
 
 CATEGORY_WORDS = {
     "FUNDING": r"rais|fund|series [a-h]|seed|invest|financ|round|capital|backed|valuation",
@@ -55,46 +88,22 @@ def roster_prompt(icp: Mapping[str, Any]) -> str:
         "or city means the headquarters is there -- an office there is not enough); their LinkedIn employee count is "
         "inside employee_count; their stage is company_stage (Seed / Series A / Series B = the latest priced round, so "
         "young startups; Series C+ = raised Series C or later and still private and venture-backed; Private Equity = "
-        "owned by a private-equity firm; Public = listed on a stock exchange). %s"
-        "When required_attribute says the company operates or runs a business (a school, carrier, lender, clinic, "
-        "energy producer, payments processor, consultancy), list only companies that ARE that business: a software "
-        "or service vendor selling to such businesses does not qualify unless product_service or required_attribute "
-        "itself asks for software or a platform. Prefer companies likely to have shown "
+        "owned by a private-equity firm; Public = listed on a stock exchange). %sPrefer companies likely to have shown "
         "the intent signal within intent_max_age_days before %s. Every company is verified afterwards, so include "
-        "likely fits rather than stopping early, but never invent a company, and list only companies operating today "
-        "under that name. Give each company's primary website domain exactly (e.g. acme.com), its current stock "
-        "ticker as EXCHANGE: SYMBOL (\"\" when not listed), and core = false when its main business is not "
-        "sub_industry (an adjacent business, e.g. a residential brokerage for a commercial real estate profile). "
-        "Return {\"companies\": [{\"name\": \"...\", \"domain\": \"...\", \"ticker\": \"...\", \"core\": true}]}."
+        "likely fits rather than stopping early, but never invent a company. Give each company's primary website "
+        "domain exactly (e.g. acme.com). Return {\"companies\": [{\"name\": \"...\", \"domain\": \"...\"}]}."
         "\n\nICP: %s" % (ROSTER_SIZE, seed, sm.evaluation_date().isoformat(), json.dumps(brief, default=str)[:3000]))
 
 
-def roster(icp: Mapping[str, Any], *, llm_json, http_client_factory=None, notes: Optional[dict] = None) -> list[dict[str, Any]]:
-    """The model's peer list.  Every roster company costs a news lookup from the per-ICP Deepline call quota, so an
-    entry the model marks off-core, or (for a Public ICP, once the model gives tickers at all) one without a ticker,
-    is skipped before any lookup."""
-
-    parsed = llm_json(roster_prompt(icp), http_client_factory=http_client_factory, max_tokens=3000, model=ROSTER_MODEL)
+def roster(icp: Mapping[str, Any], *, llm_json, http_client_factory=None) -> list[dict[str, Any]]:
+    parsed = llm_json(roster_prompt(icp), http_client_factory=http_client_factory, max_tokens=2500, model=ROSTER_MODEL)
     raw = parsed.get("companies") if isinstance(parsed, dict) else (parsed if isinstance(parsed, list) else [])
-    raw = [item for item in (raw if isinstance(raw, list) else []) if isinstance(item, dict)]
     excluded = [str(x).strip().lower() for x in icp.get("excluded_companies") or [] if str(x).strip()]
     banned = {sm.company_name_key(x) for x in excluded} | {_domain(x) for x in excluded if "." in x}
-    public = sm.normalize_stage(icp.get("company_stage")) == "public"
-    tickers = any(str(item.get("ticker") or "").strip() for item in raw)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    private = sm.normalize_stage(icp.get("company_stage")) in ("seed", "series a", "series b", "series c+", "private equity")
-    for item in raw:
-        ticker = str(item.get("ticker") or "").strip()
-        # v96: the model gives a ticker for a company it knows is listed; on a venture / private-equity ICP such an entry
-        # is a certain stage miss (10-06 local: Grail and Freenome each cost a penalty on a Series C+ ICP).
-        if private and re.search(r"[A-Za-z]{2,}\s*:\s*[A-Za-z0-9.]{1,6}$", ticker):
-            if notes is not None:
-                notes.setdefault("skipped_listed", []).append(f"{str(item.get('name') or '')[:50]} ({ticker[:16]})")
-            continue
-        if item.get("core") is False or (public and tickers and not ticker):
-            if notes is not None:
-                notes.setdefault("skipped", []).append(str(item.get("name") or "")[:60])
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
             continue
         name = " ".join(str(item.get("name") or item.get("company_name") or "").split())[:120]
         domain = _domain(str(item.get("domain") or ""))
@@ -114,7 +123,7 @@ _NOT_COMPANY_HOSTS = ("linktr.ee", "linkedin.", "facebook.", "crunchbase.", "wik
 
 
 def company_search_queries(icp: Mapping[str, Any]) -> list[str]:
-    """Two Exa company-category queries."""
+    """Two Exa company-category queries (x4: they return in-region company homepages, recent startups included)."""
 
     from .scout import region_places
 
@@ -153,18 +162,14 @@ def company_search(tools: Any, icp: Mapping[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def company_news(tools: Any, domain: str, name: str = "") -> list[dict[str, Any]]:
+def company_news(tools: Any, domain: str) -> list[dict[str, Any]]:
     """One company's dated stories from the free per-company news lookup (cached on the tools object)."""
 
     cache = tools.__dict__.setdefault("_roster_news", {})
     if domain in cache:
         return cache[domain]
     try:
-        try:
-            got = tools.search_news(domain, limit=NEWS_PER_COMPANY, company_website=f"https://{domain}/", name=name)
-        except TypeError:      # a tool client without the v97 ``name`` argument
-            got = tools.search_news(domain, limit=NEWS_PER_COMPANY, company_website=f"https://{domain}/")
-        rows = (got or {}).get("results") or []
+        rows = (tools.search_news(domain, limit=NEWS_PER_COMPANY, company_website=f"https://{domain}/") or {}).get("results") or []
     except BudgetExhausted:
         raise
     except Exception:
@@ -178,7 +183,7 @@ def read_news(tools: Any, companies: list[dict[str, Any]], *, deadline: float, c
         if clock() >= deadline:
             return company["domain"], []
         try:
-            return company["domain"], company_news(tools, company["domain"], str(company.get("company_name") or ""))
+            return company["domain"], company_news(tools, company["domain"])
         except BudgetExhausted:
             return company["domain"], []
 
@@ -208,21 +213,78 @@ def story_rows(icp: Mapping[str, Any], companies: list[dict[str, Any]], news: Ma
 
 
 def short_feed(stories: list[Mapping[str, Any]], window: int, *, age_days) -> bool:
-    """True when the free lookup is saturated (>= SATURATED_ROWS dated stories) and its oldest story is younger than."""
+    """True when the free lookup is saturated (>= SATURATED_ROWS dated stories) and its oldest story is younger than
+    half the ICP's window: the company's own events inside the window are mostly out of its reach."""
 
     ages = [a for a in (age_days(s.get("published_date")) for s in stories or []) if a is not None]
     return len(ages) >= SATURATED_ROWS and max(ages) < max(30, int(window or 365) // 2)
 
 
+def unexamined_feed(stories: list[Mapping[str, Any]], *, age_days) -> bool:
+    """True when the free lookup returned almost nothing dated about this company.
+
+    ``short_feed`` is about a feed that is *too full* to see past; this is its opposite and the case that was
+    falling through.  A company whose free lookup came back with fewer than SATURATED_ROWS dated stories is not
+    covered by it -- it is simply unexamined, and an empty feed makes ``short_feed`` false for the same reason an
+    overflowing one makes it true.  On the Education ICP of 2026-10-15 the roster listed 28 companies, 14 came
+    back with no news at all, and the paid event search was offered to three.
+    """
+
+    ages = [a for a in (age_days(s.get("published_date")) for s in stories or []) if a is not None]
+    return len(ages) < SATURATED_ROWS
+
+
+def _thin_affordable(tools: Any) -> int:
+    """How many unexamined companies the call budget can still afford one search each.
+
+    ``tools.remaining()`` is the ceiling the gateway counts; everything past EVENT_THIN_RESERVE is spare. A tools
+    object that cannot say returns 0, so an unknown budget never buys the tail."""
+
+    try:
+        calls = max(0, int(tools.remaining()) - EVENT_THIN_RESERVE)
+    except Exception:  # noqa: BLE001 - an unknown budget buys nothing
+        return 0
+    if not calls:
+        return 0
+    try:
+        cap = getattr(tools, "spend_cap_usd", None)
+        if cap is None:
+            return calls
+        price = max(1e-6, float(tools.tool_price_usd("exa_search")))
+        spare = float(cap) - float(tools.spend_usd()) - EVENT_THIN_SPEND_RESERVE_USD
+        return max(0, min(calls, int(spare / price)))
+    except Exception:  # noqa: BLE001 - an unreadable ledger buys nothing
+        return 0
+
+
 def searched_rows(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, Any]], news: Mapping[str, list[dict[str, Any]]],
                   rows: list[dict[str, Any]], category: str, *, age_days, deadline: float, clock,
                   tried: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    """Story rows from one Exa event search per short-feed company, in roster order, capped at EVENT_COMPANIES."""
+    """Story rows from one Exa event search per company whose own events the free lookup cannot show us.
+
+    Loop s27 (d25): a feed row that only matched the category words ('CrowdStrike Named a Leader in ...') no longer
+    exempts a company -- CrowdStrike, Fortinet and N-able were never searched although their releases qualified.
+
+    Two populations qualify, in this order.  A ``short_feed`` company's feed is too full to see past, which is the
+    case this loop was built for and which keeps its priority.  An ``unexamined_feed`` company's feed told us
+    almost nothing, and until now it was never searched at all: the predicate needed eight dated stories to fire,
+    so a company with none failed it exactly as a well-covered one did.  That is where the roster was leaking.  On
+    the Education ICP of 2026-10-15, 28 companies listed, 14 with no news, 3 searched; the run finished having
+    spent 516 of its 900 seconds and 151 of its 200 calls, and returned 2 companies for 5 slots.
+
+    The tail is bought out of spare budget only, so a tight round behaves exactly as it did before: the saturated
+    companies are offered first, and the unexamined ones fill what is left of EVENT_COMPANIES while at least
+    EVENT_THIN_RESERVE calls remain for verification, which is where the rest of the ICP's calls go."""
 
     if not EVENT_SEARCH or category not in CATEGORY_WORDS or category == "HIRING":
         return []
     window = int(icp.get("intent_max_age_days") or 365)
     todo = [c for c in companies if short_feed(news.get(c["domain"]) or [], window, age_days=age_days)][:max(0, EVENT_COMPANIES)]
+    if EVENT_THIN and len(todo) < max(0, EVENT_COMPANIES):
+        chosen = {id(c) for c in todo}
+        thin = [c for c in companies
+                if id(c) not in chosen and unexamined_feed(news.get(c["domain"]) or [], age_days=age_days)]
+        todo += thin[:min(max(0, EVENT_COMPANIES) - len(todo), _thin_affordable(tools))]
     if tried is not None:
         tried.extend(c["company_name"] for c in todo)
     if not todo:
@@ -232,86 +294,29 @@ def searched_rows(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, 
                           over_budget=lambda: False, limit=EVENT_COMPANIES)
 
 
-# v98: the model's roster names the right companies and the news lookup then misses their event.  10-07 ICP4 (Public,
-# product launch): the roster held MongoDB and Amplitude, the companies that qualified on-chain (9 of 13 and 3 of 10),
-# and neither became a candidate: a ten-story feed does not reach a February launch, and the paid event search covers
-# only short-feed companies.  The public news feed answers '"MongoDB" launches' with the dated press-wire headline.
-FEED_COMPANIES = int(STRATEGY.get("roster_feed_companies") or 24)
-FEED_ROWS = 3
-FEED_VERBS = {"PRODUCT_LAUNCH": "launches", "PARTNERSHIP": "partnership", "FUNDING": "raises funding",
-              "ACQUISITION": "acquires", "LEADERSHIP_CHANGE": "appoints", "MARKET_EXPANSION": "expands",
-              "FACILITY_OPENING": "opens", "REGULATORY_CLEARANCE": "approval"}
-_FEED_SUFFIXES = {"inc", "corp", "corporation", "co", "company", "ltd", "llc", "plc", "software", "technologies",
-                  "technology", "holdings", "group", "labs", "systems", "solutions"}
-_FEED_WIRE_RE = re.compile(r"(?:^|\.)(?:prnewswire\.com|businesswire\.com|globenewswire\.com|newswire\.ca|accesswire\.com)$", re.I)
-
-
-def feed_subject(title: Any, name: Any) -> bool:
-    """The headline opens with the company's name ('MongoDB, Inc. Launches ...'), so the event is its own and not
-    another company's on its platform ('Securecom launches ... on Snowflake')."""
-
-    words = re.findall(r"[a-z0-9]+", str(name or "").casefold())
-    while len(words) > 1 and words[-1] in _FEED_SUFFIXES:
-        words.pop()
-    head = re.findall(r"[a-z0-9]+", str(title or "").casefold())[:len(words)]
-    return bool(words) and head == words and len("".join(words)) >= 3
-
-
-def feed_rows(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, Any]], rows: list[dict[str, Any]],
-              category: str, *, age_days, deadline: float, clock, tried: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    """Story rows from the public news feed for the first FEED_COMPANIES roster companies: headlines that open with the
-    company's name, carry a word of the category and are dated inside the window; press-wire copies first."""
-
-    verb = FEED_VERBS.get(category)
-    reader = getattr(tools, "event_feed", None)
-    if not verb or reader is None or category not in CATEGORY_WORDS:
-        return []
-    window = int(icp.get("intent_max_age_days") or 365)
-    pattern = re.compile(CATEGORY_WORDS[category], re.I)
-    have = {str(r.get("url") or "") for r in rows}
-    titles = {(str(r.get("company")), " ".join(str(r.get("title") or "").casefold().split())[:60]) for r in rows}
-    out: list[dict[str, Any]] = []
-    for company in companies[:max(0, FEED_COMPANIES)]:
-        if clock() >= deadline:
-            break
-        name = str(company.get("company_name") or "")
-        if tried is not None:
-            tried.append(name)
-        kept: list[tuple[bool, int, dict[str, Any]]] = []
-        for story in reader(name, verb) or []:
-            url, title = str(story.get("url") or ""), str(story.get("title") or "")
-            age = age_days(story.get("published_date"))
-            if not url or url in have or age is None or not 0 <= age <= window:
-                continue
-            if not feed_subject(title, name) or not pattern.search(title):
-                continue
-            if (name, " ".join(title.casefold().split())[:60]) in titles:
-                continue
-            wire = bool(_FEED_WIRE_RE.search(sm.registrable_host(url) or ""))
-            kept.append((not wire, age, {"company": name, "domain": company["domain"],
-                                         "date": str(story.get("published_date"))[:10], "title": title[:200],
-                                         "excerpt": str(story.get("excerpt") or "")[:300], "url": url, "feed": True}))
-        taken = 0
-        for _wire_last, _age, row in sorted(kept, key=lambda k: (k[0], k[1])):
-            key = (name, " ".join(row["title"].casefold().split())[:60])
-            if key in titles or taken >= FEED_ROWS:
-                continue
-            taken += 1
-            have.add(row["url"])
-            titles.add(key)
-            out.append(row)
-    return out
-
-
 def classify_prompts(icp: Mapping[str, Any], rows: list[dict[str, Any]]) -> list[str]:
-    listing = [{k: r[k] for k in ("id", "company", "date", "title", "excerpt")} for r in rows]
+    listing = [dict({k: r[k] for k in ("id", "company", "date", "title", "excerpt")},
+                    **({"company_domain": r["domain"]} if r.get("domain") else {})) for r in rows]
     batches: list[list[dict[str, Any]]] = [[]]
     for item in listing:
         if batches[-1] and len(json.dumps(batches[-1] + [item])) > CLASSIFY_BATCH_CHARS:
             batches.append([])
         batches[-1].append(item)
-    from .scout import primary_signal
-    signal = primary_signal(icp)
+    signal = " ".join(str(s) for s in icp.get("intent_signals") or [icp.get("intent_signal") or ""])
+    # 2026-10-18 ICP 6: our PixVerse row led with PixLab, "an invite-only creator partnership program", and the judge
+    # failed its primary intent; the four submissions that qualified PixVerse led with its partnership with the UN AI
+    # for Good summit. Published PARTNERSHIP rows agree: partner-portal, award and program evidence failed intent.
+    partner_rule = (
+        "For a partnership, the story must name the outside organization THIS company partnered with; a partner, "
+        "creator, affiliate, reseller or referral program, a partner portal, a certification, an award or a "
+        "marketplace listing is not a partnership. " if re.search(r"\bpartner", signal, re.I) else "")
+    business = " / ".join(str(icp.get(k) or "").strip() for k in ("industry", "sub_industry") if str(icp.get(k) or "").strip())
+    # 2026-10-18 replay: "Princeton Properties partnered with Whale" (linkedin.com/posts/gowhale, a New England
+    # property-payments company) became the partnership of Whale (whale.sg, enterprise AI). The rows now carry the
+    # company's domain, and the prompt says what business the company is in.
+    namesake = ("Every company here is a candidate %s company; a story about a different business that only shares "
+                "the name (another domain, another industry or market) is not about THIS company. " % business[:120]
+                if business else "")
     return [(
         "Each row is a dated news story about the named company. Keep only the rows that report that THIS company "
         "itself did what the intent signal describes -- the event itself (e.g. its own funding round, its own "
@@ -321,13 +326,121 @@ def classify_prompts(icp: Mapping[str, Any], rows: list[dict[str, Any]]) -> list
         "says it closed or completed or the target now operates as part of the company, not an agreement or plan; "
         "a story where THIS company is acquired, bought, merged into another or taken private never qualifies (for an "
         "acquisition intent THIS company must be the acquirer); "
-        "a job posting is not a hire. Return EVERY row that reports such an event (several rows may cover the same "
+        "a job posting is not a hire. %s%sReturn EVERY row that reports such an event (several rows may cover the same "
         "company). Return {\"hits\": [{\"id\": <row id>, \"event\": \"<max 15 words>\"}]}.\n\n"
-        "INTENT SIGNAL: %s\n\nROWS: %s" % (signal[:600], json.dumps(batch)))
+        "INTENT SIGNAL: %s\n\nROWS: %s" % (partner_rule, namesake, signal[:600], json.dumps(batch)))
         for batch in batches if batch]
 
 
 _SOURCE_RANK = {"first_party": 0, "wire": 1, "news": 2, "linkedin": 4}
+
+# Words that, glued to a one-word company name, make it another company's name: "Whale TV". Kept to words that are
+# seldom the dropped half of the company's own legal name ("Scribe Therapeutics" and "Serefin Health" are the companies).
+_BRAND_TAILS = {"tv", "media", "games", "gaming", "studio", "studios", "music", "mobile", "network", "networks", "pay",
+                "bank", "motors", "foods", "realty", "homes", "insurance", "ventures"}
+_LEAD_WORDS = {"the", "a", "an", "and", "with", "by", "for", "from", "at", "as", "of", "on", "in", "to", "how", "why",
+               "new", "meet", "about", "inside", "exclusive", "introducing", "announcing", "welcome", "report", "update",
+               "join", "joins"}
+
+
+_DOT_TLDS = "io|ai|com|co|net|org|xyz|app|so|dev|gg|fi|finance|tech|sg|us|uk|de|fr|in|me|tv|cc|bet|casino|exchange"
+
+
+_OWN_SLUG_LEADS = {"weare", "we", "hello", "hi", "team", "the", "its", "our", "official", "meet"}
+
+
+def _host_label(host: str) -> str:
+    parts = [p for p in host.split(".") if p]
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "ac", "gov", "edu"):
+        return parts[-3]
+    return parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+
+
+def other_entity(row: Mapping[str, Any]) -> bool:
+    """True when a story row is about a different company that only shares this company's one-word name.
+
+    2026-10-18 ICP 6: the news search for Whale (whale.sg) returned "Teads Expands Global CTV Offering with Whale TV",
+    a triplewhale.com post and "Triple Whale Launches Moby Automations", and eight submissions -- ours among them --
+    led Whale's intent with them; all eight failed intent_details. Only a clear sign counts, so an unclear row still
+    reaches the classifier: the page is on another site whose name embeds this one after a prefix (triplewhale.com;
+    natwestgroup.com and marshmclennan.com start with the name and are the company's own group), or every mention
+    in the title and excerpt is glued to another word -- a brand tail ("Whale TV") or a capitalised word opening the
+    headline ("Triple Whale ..."). Multi-word names and the company's own pages are never touched. Checked on the
+    published rows of 2026-10-01..18: 0 of 1,002 qualified evidence rows flagged."""
+
+    words = re.findall(r"[A-Za-z0-9]+", str(row.get("company") or ""))
+    domain = str(row.get("domain") or "").lower()
+    if len(words) != 1 or len(words[0]) < 3 or not domain:
+        return False
+    word = words[0].lower()
+    own = _host_label(domain)
+    host = sm.registrable_host(str(row.get("url") or "")).lower()
+    if host and (host == domain or host.endswith("." + domain)):
+        return False
+    if host:
+        label = _host_label(host)
+        if word in label and not label.startswith(word) and label != own:
+            return True
+        # The same test on a LinkedIn page's own slug: linkedin.com/posts/gowhale_... is a New England property-
+        # payments company's post, not Whale's (whale.sg) -- the classifier took it as Whale's partnership.
+        if host == "linkedin.com" or host.endswith(".linkedin.com"):
+            path = str(row.get("url") or "").split("linkedin.com", 1)[-1].lower()
+            found = re.match(r"/(?:posts|company)/([a-z0-9-]+?)(?:[_/?#]|$)", path)
+            slug = found.group(1).replace("-", "") if found else ""
+            lead = slug[:slug.find(word)] if word in slug else ""
+            # "wearerunwise" is Runwise's own page; a self-introducing prefix keeps the slug the company's.
+            if slug and lead and slug != own and lead not in _OWN_SLUG_LEADS:
+                return True
+    mentions = 0
+    for text in (str(row.get("title") or ""), str(row.get("excerpt") or "")):
+        for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(words[0]), text, re.I):
+            mentions += 1
+            after = re.match(r"\s+([A-Za-z]+)", text[m.end():])
+            opener = re.fullmatch(r"\s*([A-Za-z]{3,})\s+", text[:m.start()])
+            tail = after.group(1).lower() if after else ""
+            lead = opener.group(1) if opener else ""
+            # "Whale.io" on a whale.sg company is another company's domain written as its name (10-18 smoke run: a
+            # crypto casino's token launch became Whale's second signal). One such mention settles it.
+            dotted = re.match(r"\.(%s)\b" % _DOT_TLDS, text[m.end():], re.I)
+            if dotted and "%s.%s" % (word, dotted.group(1).lower()) != domain:
+                return True
+            glued_tail = tail in _BRAND_TAILS and word + tail not in own
+            glued_lead = lead[:1].isupper() and lead.lower() not in _LEAD_WORDS and lead.lower() + word not in own
+            if not (glued_tail or glued_lead):
+                return False
+    return mentions > 0
+    text = "%s %s" % (row.get("title") or "", row.get("excerpt") or "")
+    hits = list(re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(words[0]), text, re.I))
+    if not hits:
+        return False
+    for m in hits:
+        after = re.match(r"\s+([A-Za-z]+)", text[m.end():])
+        before = re.search(r"(?:^|\s)([A-Za-z][A-Za-z]*)\s+$", text[:m.start()])
+        tail = after.group(1).lower() if after else ""
+        lead = before.group(1) if before else ""
+        glued_tail = tail in _BRAND_TAILS and word + tail not in own
+        glued_lead = lead[:1].isupper() and lead.lower() not in _LEAD_WORDS and lead.lower() + word not in own
+        if not (glued_tail or glued_lead):
+            return False
+    return True
+    text = "%s %s" % (row.get("title") or "", row.get("excerpt") or "")
+    hits = list(re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(words[0]), text, re.I))
+    if not hits:
+        return False
+    own = domain.split(".")[0]
+    for m in hits:
+        before = re.findall(r"[A-Za-z0-9&'.-]+", text[max(0, m.start() - 40):m.start()])[-1:]
+        after = re.findall(r"[A-Za-z0-9&'-]+", text[m.end():m.end() + 30])[:1]
+        tail = after[0].lower() if after else ""
+        lead = before[0] if before else ""
+        glued_tail = tail in _BRAND_TAILS and (word + tail) not in own
+        glued_lead = (lead[:1].isupper() and lead.lower().strip(".'") not in _LEAD_WORDS
+                      and not lead.endswith(".") and (lead.lower() + word) not in own
+                      and text[max(0, m.start() - 2):m.start()].strip() == "" and m.start() > 0
+                      and not re.search(r"[.!?:|\-]\s*$", text[:m.start() - len(lead) - 1] if m.start() > len(lead) else ""))
+        if not (glued_tail or glued_lead):
+            return False
+    return True
 
 
 def _kind(row: Mapping[str, Any]) -> str:
@@ -339,6 +452,7 @@ def _kind(row: Mapping[str, Any]) -> str:
 
 
 def pick_events(icp: Mapping[str, Any], rows: list[dict[str, Any]], *, llm_json, http_client_factory=None) -> list[dict[str, Any]]:
+    rows = [r for r in rows if not other_entity(r)]
     by_id = {r["id"]: r for r in rows}
     hits: list[dict[str, Any]] = []
     for prompt in classify_prompts(icp, rows):
@@ -361,7 +475,10 @@ def pick_events(icp: Mapping[str, Any], rows: list[dict[str, Any]], *, llm_json,
             continue
         seen.add(row["domain"])
         out.append({"company_name": row["company"], "domain": row["domain"], "event": str(hit.get("event") or row["title"])[:300],
-                    "date": row["date"], "url": row["url"], "snippet": row["title"], "fit": "likely", "source": "roster"})
+                    "date": row["date"], "url": row["url"], "snippet": row["title"], "fit": "likely", "source": "roster",
+                    # The evidence is the company's own page. In a PRODUCT_LAUNCH ICP a first-party primary URL
+                    # qualifies 18.5% of the time against 9.3% for a third-party one, so these go first.
+                    "own_site": bool(row.get("own_site"))})
     out.sort(key=lambda c: c["date"], reverse=True)
     return out
 
@@ -370,13 +487,9 @@ def run_roster(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_d
                http_client_factory=None, last: dict[str, Any], event_companies=(), max_companies: int = MAX_ROSTER,
                search_companies: bool = True) -> list[dict[str, Any]]:
     category = intent_category(icp, kind)
-    notes: dict[str, Any] = {}
-    listed = roster(icp, llm_json=llm_json, http_client_factory=http_client_factory, notes=notes)
-    # Exa's company category returns small private firms with no stage signal: for a Public ICP each would only spend
-    # a news lookup before resolution drops it as privately held.
-    public = sm.normalize_stage(icp.get("company_stage")) == "public"
+    listed = roster(icp, llm_json=llm_json, http_client_factory=http_client_factory)
     try:
-        searched = company_search(tools, icp) if COMPANY_SEARCH and search_companies and not public else []
+        searched = company_search(tools, icp) if COMPANY_SEARCH and search_companies else []
     except BudgetExhausted:
         searched = []
     companies, seen = [], set()
@@ -398,6 +511,45 @@ def run_roster(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_d
         return cands
     news = read_news(tools, companies, deadline=deadline, clock=clock)
     rows = story_rows(icp, companies, news, category, age_days=age_days)
+    # A product launch mostly lives on the company's own site, not in a news index: of the fifteen companies
+    # that qualified on the paying ICP of 2026-10-14, eight cited their own changelog, blog or release notes.
+    # Those pages are free over the bridge, so they are read here beside the news lookup.
+    if OWN_NEWS and category in _ownnews_categories():
+        try:
+            from . import ownnews
+            from .scout import find_date
+
+            words = re.compile(CATEGORY_WORDS[category], re.I) if category in CATEGORY_WORDS else None
+            own = ownnews.own_rows(icp, tools, companies, find_date=find_date, age_days=age_days,
+                                   deadline=deadline, clock=clock, last=last, words=words)
+        except Exception as exc:  # noqa: BLE001 - a free lane that fails adds nothing and breaks nothing
+            own, last["own_news_error"] = [], f"{type(exc).__name__}: {str(exc)[:120]}"
+        seen_own = {r["url"] for r in rows}
+        for row in own:
+            if row["url"] not in seen_own:
+                seen_own.add(row["url"])
+                rows.append(dict(row, id=len(rows), own_site=True))
+    # The companies both free lookups were silent about, read for free before anything is paid for them. An
+    # ICP's binding budget is money, not time: on 2026-10-15 the run finished with 384 of 900 seconds unused and
+    # $0.52 of a $0.64 research allowance gone, while 14 of 28 roster companies had never been looked at.
+    if FOUND_NEWS and category in CATEGORY_WORDS:
+        try:
+            from . import ownnews
+            from .scout import find_date
+            from .stagefirst import event_query
+
+            words = re.compile(CATEGORY_WORDS[category], re.I) if category in CATEGORY_WORDS else None
+            silent = [c for c in companies if unexamined_feed(news.get(c["domain"]) or [], age_days=age_days)]
+            got = ownnews.found_rows(icp, tools, silent, find_date=find_date, age_days=age_days, deadline=deadline,
+                                     clock=clock, make_query=lambda name: event_query(icp, category, name),
+                                     last=last, words=words)
+        except Exception as exc:  # noqa: BLE001 - a free lane that fails adds nothing and breaks nothing
+            got, last["found_news_error"] = [], f"{type(exc).__name__}: {str(exc)[:120]}"
+        seen_found = {r["url"] for r in rows}
+        for row in got:
+            if row["url"] not in seen_found:
+                seen_found.add(row["url"])
+                rows.append(dict(row, id=len(rows), found_free=True))
     tried: list[str] = []
     try:
         extra = searched_rows(icp, tools, companies, news, rows, category, age_days=age_days, deadline=deadline, clock=clock,
@@ -409,21 +561,11 @@ def run_roster(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_d
         if row["url"] not in seen:
             seen.add(row["url"])
             rows.append(dict(row, id=len(rows)))
-    fed: list[str] = []
-    try:
-        feed = feed_rows(icp, tools, companies, rows, category, age_days=age_days, deadline=deadline, clock=clock, tried=fed)
-    except Exception:  # noqa: BLE001 - the feed only adds rows
-        feed = []
-    for row in feed:
-        rows.append(dict(row, id=len(rows)))
     cands = pick_events(icp, rows, llm_json=llm_json, http_client_factory=http_client_factory) if rows else []
     last["roster"] = {"category": category, "companies": [c["company_name"] for c in companies],
-                      "listed": len(listed), "searched": len(searched), "skipped": notes.get("skipped", []),
-                      "skipped_listed": notes.get("skipped_listed", []),
+                      "listed": len(listed), "searched": len(searched),
                       "with_news": sum(1 for c in companies if news.get(c["domain"])), "story_rows": len(rows),
                       "event_search_tried": tried, "event_search_rows": len(extra),
-                      "feed_tried": len(fed), "feed_rows": len(feed),
-                      "feed_companies": sorted({r["company"] for r in feed}),
                       "event_search_companies": sorted({r["company"] for r in extra}),
                       "candidates": [c["company_name"] for c in cands]}
     return cands

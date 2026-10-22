@@ -1,31 +1,36 @@
-"""(v110) One cheap model call grades each verified row's cited announcement before admission.
+"""Judge mirror, step 1: grade each verified row's cited announcement the way the judge reads it, before the five
+slots are filled.
 
-Why: on the paying ICP of the published 2026-10-12 round the agent verified seven to nine companies per run and sent
-the wrong five - every row carried the same fit tier, so the order came from incidental flags.  The judge's own
-receipts show what it looks at: is the cited text really the event the criterion names, and, when the required
-attribute carries a condition about a current change ("is undergoing a material business or organizational change",
-"is actively expanding its commercial footprint"), does the announcement itself establish that condition.
+Ported from the rival V-line's ``eventgrade.py`` (v110, AGPL, round 10-15 build) onto this agent's own LLM client.
+Why: on rich ICPs this agent drafts 4-11 companies the field qualifies and sends 2-4 of them -- inside a re-check
+vote tier the order falls back to draft order (reverify.rerank). The judge's receipts show what decides a row: is
+the cited text really the event the intent criterion names, and when the required attribute carries a condition
+about a current change, does the announcement itself establish it. The V-line measured on published verdicts:
+rows graded ``strong`` qualified 73%, ``weak`` 54%, ``none`` 11%, and "not such an event" 0 of 8.
 
-Checked against published verdicts before use (model calls only): on that ICP's 68 on-chain rows, rows graded
-``strong`` qualified 73% (required attribute unproven 9%), ``weak`` 54% (31%), ``none`` 11%; rows whose text was graded
-"not such an event" qualified 0 of 8.  On two earlier rounds (1,675 rows) the intent check passed 68% of rows graded a
-real event and 15% of the others.  The grade only orders and weights rows already verified from their own sources;
-it adds no company and no fact.
+The grade only orders rows already verified from their own sources; it adds no company and no fact. A failed or
+malformed reply leaves the rows ungraded, which sorts them exactly as before.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+import time
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
-from . import criteria
-from . import llm
-
-MODEL = "google/gemini-3.5-flash-lite"
+MODEL = "google/gemini-3.5-flash-lite"   # gemini-2.5-flash has no zero-data-retention route (2026-10-20)
 BATCH = 12
 HEADLINE_CHARS = 300
 GRADES = ("strong", "weak", "none")
+# Sort weight per grade, lower first: a real event that proves the change clause leads its vote tier, an announcement
+# graded "not such an event" goes last. Ungraded rows sit between "weak" and "none" so a failed call changes nothing
+# relative to draft order among themselves.
+_RANK = {"strong": 0, "weak": 1, "n/a": 1, None: 2, "none": 3}
+# Grades live here, keyed by id(row), never inside the row: the output validator forbids unknown keys, and a
+# "_judge_mirror" field on a pool row made sm.validate_output reject the whole re-checked list. One ICP runs per
+# process, and grade() clears the map before each pass, so a recycled id cannot carry a stale grade.
+_MARKS: dict[int, dict[str, Any]] = {}
 
 
 def prompt(attribute: str, criterion: str, items: list[dict]) -> str:
@@ -56,9 +61,19 @@ def prompt(attribute: str, criterion: str, items: list[dict]) -> str:
         '"rows": [{"i": <i>, "event_ok": true|false, "change": "strong"|"weak"|"none"|"n/a"}]}')
 
 
+def _criterion(icp: Mapping[str, Any]) -> str:
+    signals = icp.get("intent_signals")
+    if isinstance(signals, list) and signals:
+        first = signals[0]
+        if isinstance(first, Mapping):
+            return str(first.get("text") or first.get("signal") or first.get("description") or "")
+        return str(first)
+    return str(icp.get("intent_signal") or "")
+
+
 def _primary(row: Mapping[str, Any]) -> Mapping[str, Any]:
     for signal in row.get("intent_signals") or []:
-        if signal.get("matched_icp_signal") in (0, None):
+        if isinstance(signal, Mapping) and signal.get("matched_icp_signal") in (0, None):
             return signal
     return {}
 
@@ -76,23 +91,27 @@ def item(index: int, row: Mapping[str, Any]) -> dict[str, Any]:
             "source": host[4:] if host.startswith("www.") else host, "date": str(signal.get("date") or "")[:10]}
 
 
-def grade(rows: list[dict[str, Any]], icp: Mapping[str, Any]) -> dict[str, Any]:
-    """Set ``_flags['event_ok']`` (bool) and, when the attribute has a change clause, ``_flags['change_grade']`` on each
-    row, in place.  A failed or malformed reply leaves the rows untouched.  Returns notes for the run report."""
+def grade(rows: list[dict[str, Any]], icp: Mapping[str, Any], *,
+          llm_json: Callable[..., Optional[Any]], deadline: Optional[float] = None) -> dict[str, Any]:
+    """Record ``{'event_ok': bool, 'change': grade}`` for each graded row (side map, see _MARKS).
 
-    notes: dict[str, Any] = {"rows": len(rows), "graded": 0}
+    ``llm_json(prompt, max_tokens=..., model=..., deadline=...)`` is the agent's own JSON chat client
+    (scout.llm_json with the run's HTTP client factory bound). Returns notes for the run report."""
+
+    notes: dict[str, Any] = {"rows": len(rows), "graded": 0, "model": MODEL}
+    _MARKS.clear()
     if not rows:
         return notes
-    try:
-        criterion = str(criteria.signals(icp)[0].get("text") or "")
-    except Exception:  # noqa: BLE001
-        criterion = str(icp.get("intent_signal") or "")
     attribute = " ".join(str(icp.get("required_attribute") or "").split()) or "(none stated)"
+    criterion = _criterion(icp)
     for start in range(0, len(rows), BATCH):
+        if deadline is not None and time.monotonic() > deadline - 20.0:
+            notes["stopped"] = "deadline"
+            break
         batch = rows[start:start + BATCH]
         try:
-            reply = llm.chat_json(prompt(attribute, criterion, [item(n, row) for n, row in enumerate(batch)]),
-                                  model=MODEL, max_tokens=900, purpose="eventgrade")
+            reply = llm_json(prompt(attribute, criterion, [item(n, row) for n, row in enumerate(batch)]),
+                             max_tokens=900, model=MODEL, deadline=deadline)
         except Exception as exc:  # noqa: BLE001 - grading is optional
             notes.setdefault("errors", []).append(type(exc).__name__)
             continue
@@ -106,16 +125,29 @@ def grade(rows: list[dict[str, Any]], icp: Mapping[str, Any]) -> dict[str, Any]:
                 row = batch[int(entry.get("i"))]
             except (TypeError, ValueError, IndexError, AttributeError):
                 continue
-            flags = row.setdefault("_flags", {})
+            mark: dict[str, Any] = {}
             if isinstance(entry.get("event_ok"), bool):
-                flags["event_ok"] = entry["event_ok"]
+                mark["event_ok"] = entry["event_ok"]
             change = str(entry.get("change") or "").strip().lower()
-            if has_clause and change in GRADES:
-                flags["change_grade"] = change
+            mark["change"] = change if has_clause and change in GRADES else "n/a"
+            _MARKS[id(row)] = mark
             notes["graded"] += 1
             notes.setdefault("grades", {})[str(row.get("company_name") or "")[:40]] = \
-                f"{'event' if flags.get('event_ok') is not False else 'no event'} / {flags.get('change_grade') or 'n/a'}"
+                f"{'event' if mark.get('event_ok') is not False else 'no event'} / {mark['change']}"
     return notes
 
 
-__all__ = ["grade", "prompt", "item", "MODEL"]
+def order_key(row: Mapping[str, Any]) -> int:
+    """Lower sorts first. Used inside a re-check vote tier, before draft order."""
+
+    mark = _MARKS.get(id(row))
+    if mark is None and isinstance(row, Mapping):
+        mark = row.get("_judge_mirror")   # offline evaluation passes grades on a copy of the row
+    if not isinstance(mark, Mapping):
+        return _RANK[None]
+    if mark.get("event_ok") is False:
+        return 4
+    return _RANK.get(mark.get("change"), _RANK[None])
+
+
+__all__ = ["grade", "order_key", "prompt", "item", "MODEL"]

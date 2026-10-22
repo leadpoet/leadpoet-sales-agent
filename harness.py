@@ -1,87 +1,218 @@
 """Arena entrypoint: ``run_icp(icp) -> list[dict]``.
 
-Pipeline for one ICP (all deadlines from LAB_ARENA_WALL_CLOCK_SECONDS, all spend under the per-ICP governor):
-  1. discovery lanes (scout.py): event-first search, stage-first funding search, the exemplar-peer roster with its
-     free per-company news, and the ATS hiring lane; each candidate is screened with the judge's deterministic checks,
-     resolved (homepage, LinkedIn company record, headquarters), stage-checked and fit-proven from its own pages;
-  2. verification (verify.py): identity binding, evidence pages, dates and windows, stage quotes;
-  3. the bonus criterion (bonus.py) where a fetched page proves it;
-  4. the judge-route page check (preflight.py) on cited intent URLs;
-  5. admission (admission.py): up to 5 companies (list-type ICPs) or 3 by expected value, ranked, drops only on
-     proven conflicts;
-  6. lock and checkpoint (lock.py), the reviewed paragraph, the Sonar re-check, and a final lock.  A company the
-     re-check drops leaves the output (admission then runs once more without it); if none is left the output is
-     empty.  A row it contests is held back beside other rows, and with time to spare its slot is filled once from
-     the verified rows no re-check has seen.
-``run_icp`` returns the last locked list.  With nothing locked, a host fault returns [] (an infrastructure failure
-would otherwise leave the assignment incomplete) and our own failure raises for the retry attempt.
+Synchronous, one positional argument, returns a list of company dicts in the
+public competition schema.  The host writes companies.json itself.
+
+Pipeline (all inside the Arena's 300 s wall clock):
+  1. read LAB_ARENA_COMPANY_LIMIT (1..5, default 5) -- a HARD cap: a list longer
+     than MAX_COMPANIES=5 is rejected whole (qualification/competition_models.py:128,
+     lab_arena/output.py:18) and the ICP scores 0
+  2. run the PydanticAI agent with Deepline-only tools (agent.py), under a
+     RESEARCH deadline that stops tool calls in time for a final answer
+  3. hand the RUN deadline back (verification_deadline) and verify and repair
+     every draft against the scorer's own rules (verify.py)
+  4. re-check every emitted company against perplexity/sonar and refill any slot
+     a MISMATCH emptied from the verified surplus (reverify.py,
+     backfill_empty_slots) -- never above the five-company cap
+  5. return the validated, ranked list; return [] for a genuinely empty search
+     OR for a run the HOST broke (the exception chain or the recorded
+     infrastructure channel says so), and RAISE only when the failure was ours
+     (see _no_companies and diagnostics.py)
+
+Nothing here spends or submits by itself; the Arena runner calls it.
 """
 
 from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import re
 import sys
+import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 _PARENT = os.path.dirname(_HERE)
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
 try:
-    from . import admission, arena_training, bonus, diagnostics, gates, governor, llm, lock, preflight
-    from . import reverify as reverify_module
-    from . import scout as scout_module
-    from . import eventgrade
-    from . import intent_details as details_module
+    from . import diagnostics
     from . import scorer_mirror as sm
-    from . import arena_tools as _tools_mod, roster as roster_module, stagefirst as stagefirst_module, yieldplan
-    from .arena_tools import STRATEGY as _STRATEGY, ArenaTools
-    from .verify import announced_schema, strip_internal, verify_companies, verify_signal
+    from .arena_tools import ArenaTools
+    from .verify import verify_companies
 except ImportError:
+    import importlib
+
     _pkg = os.path.basename(_HERE)
-    admission, arena_training, bonus, diagnostics, gates, governor, llm, lock, preflight = (
-        importlib.import_module(f"{_pkg}.{m}") for m in
-        ("admission", "arena_training", "bonus", "diagnostics", "gates", "governor", "llm", "lock", "preflight"))
-    details_module = importlib.import_module(f"{_pkg}.intent_details")
-    reverify_module = importlib.import_module(f"{_pkg}.reverify")
-    scout_module = importlib.import_module(f"{_pkg}.scout")
-    eventgrade = importlib.import_module(f"{_pkg}.eventgrade")
+    diagnostics = importlib.import_module(f"{_pkg}.diagnostics")
     sm = importlib.import_module(f"{_pkg}.scorer_mirror")
-    roster_module = importlib.import_module(f"{_pkg}.roster")
-    stagefirst_module = importlib.import_module(f"{_pkg}.stagefirst")
-    yieldplan = importlib.import_module(f"{_pkg}.yieldplan")
-    _tools_mod = importlib.import_module(f"{_pkg}.arena_tools")
-    _STRATEGY, ArenaTools = _tools_mod.STRATEGY, _tools_mod.ArenaTools
+    ArenaTools = importlib.import_module(f"{_pkg}.arena_tools").ArenaTools
+    verify_companies = importlib.import_module(f"{_pkg}.verify").verify_companies
+
+try:
+    from .arena_tools import STRATEGY as _STRATEGY
+    from .verify import announced_schema, strip_internal
+    from . import intent_details as details_module
+except ImportError:
+    _STRATEGY = importlib.import_module(f"{_pkg}.arena_tools").STRATEGY
     _verify_mod = importlib.import_module(f"{_pkg}.verify")
     announced_schema, strip_internal = _verify_mod.announced_schema, _verify_mod.strip_internal
-    verify_companies, verify_signal = _verify_mod.verify_companies, _verify_mod.verify_signal
+    details_module = importlib.import_module(f"{_pkg}.intent_details")
 
-DRAFT_LIMIT = int(_STRATEGY.get("draft_limit") or 8)
-PARAGRAPH_MODEL = str(_STRATEGY.get("paragraph_model") or "anthropic/claude-sonnet-5.5")
-FRUGAL_BELOW_USD = 0.15
-# Spend kept for everything after discovery: bonus rows, paragraphs, the Sonar re-check and one replacement round
-# (about $0.01-0.05 in local runs), plus the governor's closing reserve.
-POST_SCOUT_RESERVE_USD = 0.10
-# Deepline calls kept for verification, bonus rows and the judge-route preflight (run c-fix-r1: discovery used all
-# 198 calls and the preflight of a cited URL was refused).
-POST_SCOUT_CALLS = 30
-SCOUT_BUDGET_USD = float(_STRATEGY.get("scout_budget_usd") or 0.30)
-BONUS_ROWS = 5
-REVERIFY_ENABLED = bool(_STRATEGY.get("reverify", 1))
+try:
+    from . import yieldmap as _yieldmap
+except ImportError:
+    try:
+        _yieldmap = importlib.import_module(f"{os.path.basename(_HERE)}.yieldmap")
+    except Exception:  # noqa: BLE001 - without the map an ICP is simply not priced
+        _yieldmap = None
+except Exception:
+    _yieldmap = None
+
+try:
+    from . import judge as _judge
+except ImportError:
+    try:
+        _judge = importlib.import_module(f"{os.path.basename(_HERE)}.judge")
+    except Exception:
+        _judge = None
+except Exception:
+    _judge = None
+
+try:
+    from . import contacts as contacts_module
+except ImportError:
+    try:
+        import importlib as _importlib
+        contacts_module = _importlib.import_module(f"{os.path.basename(_HERE)}.contacts")
+    except Exception:
+        contacts_module = None
+
+
+def _strategy_number(key: str, default: float, low: float, high: float) -> float:
+    value = _STRATEGY.get(key)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        default = float(value)
+    return max(low, min(high, default))
+
+
+WALL_CLOCK_SECONDS = 300.0
+SAFETY_SECONDS = 22.0
+AGENT_SHARE = 0.62
+AGENT_SHARE_V5 = 0.55
+SHORT_CLOCK_SECONDS = _strategy_number("short_clock_seconds", WALL_CLOCK_SECONDS, 120.0, WALL_CLOCK_SECONDS)
+LONG_CLOCK_SECONDS = _strategy_number("long_clock_seconds", 0.0, 0.0, 5400.0)
+AGENT_LONG_SECONDS = _strategy_number("agent_long_seconds", 900.0, 60.0, 3600.0)
+LONG_PATH_MARGIN_SECONDS = 120.0
+CONTACTS_ENABLED = _strategy_number("contacts", 1, 0, 1) >= 1
+CONTACT_CANDIDATES = int(_strategy_number("contact_candidates", 3, 1, 6))
+PARAGRAPH_ENABLED = _strategy_number("intent_paragraph", 1, 0, 1) >= 1
+ICP_SPEND_CAP_USD = _strategy_number("icp_spend_cap_usd", 1.60, 0.0, 4.0)
+COMPLETION_HOLDBACK_USD = _strategy_number("completion_holdback_usd", 0.08, 0.0, 1.0)
+RESEARCH_CAP_USD = round(max(0.0, ICP_SPEND_CAP_USD - COMPLETION_HOLDBACK_USD), 4)
+# Rounds created after 2026-10-19 05:23Z freeze `successful_calls_flat_per_icp_v1`: an ICP is cost-eligible up to a
+# flat $4 of successful sourcing, however many companies qualify (it was $0.80 per qualified company, which is why
+# icp_spend_cap_usd sits at 0.72). The quota snapshot says which policy the round froze:
+# sourcing_cost.per_qualified_pair_cap_microusd is 4,000,000 under the flat policy and 800,000 under the old one.
+# On 2026-10-19 our widest arm returned no company at all on four ICPs after spending $0.60-0.62 each.
+FLAT_POLICY_PAIR_CAP_MICROUSD = 4_000_000
+_LAST_SNAPSHOT: Optional[dict] = None
+FLAT_ICP_CAP_USD = _strategy_number("flat_icp_cap_usd", 3.5, 0.0, 3.9)
+FLAT_HOLDBACK_USD = _strategy_number("flat_holdback_usd", 0.3, 0.0, 1.0)
+FLAT_CALL_BUDGET = int(_strategy_number("flat_call_budget", 600, 50, 2000))
+FLAT_FORCE = str(_STRATEGY.get("cost_policy_force") or "").strip().lower() == "flat"   # local tests only
+FLAT_EVENT_COMPANIES = int(_strategy_number("flat_event_companies", 30, 0, 60))
+# s62 (tried, reverted): 25 reserve drafts (30 in all) on 2026-10-17 ICP 1 drafted 29 companies, 7 of them field-
+# qualified, but still sent 2 qualified of 5 -- the extra drafts queue behind the earlier ones in the re-check -- for
+# $2.50 and 35 minutes against $1.78 and 15. Back to 15 reserve drafts (20 in all).
+FLAT_RESERVE_DRAFTS = int(_strategy_number("flat_reserve_drafts", 15, 0, 25))
+# s63: rounds created after the organizer's 7ca91bf4d deployed (2026-10-20 ~05Z) freeze ARENA_FIT_FP_CLASSIFICATION =
+# company_fit_receipt_v1. A row carrying a company_fit receipt is then penalized only for a proven fit mismatch, an
+# exclusion, a duplicate or a data-quality issue, plus an unverified primary intent once fit passes. A required
+# attribute, industry, size or stage left "unavailable" costs nothing -- and the attribute was 117 of our 130 penalized
+# failures in October. The gates that withhold a row to spare that penalty (drop_unprovable, drop_weak_attribute,
+# precision.companion_drop's capability/stage drops and precision.confident_only) then only throw chances away.
+# The scorer policy is not published, so it is read from the ICP id's date: arena-2026-10-21 was open by 02:48Z on
+# 10-20 (icp_20261020_*, old classification); arena-2026-10-22 is created at 10-21 00:00Z (icp_20261021_*).
+FIT_FREE_FROM = str(_STRATEGY.get("fit_free_from") or "20261021").strip()
+FIT_FREE_FORCE = _strategy_number("fit_free_force", 0, 0, 1) >= 1   # local tests only
+FIT_FREE = False
+# o3: what this bundle adds on top of s63 under FIT_FREE (both inert while the round penalizes unproven fits):
+# fill_to_limit fills every open slot from the verified surplus; discovery_passes is how many second-pass rounds of
+# discovery an ICP short of drafts may run (1 = the old single second pass).
+FILL_TO_LIMIT = _strategy_number("fill_to_limit", 1, 0, 1) >= 1
+DISCOVERY_PASSES = int(_strategy_number("discovery_passes", 3, 1, 6))
+QUOTA_READS_MAX = 16
+START_READ_RETRIES = 2
+START_READ_BACKOFF_S = 1.5
+SNAPSHOT_CACHE_MARGIN_S = 1.5
+_QUOTA_READ_LOCK = threading.Lock()
+PARAGRAPH_EST_USD = 0.04
+PAIR_ALLOWANCE_USD = 0.80
+COMPLETION_RESERVE_USD = 0.05
+MIN_CONTACT_USD = 0.02
+MAX_PAIRS = 5
+REVERIFY_EST_USD = 0.016
+PARAGRAPH_MAX_USD = 0.06
+ATS_BONUS = _strategy_number("ats_bonus", 1, 0, 1) >= 1
+ATS_PICK_MODEL = str(_STRATEGY.get("ats_pick_model") or "google/gemini-3.5-flash-lite")
+ATS_BONUS_SECONDS = _strategy_number("ats_bonus_seconds", 150.0, 10.0, 400.0)
+# Loop s33: an operator's cost switch, OFF by default -- every ICP is researched.  Set to 1, research is not started for
+# a Private Equity ICP (no row of that stage class has qualified in the field; the research costs about $0.29 a round).
+SKIP_PRIVATE_EQUITY = _strategy_number("skip_private_equity", 0, 0, 1) >= 1
+# Drafts beyond the public cap that research may return. The output is still five companies; this is how many
+# candidates get verified before the best five are chosen. Bounded at 10 (it was 5): on arena-2026-10-17 our
+# runs ended at a mean of 722 of their 3600 seconds and no ICP reached its $0.72 spend cap (the highest spent
+# $0.58), so the run stopped for want of candidates, not of time or money -- ICP 6 returned one company in
+# 754 seconds while the field qualified two more. The same round measured the knob: 4 scored 13.133 against 7.133
+# for the identical arm at 2. The spend cap still binds above this, so a larger value spends idle budget and
+# can never overspend it.
+RESERVE_DRAFTS = int(_strategy_number("reserve_drafts", 0, 0, 10))
+REVERIFY_MAX_COMPANIES = 8
+# s56: under the flat policy every verified draft competes for the five slots. On 2026-10-17 ICP 1 replayed at the
+# full $3.5 cap the run drafted 18 companies, six of them field-qualified, and sent Rainfall Health and Valerie Health
+# (Valerie failed both times others sent it) ahead of BrainCheck, Insight Health and Onos Health: the re-check saw only
+# the five verify kept plus three spares, and ranked its survivors by draft order. POOL_CHECKED widens that pool;
+# DEPTH_RANK (off) would order it by evidence depth first: on the published rows of 10-08..10-19 that put the qualified
+# row above the failed one in 67% of other miners' same-ICP pairs against draft order's 58% -- but in 57% of ours, the
+# same as draft order (our drafts all carry similar depth), and a live replay of 10-17 ICP 1 with it on sent three
+# never-judged seed-lane companies ahead of Concurrence, Ognomy Sleep and Insight Health. The wider pool stays: rows
+# the re-check rejects are then replaced by later drafts in draft order rather than from three spares.
+POOL_CHECKED = 0           # 0: RESERVE_CHECKED
+DEPTH_RANK = False
+FLAT_POOL_CHECKED = int(_strategy_number("flat_pool_checked", 20, 3, 30))
+# s57: under the flat policy money stops binding and the clock does. 2026-10-17 ICP 1 at the full $3.5 cap ran the agent
+# to its 1,968 s share (0.55 of the horizon, capped at agent_long_seconds 2,000), stopped on "time budget exhausted"
+# with candidates still queued, and the whole run returned at 1,971 s: verify, paragraphs and the re-check took 51 s and
+# 27 of the 60 minutes went unused. The flat policy gives the agent 0.80 of the horizon (about 48 minutes of 60), which
+# still leaves about 12 minutes for phases that take one or two.
+FLAT_AGENT_SHARE = _strategy_number("flat_agent_share", 0.80, 0.3, 0.88)
+# s58: the re-check asks each company REVERIFY_ASKS times and takes the majority (reverify.rerank). One ask agreed with
+# itself across five asks on 28% of 60 judge-ruled rows; a majority of three raised agreement with the judge from 67% to
+# 70% and cut judge-failed rows still read as a match from 19% to 15%. Three asks of up to 20 companies cost about
+# $0.44 an ICP at sonar's $0.0074 a call, so only the flat policy affords it.
+REVERIFY_ASKS = 1
+# s60: the extraction caps lose field qualifiers the search already found. 2026-10-17 ICP 1: the second arm's lanes made
+# 8 of the 15 field-qualified companies candidates, while the extraction prompt run unchanged over that same run's own
+# search rows with no caps named 12 and 11 of them (two runs) -- Concurrence and Ognomy Sleep were in result titles
+# ("... Raises $17M Series A"). Each extraction kept 12 candidates and saw 60 rows. The flat policy keeps 40 and 400.
+FLAT_CANDIDATES = int(_strategy_number("flat_candidates", 40, 12, 40))
+FLAT_EXTRACT_ROWS = int(_strategy_number("flat_extract_rows", 400, 60, 800))
+FLAT_REVERIFY_ASKS = int(_strategy_number("flat_reverify_asks", 3, 1, 5))
+FLAT_AGENT_LONG_SECONDS = _strategy_number("flat_agent_long_seconds", 2900.0, 60.0, 3600.0)
+# o2: judge mirror, off by default. One cheap model call per 12 rows grades whether each row's cited announcement is
+# really the criterion's event and proves the attribute's change clause (agent/judgemirror.py, ported from the V-line's
+# eventgrade). The grade breaks ties inside a re-check vote tier before draft order: on rich ICPs the pool held 4-11
+# field-qualified companies while 2-4 went out, because that tier fell back to draft order.
+JUDGE_MIRROR = _strategy_number("judge_mirror", 0, 0, 1) >= 1
+RESERVE_CHECKED = 3
 LAST_REPORT: dict[str, Any] = {}
-_GATES_PRINTED = {"done": False}
-_INFRA_STATUSES = diagnostics.INFRA_STATUSES
-_INFRA_CODES = diagnostics.INFRA_CODES
-_HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
-
-
-def _log(message: str) -> None:
-    print(f"[arena-harness] {message}", file=sys.stderr, flush=True)
 
 
 def _company_limit() -> int:
@@ -92,9 +223,71 @@ def _company_limit() -> int:
         return 5
 
 
-def provider_infrastructure_error(exc: BaseException | None) -> str | None:
-    """Name the host-side fault in an exception chain, else None (the fault is ours)."""
+def announced_wall_clock() -> Optional[float]:
+    """The wall clock the sandbox announces for this run, or None when it does not.
 
+    LAB-LOG #309: `LAB_ARENA_WALL_CLOCK_SECONDS` is set for every sandbox by
+    `runtime.sandbox_environment` (upstream 1cf9ce2d).  Anything unparseable,
+    non-finite or under the contract minimum (30 s) is treated as absent, so a
+    stray value can only ever shorten our plan back to the short clock.
+    """
+
+    raw = str(os.environ.get("LAB_ARENA_WALL_CLOCK_SECONDS") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 30.0:
+        return None
+    return value
+
+
+def plan_clock() -> dict:
+    """The two deadlines a run plans against, and where they came from.
+
+    ``short``   -- a complete, contract-valid checkpoint must exist by here.
+    ``horizon`` -- the run must have RETURNED by here (minus SAFETY_SECONDS).
+    ``long``    -- whether the phases may spread over the horizon: the research
+                   phase then gets up to AGENT_LONG_SECONDS and the later phases
+                   plan against the horizon instead of the short clock.
+    ``source``  -- "sandbox" when the announced clock decided, else "strategy".
+    """
+
+    announced = announced_wall_clock()
+    if announced is None:
+        short = SHORT_CLOCK_SECONDS
+        horizon = LONG_CLOCK_SECONDS if LONG_CLOCK_SECONDS > short else short
+        source = "strategy"
+    else:
+        short = min(SHORT_CLOCK_SECONDS, announced)
+        horizon = announced
+        if LONG_CLOCK_SECONDS > 0:
+            horizon = min(horizon, max(LONG_CLOCK_SECONDS, short))
+        source = "sandbox"
+    horizon = max(short, horizon)
+    return {"short": short, "horizon": horizon, "announced": announced, "source": source,
+            "long": horizon >= short + LONG_PATH_MARGIN_SECONDS}
+
+
+def _log(message: str) -> None:
+    print(f"[arena-harness] {message}", file=sys.stderr, flush=True)
+
+
+_INFRA_STATUSES = diagnostics.INFRA_STATUSES
+_INFRA_CODES = diagnostics.INFRA_CODES
+_HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
+
+
+def provider_infrastructure_error(exc: BaseException | None) -> str | None:
+    """Name the host-side fault in an exception chain, else None (the fault is ours).
+
+    The broker hands submitted code a 502 ``provider_unavailable`` for a provider
+    outage, and since upstream `10b602f5` it also rewrites an OpenRouter error
+    returned inside an HTTP 200 to that error's real status -- so a rate limit
+    that used to arrive as an unparseable "success" now arrives as a 429.
+    """
     seen: set[int] = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
@@ -118,6 +311,21 @@ def provider_infrastructure_error(exc: BaseException | None) -> str | None:
 
 
 def recorded_infra_fault(tools: Any = None) -> str | None:
+    """The host fault the run SAW, even though no exception carries it any more.
+
+    LAB-LOG #234 gate 1 (the CRITICAL one).  ``agent.guard`` turns every tool
+    exception into ``{"ok": False, ...}`` so the loop can keep going, and that
+    includes the ``RuntimeError("provider_unavailable")`` a Deepline 429/5xx
+    arrives as (`lab_arena/operations.py:1661-1667` collapses every
+    infrastructure status into one generic 502 with that body).  The run then
+    fails for some later, innocent-looking reason and
+    ``provider_infrastructure_error`` -- which reads ONLY the final exception
+    chain -- finds nothing.  The host, meanwhile, has the infrastructure call on
+    record (`runner.py:1395-1405`), so our raise is rewritten to
+    ``provider_error`` (`:1406-1408`), which is not model-caused, and the round
+    dies for everyone.  So consult the record as well as the chain.
+    """
+
     fault = getattr(tools, "infra_fault", None)
     if isinstance(fault, str) and fault:
         return fault
@@ -125,29 +333,1822 @@ def recorded_infra_fault(tools: Any = None) -> str | None:
 
 
 def _no_companies(exc: BaseException | None, tools: Any = None) -> list[dict]:
-    """Nothing locked: [] after no error or a host fault; our own failure raises (the host grants a retry)."""
+    """What to hand back when the run produced nothing.
 
+    ⚠️ This reverses the infrastructure branch of #224, which looked only at our
+    own ICP score. The round-level rule dominates it
+    (`scripts/185-lab-arena-miner-credentials.sql:610`):
+
+        HAVING bool_and(runs.status <> 'accepted')
+           AND NOT bool_or(terminal_cause IN (model_timeout, invalid_output,
+                           budget_exhausted, credential_error, model_error))
+        ...
+        IF v_incomplete > 0 THEN cancel the WHOLE round
+
+    That exclusion list is exactly MODEL_CAUSED_TERMINAL_CAUSES. So an assignment
+    with no accepted run whose failures were all INFRASTRUCTURE counts as
+    incomplete, and **one incomplete assignment cancels the round for everybody**.
+    We field 4 submissions x 20 ICPs = 80 assignments, so raising on a host fault
+    multiplies that exposure by 80 -- and a cancelled round voids every ICP we
+    scored and any crown we earned. Three rounds in a row died this way
+    (09-06 `capacity:scoring2:1`, 09-07 `scoring_window_closed`,
+    09-08 `capacity:stage1:4`).
+
+    So:
+      * host fault (429/5xx/shared account, broker unavailable) -> return [].
+        An accepted run with zero companies cannot make the assignment
+        incomplete. We trade one ICP's zero -- which is all a failed ICP was ever
+        worth -- for the round staying alive.
+      * our own fault -> raise. `model_error` IS in the exclusion list, so it
+        cannot cancel the round, and a failed run still earns one confirmation
+        attempt (`scripts/179-lab-arena-v1.sql:1859`). Free upside, no round risk.
+      * no exception at all -> return []: an empty search is an honest answer.
+
+    A host fault counts whether it is still in the exception chain or only in
+    the recorded infrastructure channel (`recorded_infra_fault`): what decides
+    the round is what the HOST has in `state.calls`, not what our last exception
+    happens to remember. A genuine agent failure with NO fault on either still
+    raises -- that contract is the free confirmation attempt and is unchanged.
+    """
     if exc is None:
         return []
-    reason = provider_infrastructure_error(exc) or (
-        "recorded:%s" % recorded_infra_fault(tools) if recorded_infra_fault(tools) else None)
+    reason = provider_infrastructure_error(exc)
+    if not reason:
+        recorded = recorded_infra_fault(tools)
+        if recorded:
+            reason = "recorded:%s" % recorded
     if reason:
         LAST_REPORT["no_output"] = "host_fault_completed:%s" % reason
-        _log("no companies after a host fault (%s): returning []" % reason)
+        _log("no companies after a HOST fault (%s): returning [] so this assignment "
+             "completes -- an incomplete infrastructure assignment cancels the whole round" % reason)
         return []
     LAST_REPORT["no_output"] = "agent_failure"
-    _log("no companies after %s (our fault): raising for the retry attempt" % type(exc).__name__)
+    _log("no companies after %s (our fault): raising for the confirmation attempt "
+         "-- model_error cannot cancel the round" % type(exc).__name__)
     raise exc
 
 
+def verification_deadline(started: float) -> float:
+    """The RUN deadline -- what ``tools.deadline`` must be reset to before verification.
+
+    LAB-LOG #236 idea 3.  ``run_icp`` sets ``tools.deadline`` to the RESEARCH
+    cut-off (``agent_timeout - 35 s``) so the model stops calling tools in time to
+    still emit ``submit_companies`` itself.  That cut-off is by construction
+    ALREADY IN THE PAST when the agent returns -- at the status-quo dials it
+    lands ~137 s in, against an agent that may run to ~172 s -- and it was never
+    reset.
+
+    It really does bind afterwards, verified in this tree, not assumed:
+    ``ArenaTools._deepline`` raises ``BudgetExhausted("time budget exhausted")``
+    past the deadline (arena_tools.py:324), ``fetch_page`` turns that into
+    ``Page(url, error="budget")`` (arena_tools.py:571-574, :609-610), and
+    ``verify.verify_signal`` reads ``if not page.ok`` and drops the signal as
+    "evidence page unavailable (budget)" (verify.py) -- then drops the company
+    for "no verifiable intent signal".  So every evidence page the AGENT did not
+    already cache was unfetchable during verification, and the company built on
+    it was thrown away for a clock we set ourselves.  Pinned by
+    ``test_verification_deadline.py``.
+
+    The reset is to the run's own wall clock and nothing wider: the Arena kills
+    the sandbox at WALL_CLOCK_SECONDS and SAFETY_SECONDS is the margin, so this
+    is exactly the envelope LAB-LOG #235 §7 already prices (a worst-case tool
+    fired at ~277 s settles by ~352 s, ~4.7x inside the post-35f81d81 lease
+    budget).  Deepline calls are also not charged against the $5 OpenRouter
+    execution cap, and ``ArenaTools.call_budget`` still caps their number.
+    """
+
+    return started + (WALL_CLOCK_SECONDS - SAFETY_SECONDS)
+
+
+def identity_keys(company: Mapping[str, Any]) -> set[str]:
+    """The two identities a refill must not repeat: the name key and the registrable host."""
+
+    keys = {sm.company_name_key(company.get("company_name"))}
+    host = sm.registrable_host(str(company.get("company_website") or ""))
+    if host:
+        keys.add(host)
+    return {k for k in keys if k}
+
+
+def backfill_empty_slots(companies: list[dict], report: Any, *, limit: int,
+                         schema: str = sm.SCHEMA_V1, exclude: Optional[set[str]] = None) -> tuple[list[dict], list[str]]:
+    """Fill slots the sonar re-verification EMPTIED, from the verified surplus.
+
+    LAB-LOG #236 idea 2.  ``verify_companies`` ranks every locally verified
+    company and truncates to ``limit``; the ones it cut are kept in
+    ``report.surplus``.  ``reverify.rerank`` may then EVICT a company -- and only
+    ever on an explicit MISMATCH verdict (reverify.py:616-619); "unprovable", a
+    timeout, a refused call and a ``None`` verdict are all NO INFORMATION and
+    keep the company (reverify.py:585-589).  This function refills what that
+    eviction emptied.
+
+    Three rules, all load-bearing:
+
+    * ⛔ It only ever APPENDS into a genuinely empty slot.  A company that passed
+      local verification is never replaced, re-ranked or competed against: if
+      ``len(companies) >= limit`` this returns the list unchanged.
+    * ⛔ The result can never exceed ``limit`` (<= 5).  A sixth company is not an
+      ignored extra -- ``validate_companies`` rejects the whole list
+      ("too many companies", qualification/competition_models.py:128,
+      MAX_COMPANIES=5 at lab_arena/output.py:18), the run terminates
+      ``invalid_output`` and the ICP scores 0.  The final list is re-validated
+      through the scorer mirror before it is returned, and the original list is
+      returned untouched if that fails.
+    * ⛳️ POSITION.  The platform scores ``company_scores[:goal]`` in MODEL ORDER,
+      not best-first (lab_arena/verify.py:242-243, lab_arena/scoring.py:260-261,
+      qualification/scoring/competition.py:270 ``list(companies)[:_company_goal(icp)]``).
+      A back-filled company is therefore appended LAST, deliberately: it ranked
+      below every survivor on the local estimate, and it is the one company in
+      the list the sonar gate has NOT seen (it was drawn after the reverify call
+      went out).  If ``goal`` ever turns out smaller than what we emit -- the
+      only case where position decides anything -- the unchecked candidate is the
+      one that falls outside the slice, never a re-verified survivor.
+
+    * ⛔ ``exclude`` (LAB-LOG #315): the identities of every company an explicit
+      sonar MISMATCH evicted this run.  A reserve company that was promoted, then
+      rejected, used to come straight back from the same surplus with its cached
+      contact -- the pre-check's verdict undone by its own refill.
+
+    Returns ``(companies, names_added)``; ``names_added`` is empty when nothing moved.
+    """
+
+    limit = max(1, int(limit))
+    if len(companies) >= limit:
+        return companies, []
+    pool = [c for c in list(getattr(report, "surplus", None) or []) if isinstance(c, dict)]
+    if not pool:
+        return companies, []
+    keys = {sm.company_name_key(c.get("company_name")) for c in companies}
+    hosts = {sm.registrable_host(str(c.get("company_website") or "")) for c in companies}
+    banned = set(exclude or ())
+    out = list(companies)
+    added: list[str] = []
+    for candidate in pool:
+        if len(out) >= limit:
+            break
+        key = sm.company_name_key(candidate.get("company_name"))
+        host = sm.registrable_host(str(candidate.get("company_website") or ""))
+        if key in keys or (host and host in hosts):
+            continue
+        if banned & identity_keys(candidate):
+            continue
+        keys.add(key)
+        hosts.add(host)
+        out.append(candidate)
+        added.append(str(candidate.get("company_name") or ""))
+    if not added:
+        return companies, []
+    try:
+        out = sm.validate_output(out, max_companies=limit, schema_version=schema)
+    except Exception as exc:
+        _log("back-fill rejected by the output contract (%s): emitting the verified list unchanged"
+             % type(exc).__name__)
+        return companies, []
+    return out, added
+
+
+# o3: stages where a row with no stage evidence and a silent signal never qualified (0 of 466 published rows, 10-14..10-19).
+_STAGE_PROOF_STAGES = ("series a", "series b", "series c", "private equity")
+
+
+def fill_to_limit(companies: list[dict], report: Any, icp: Mapping[str, Any], *, limit: int,
+                  schema: str = sm.SCHEMA_V1, exclude: Optional[set[str]] = None,
+                  verdicts: Optional[Mapping[str, str]] = None) -> tuple[list[dict], list[str]]:
+    """o3: under fit-receipt penalties (FIT_FREE) fill every open slot from the verified surplus.
+
+    From arena-2026-10-22 a row whose fit the judge leaves "unavailable" costs nothing, while a qualified row adds
+    16-18 of the ICP's points, so an empty slot is a ticket thrown away. Still penalized: a proven mismatch, an
+    exclusion, a duplicate, a data-quality issue, and an unverified primary signal on a row whose fit passed. So a
+    surplus row joins only if it shares no identity with the output or with a row the re-check rejected, carries a
+    dated primary signal, was not read as a mismatch by the re-check, and -- on a Series A/B/C+ or Private Equity
+    ICP -- has stage evidence or a signal that names the round. Ranked by stage evidence, re-check verdict, a
+    81-160 character attribute quote, then distinct URLs (59.7% qualified-first on published pairs against 56% for
+    draft order). Appended after the existing rows; never more than ``limit``; re-validated, and the list is
+    returned unchanged if the contract refuses it."""
+
+    limit = max(1, int(limit))
+    if len(companies) >= limit:
+        return companies, []
+    pool = [c for c in list(getattr(report, "surplus", None) or []) if isinstance(c, dict)]
+    if not pool:
+        return companies, []
+    try:
+        signal_round = _sibling_module("precision")._signal_round
+    except Exception:  # noqa: BLE001
+        signal_round = None
+    stage = str(icp.get("company_stage") or "")
+    needs_stage = stage.strip().lower().startswith(_STAGE_PROOF_STAGES)
+    taken = {k for c in companies for k in identity_keys(c)}
+    banned = set(exclude or ())
+    verdicts = dict(verdicts or {})
+    ranked: list[tuple[tuple, dict]] = []
+    for order, row in enumerate(pool):
+        keys = identity_keys(row)
+        if not keys or keys & taken or keys & banned:
+            continue
+        primary = [sig for sig in row.get("intent_signals") or []
+                   if isinstance(sig, Mapping) and sig.get("matched_icp_signal") in (0, None) and sig.get("url")]
+        if not primary or not any(str(sig.get("date") or "").strip() for sig in primary):
+            continue
+        verdict = str(verdicts.get(sm.company_name_key(row.get("company_name")), ""))
+        if verdict == "mismatch":
+            continue
+        proofs = len(row.get("company_stage_evidence") or [])
+        if needs_stage and not proofs and not (signal_round and signal_round(row, stage)):
+            continue
+        attribute = row.get("required_attribute") if isinstance(row.get("required_attribute"), Mapping) else {}
+        quote = len(str(attribute.get("evidence_quote") or ""))
+        try:
+            urls = int(evidence_depth(row)[2])
+        except Exception:  # noqa: BLE001
+            urls = 0
+        tier = {"match": 0, "unavailable": 1}.get(verdict, 2)
+        ranked.append(((-min(proofs, 3), tier, not 81 <= quote <= 160, -urls, order), row))
+    ranked.sort(key=lambda item: item[0])
+    out = list(companies)
+    added: list[str] = []
+    for _, row in ranked:
+        if len(out) >= limit:
+            break
+        keys = identity_keys(row)
+        if keys & taken:
+            continue
+        taken |= keys
+        out.append(row)
+        added.append(str(row.get("company_name") or ""))
+    if not added:
+        return companies, []
+    try:
+        out = sm.validate_output(out, max_companies=limit, schema_version=schema)
+    except Exception as exc:  # noqa: BLE001
+        _log("fill rejected by the output contract (%s): emitting the list unchanged" % type(exc).__name__)
+        return companies, []
+    return out, added
+
+
+def recheck_ashby_postings(companies: list[dict], report: Any, tools: Any, *, deadline: float, limit: int,
+                           schema: str, exclude: set[str]) -> list[dict]:
+    """Loop s22 (teardown-0925 #6, upstream ab3a1e33): just before output, re-read the Ashby board API (free) and
+    drop a row whose posting left the board -- the judge now scores it a company-local zero -- then refill that slot
+    from the verified surplus.  Bounded (6 board reads, 20 s each) and never raises: on any doubt the rows stand."""
+
+    saved = getattr(tools, "timeout", None)
+    try:
+        try:
+            from . import hiring as hiring_module
+        except ImportError:
+            hiring_module = importlib.import_module(f"{os.path.basename(_HERE)}.hiring")
+        if saved is not None:
+            tools.timeout = min(float(saved), 20.0)
+        surplus = [c for c in list(getattr(report, "surplus", None) or []) if isinstance(c, dict)]
+        gone = hiring_module.recheck_ashby(companies + surplus, tools, deadline=deadline)
+        if not gone:
+            return companies
+        keys = set().union(*(identity_keys(c) for c in gone))
+        kept = [c for c in companies if not (identity_keys(c) & keys)]
+        if len(kept) == len(companies):
+            return companies
+        out, added = backfill_empty_slots(kept, report, limit=min(limit, len(companies)), schema=schema,
+                                          exclude=set(exclude) | keys)
+        LAST_REPORT["ashby_unlisted"] = {"dropped": [str(c.get("company_name") or "") for c in gone], "backfilled": added}
+        checkpoint(out, schema=schema, limit=limit)
+        return out
+    except Exception as exc:
+        LAST_REPORT["ashby_unlisted"] = {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        return companies
+    finally:
+        if saved is not None:
+            try:
+                tools.timeout = saved
+            except Exception:
+                pass
+
+
+_URL_RE = re.compile(r"https?://[^\s\"'<>\\]+")
+_DOMAIN_RE = re.compile(r"\"domain\":\s*\"([^\"]+)\"")
+_DISCOVERY_TOOLS = ("search_companies", "search_web", "search_news", "get_company_events",
+                    "get_company_profile", "fetch_page")
+_NON_CANDIDATE_HOSTS = frozenset({
+    "linkedin.com", "techcrunch.com", "prnewswire.com", "businesswire.com", "globenewswire.com",
+    "crunchbase.com", "bloomberg.com", "reuters.com", "google.com", "wikipedia.org", "x.com",
+    "twitter.com", "youtube.com", "medium.com", "forbes.com", "nytimes.com", "wsj.com", "ft.com",
+    "sec.gov", "greenhouse.io", "lever.co", "workable.com", "indeed.com", "glassdoor.com",
+})
+
+
+def candidate_origins(tools: Any, companies: Optional[list] = None) -> dict[str, Any]:
+    """Observable candidate identities per discovery path, read from the trace (#317 addendum).
+
+    ``discovered`` counts only ``search_companies`` rows, which #281 §4 recorded as
+    a counter artifact: on the 09-12 runs 15 of 27 returned companies came from
+    attempts that reported zero discoveries because event-first research found
+    them through ``search_web``.  This reads every discovery tool's trace entry
+    for the registrable hosts it named (result rows and call arguments), keeps
+    them per tool, and says for each returned company which paths had shown its
+    host -- or ``unknown`` when none had, which is distinct from a zero count.
+    An upper bound on identities, not a count of qualified candidates.  Telemetry
+    only; never raises.
+    """
+
+    by_tool: dict[str, set[str]] = {}
+    for entry in getattr(tools, "trace", None) or []:
+        if not isinstance(entry, dict):
+            continue
+        tool = str(entry.get("tool") or "")
+        if tool not in _DISCOVERY_TOOLS:
+            continue
+        try:
+            text = str(entry.get("result") or "") + " " + json.dumps(entry.get("args") or {}, default=str)
+        except Exception:
+            text = str(entry.get("result") or "")
+        hosts = by_tool.setdefault(tool, set())
+        for url in _URL_RE.findall(text):
+            host = sm.registrable_host(url)
+            if host and host not in _NON_CANDIDATE_HOSTS:
+                hosts.add(host)
+        for domain in _DOMAIN_RE.findall(text):
+            host = sm.registrable_host("https://%s/" % domain.strip().lower())
+            if host and host not in _NON_CANDIDATE_HOSTS:
+                hosts.add(host)
+    seen: set[str] = set().union(*by_tool.values()) if by_tool else set()
+    origins: dict[str, list[str]] = {}
+    unknown = 0
+    for company in companies or []:
+        if not isinstance(company, dict):
+            continue
+        host = sm.registrable_host(str(company.get("company_website") or ""))
+        paths = sorted(tool for tool, hosts in by_tool.items() if host and host in hosts)
+        origins[host or str(company.get("company_name") or "?")] = paths or ["unknown"]
+        if not paths:
+            unknown += 1
+    return {"candidates_seen": len(seen),
+            "candidates_by_tool": {tool: len(hosts) for tool, hosts in sorted(by_tool.items())},
+            "origins": origins, "origin_unknown": unknown}
+
+
+def _write_empty_snapshot(icp: Mapping[str, Any], tools: Any, usage: Optional[Mapping[str, Any]] = None) -> None:
+    """Local runs only: the exact research state at a voluntary empty decision (#317 addendum).
+
+    The paired recovery experiment branches from this state (the same trace,
+    pages and counters) so every arm shares one research expense.  Written only
+    when ARENA_EMPTY_SNAPSHOT_DIR is set, which the sandbox never does; can
+    never change what the ICP returns.
+    """
+
+    target = os.environ.get("ARENA_EMPTY_SNAPSHOT_DIR", "").strip()
+    if not target:
+        return
+    try:
+        snap = tools.snapshot() if hasattr(tools, "snapshot") else {"trace": list(getattr(tools, "trace", None) or [])}
+        snap["icp"] = dict(icp)
+        snap["agent_usage"] = dict(usage or {})
+        os.makedirs(target, exist_ok=True)
+        path = os.path.join(target, "%s-empty.json" % str(icp.get("icp_id") or "icp"))
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(snap, handle, default=str)
+        LAST_REPORT["empty_snapshot"] = path
+    except Exception as exc:
+        LAST_REPORT["empty_snapshot_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+
+
+def _funnel(tools: Any, *, drafted: int, verify_out: int | None, reverify_out: int | None,
+            returned: int, terminal: str, companies: Optional[list] = None) -> dict[str, Any]:
+    """The per-ICP funnel, in stderr, on EVERY path (LAB-LOG #248).
+
+    ⚠️ A rejection histogram alone cannot tell "the model produced nothing" from
+    "verification discarded everything" -- both end at zero companies. Only the
+    stage counts separate them, so they are emitted even (especially) when the
+    ICP returns empty, which is exactly the path that used to log nothing:
+    `if not drafts: return _no_companies(...)` returned before the report line.
+
+    `verify_out`/`reverify_out` are None when that stage never ran, which is
+    itself the signal -- do not coerce them to 0.
+    """
+
+    out: dict[str, Any] = {
+        "discovered": int(getattr(tools, "discovered", 0) or 0),
+        "discovered_bucket_ok": int(getattr(tools, "discovered_bucket_ok", 0) or 0),
+        "discovered_with_linkedin": int(getattr(tools, "discovered_with_linkedin", 0) or 0),
+        "drafted": int(drafted),
+        "verify_in": int(drafted),
+        "verify_out": verify_out,
+        "reverify_out": reverify_out,
+        "returned": int(returned),
+        "terminal": terminal,
+    }
+    try:
+        out.update(candidate_origins(tools, companies))
+    except Exception:
+        pass
+    return out
+
+
 def _emit_report() -> None:
+    """Write the one stderr record for this ICP, exactly once.
+
+    stderr is the only channel that survives the sandbox, and the run used to
+    emit this only on the success path. It now runs from `finally`, so an empty
+    ICP and a raising ICP are as legible as a scoring one. The `verify` block
+    stays out: it carries company names, URLs and interpolated reasons, and the
+    bounded histograms in `verify_counts` say the same thing in a form that
+    aggregates across runs.
+    """
+
     if LAST_REPORT.get("_emitted"):
         return
     LAST_REPORT["_emitted"] = True
     try:
-        _log(json.dumps({k: v for k, v in LAST_REPORT.items() if k != "_emitted"}, default=str)[:60000])
+        _log(json.dumps({k: v for k, v in LAST_REPORT.items()
+                         if k not in ("verify", "_emitted")}))
+    except Exception:
+        pass
+
+
+EMIT_GATE = bool(_strategy_number("emit_gate", 0, 0, 1))
+# What a stage-evidence item is worth, measured over every published round on
+# the companies that had already cleared industry and required_attribute --
+# the population a gate here actually decides:
+#
+#     ICP stage        no evidence   one or more   n
+#     Series C+             5.8%        78.4%     568
+#     Series B              9.5%        82.5%     648
+#     Series A             26.7%        73.7%     499
+#     Public               39.0%        80.9%     491
+#     Seed                 46.5%        72.6%     330
+#     Private Equity       10.3%         9.1%     426
+#
+# So an unproven row is near-certain loss in Series B and C+, an even bet in
+# Seed, and in Private Equity evidence changes nothing at all -- there the
+# floor is what it is and a row costs nothing to send.
+# Every stage, Private Equity included. Measured over 2026-10-01..10-14, inside an ICP that already holds a
+# row carrying stage evidence, a row with none qualifies: public 7.3% (n=234), seed 7.0% (n=199), series a
+# 3.8% (n=130), series b 2.4% (n=82), series c+ 0.6% (n=165) and private equity **0.0%** (n=141) -- all far
+# below the 17% break-even, while a row that does carry evidence qualifies 13.9% to 29.0% in every stage.
+# Adding private equity drops 107 more failing rows and not one qualifying row, and moves the replayed score
+# by exactly 0.0, because a private-equity ICP has had no qualifier at all in thirteen rounds and its score
+# was already the floor. It is in the tuple for the round where one finally does.
+# Private equity is OUT again. Adding it gained exactly 0.0 points replayed over the thirteen rounds it
+# was fitted on and cost 7.7 on arena-2026-10-15, the first round it had never seen.
+_PROOF_MATTERS = ("series c+", "series b", "series a", "public", "seed")
+
+
+def drop_unprovable(companies: list, icp: Mapping[str, Any], report: Any = None) -> list:
+    """Drop a company nothing proves, once another one in this ICP is proven.
+
+    Two kinds of row qualify as unprovable: in a venture ICP, one with no
+    stage evidence; in any ICP, one whose required attribute the model could
+    not find a sentence for.
+
+    The organizer widened "fail closed when the current venture stage remains
+    unproven" from Public to every venture stage on 2026-10-02 (`86268ca0`), so
+    a row with no stage evidence in a Seed/Series ICP is close to a certain
+    loss. Measured over every published round, a venture company with no stage
+    evidence qualifies 8.1% of the time against 24.8% with one; and inside an
+    ICP that already has one qualifying company, each failure costs about 3.2
+    of its per_icp_score. On arena-2026-10-14 we sent five such rows and all
+    five failed, three of them on `stage: unavailable` exactly.
+
+    Nothing is dropped while the ICP has no proven company: there the floor is
+    zero and an extra row is a free lottery ticket.
+    """
+
+    if not EMIT_GATE or not companies:
+        return companies
+    stage = str((icp or {}).get("company_stage") or "").strip().lower()
+
+    def carries_proof(company: Mapping[str, Any]) -> bool:
+        # A company whose attribute the model could not prove from its own
+        # pages goes out with whatever the keyword score found, which on a
+        # marketing page is the navigation bar. The judge gets two source URLs
+        # for the attribute and no retry once both are spent (`1e4e1793`) and
+        # says plainly that a navigation label is not evidence (`91d26d2a`),
+        # so such a row can only fail. On arena-2026-10-14 the attribute was
+        # the first failing check on five of our sixteen companies.
+        if company.get("_attribute_unproven"):
+            return False
+        if stage in _PROOF_MATTERS:
+            # Any evidence counts. Two tempting refinements were measured against every published round and
+            # both are withdrawn, because the rate that decides them is not the rate over all rows but the
+            # rate among the rows this gate can actually drop -- rows sitting in an ICP that already holds a
+            # proven company. Over 2026-10-01..10-14, inside such an ICP:
+            #
+            #   stage items the scorer's own gate accepts        23.5% qualify (n=2773)
+            #   stage items it rejects, every one                17.2% qualify (n= 250)  <- break-even is 17%
+            #   no stage items at all                             6.0% qualify (n= 630)
+            #   no items, but a cited signal the gate accepts      2.6% qualify (n=  39)
+            #
+            # So dropping a row whose items the gate refuses is a coin flip (and cost 389 points when
+            # replayed over every submission of every round), and keeping a row because its funding signal
+            # passes the gate is worse than keeping nothing. Only "no evidence at all" is far enough below
+            # break-even to act on. The verdicts still decide the ORDER of what goes out (verify.py), where
+            # 23.5% against 17.2% against 6.0% is exactly the ranking we want.
+            return bool(company.get("company_stage_evidence"))
+        return True
+
+    proven = [c for c in companies if carries_proof(c)]
+    if proven and len(proven) != len(companies):
+        companies = _report_drop(companies, proven, report,
+                                 "no proof the judge can read, beside a company that has it")
+    return drop_weak_attribute(companies, icp, report)
+
+
+# Companies our own re-verification confirmed on every dimension, by name key. Filled after `reverify.rerank`
+# and read by the attribute-shape rule, which must never outrank a full re-check.
+_REVERIFY_MATCHED: set = set()
+_ATTRIBUTE_RANK_FLOOR = 3
+_NO_ATTRIBUTE_QUOTE = -1   # kept, not dropped: it qualifies 18.1%, above the 17% break-even
+
+
+def attribute_strength(company: Mapping[str, Any]) -> Optional[int]:
+    """How much this row's attribute quote looks like the ones the verifier accepts, or None when we cannot say."""
+
+    attribute = company.get("required_attribute")
+    if not isinstance(attribute, Mapping):
+        return None
+    quote = str(attribute.get("evidence_quote") or "").strip()
+    if not quote:
+        return _NO_ATTRIBUTE_QUOTE
+    try:
+        from . import scout as _scout
+    except Exception:  # noqa: BLE001
+        try:
+            _scout = importlib.import_module(f"{os.path.basename(_HERE)}.scout")
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        key = sm.company_name_key(company.get("company_name"))
+        return int(_scout.attribute_sentence_rank(attribute.get("evidence_url"), quote, key))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+GATE_REFILL = _strategy_number("gate_refill", 1, 0, 1) >= 1
+GATE_REFILL_FLOOR = int(_strategy_number("gate_refill_floor", 5, 0, 9))
+
+
+class _Pool:
+    def __init__(self, rows: list) -> None:
+        self.surplus = rows
+
+
+def refill_after_gates(companies: list, icp: Mapping[str, Any], report: Any, *, emptied: int, limit: int,
+                       schema: str, exclude: Optional[set] = None) -> list:
+    """Refill the slots drop_unprovable just emptied, from the verified surplus, with rows that carry what the gate
+    asks for: stage evidence on a venture ICP, and an attribute quote that reads like a proof (rank >= the floor) or a
+    full match from our own re-check. Appended last, never more than the gate removed, never past ``limit``.
+
+    The gate drops a row nothing proves beside a proven one -- and then sent the ICP out short. A published fork of
+    our 10-18 code that refills those slots (v131) took second place on 2026-10-19 at 2.85, above both our 10-18 code
+    (1.75) and our 10-19 arms (1.275)."""
+
+    if not GATE_REFILL or emptied <= 0 or report is None or len(companies) >= limit:
+        return companies
+    stage = str((icp or {}).get("company_stage") or "").strip().lower()
+    asks_attribute = bool(str((icp or {}).get("required_attribute") or "").strip())
+    pool, skipped = [], {}
+    for row in [c for c in list(getattr(report, "surplus", None) or []) if isinstance(c, dict)]:
+        name = str(row.get("company_name") or "")
+        if stage in _PROOF_MATTERS and not row.get("company_stage_evidence"):
+            skipped[name] = "no stage evidence"
+            continue
+        if asks_attribute and sm.company_name_key(name) not in _REVERIFY_MATCHED:
+            rank = attribute_strength(row)
+            if rank is None or rank < GATE_REFILL_FLOOR:
+                skipped[name] = "attribute rank %s" % rank
+                continue
+        pool.append(row)
+    try:
+        out, added = backfill_empty_slots(companies, _Pool(pool), limit=min(int(limit), len(companies) + int(emptied)),
+                                          schema=schema, exclude=exclude)
+    except Exception as exc:  # noqa: BLE001 - a refill must never cost the rows already kept
+        LAST_REPORT["gate_refill"] = {"error": type(exc).__name__}
+        return companies
+    LAST_REPORT["gate_refill"] = {"emptied": int(emptied), "added": added, "skipped": dict(list(skipped.items())[:10])}
+    return out
+
+
+def drop_weak_attribute(companies: list, icp: Mapping[str, Any], report: Any = None) -> list:
+    """Beside a row whose attribute reads like a proof, drop the ones whose attribute reads like a menu.
+
+    Measured over the 6,550 published rows of 2026-10-01..10-14, counting only rows whose stage evidence the
+    scorer's own gate accepts, by `scout.attribute_sentence_rank` of the submitted attribute quote:
+
+        rank >= 5          24.3% qualify (n=1245)   keep
+        rank 3-4           26.7% qualify (n= 993)   keep
+        rank <= 2          11.1% qualify (n= 369)   below break-even -> dropped
+        no attribute quote 18.1% qualify (n= 271)   above break-even -> kept
+
+    The last row is why a missing quote is not treated as a weak one: on the first six rounds measured it
+    looked like 10.0% and the full thirteen put it at 18.1%, above the break-even. The verifier does its own
+    research when we hand it nothing (one company passed the attribute on 2026-10-14 with
+    `evidence_url: null`); what it cannot recover from is a quote that points it at a menu.
+
+    Our own arena-2026-10-14 ICP 5 calibrates the penalty exactly: one qualified row and four failed ones
+    scored 3.5 of that ICP's 100 points, so 20 - 4p = 3.5 and a failed row costs **4.1** points. Beside a
+    qualifying row the break-even pass rate is therefore 4.1 / 24.1 = 17%: a rank <= 2 row (12.5%) and a row
+    with no attribute quote (10.0%) are both negative there, while a rank >= 3 row (27.0%) stays positive --
+    which is why only the weak tail is dropped and more rows are never discouraged.
+
+    Nothing is dropped while no row is strong, and nothing is dropped for an ICP that asks no attribute.
+    """
+
+    if not _strategy_number("emit_gate_strength", 1, 0, 1) >= 1:
+        return companies
+    if not companies or not str((icp or {}).get("required_attribute") or "").strip():
+        return companies
+    ranks = {id(c): attribute_strength(c) for c in companies}
+    if any(rank is None for rank in ranks.values()):
+        return companies
+    # A row our own re-verification confirmed on every dimension is never the weak one here. On the Education
+    # ICP of 2026-10-15 this rule dropped Knowledgehook -- re-verified "match" on identity, employee size,
+    # industry, geography, stage and the required attribute -- because its attribute quote ranked 2, and kept
+    # two rows the same re-check had returned "unavailable" on. Knowledgehook is the only company that has
+    # ever qualified on that ICP: the field sent it fifteen times and it passed six. A quote's shape is a
+    # weaker signal than five dimensions confirmed, and must not overrule it.
+    confirmed = {c_id for c_id, c in ((id(c), c) for c in companies)
+                 if sm.company_name_key(c.get("company_name")) in _REVERIFY_MATCHED}
+    strong = [c for c in companies if ranks[id(c)] >= _ATTRIBUTE_RANK_FLOOR or id(c) in confirmed]
+    weak = [c for c in companies if 0 <= ranks[id(c)] < _ATTRIBUTE_RANK_FLOOR and id(c) not in confirmed]
+    if not strong or not weak:
+        return companies
+    LAST_REPORT["emit_gate_attribute_ranks"] = {str(c.get("company_name")): ranks[id(c)] for c in companies}
+    keep = [c for c in companies if c not in weak]
+    return _report_drop(companies, keep, report,
+                        "the attribute quote reads like a menu, beside a row whose reads like a proof")
+
+
+def _report_drop(companies: list, keep: list, report: Any, reason: str) -> list:
+    kept = {id(c) for c in keep}
+    dropped = [str(c.get("company_name")) for c in companies if id(c) not in kept]
+    LAST_REPORT.setdefault("emit_gate_dropped", []).extend(dropped)
+    _log("emission gate drops %s: %s" % (", ".join(dropped) or "nothing", reason))
+    if report is not None:
+        for name in dropped:
+            try:
+                report.dropped_companies.append((name, reason))
+            except Exception:  # noqa: BLE001 - reporting must not fail the run
+                break
+    return list(keep)
+
+
+_JUDGE_ANNOUNCED = []
+
+
+def _announce_judge_gates() -> None:
+    """Say once, in the run log, which of the scorer's own helpers this image lets us reach.
+
+    The run log is the only thing we get back from a sandbox we cannot enter. Whether ``/model`` was there at
+    all decides how to read every judge verdict in this report, so it is the first line of the ICP.
+    """
+
+    if _JUDGE_ANNOUNCED:
+        return
+    _JUDGE_ANNOUNCED.append(True)
+    gates = judge_gates()
+    if gates is None:
+        _log("the scorer source is not reachable in this image: every judge verdict stays unknown")
+        return
+    try:
+        verdicts = gates.self_test()
+        counts = {key: sum(1 for value in verdicts.values() if value == key)
+                  for key in ("pass", "fail", "unknown")}
+        _log("scorer helpers reachable: %s %s" % (json.dumps(counts), json.dumps(verdicts, sort_keys=True)))
+        LAST_REPORT["judge_self_test"] = counts
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - a self-test must never end a run
+        _log("scorer helper self-test failed: %s" % type(exc).__name__)
+
+
+def judge_gates() -> Any:
+    """The scorer's own helpers if the round image carries them, else None (every verdict then stays unknown)."""
+
+    if _judge is None or _strategy_number("judge_gates", 1, 0, 1) < 1:
+        return None
+    try:
+        return _judge if _judge.available() else None
+    except Exception:  # noqa: BLE001 - a bridge that misbehaves is simply absent
+        return None
+
+
+def judge_stage_verdicts(company: Mapping[str, Any]) -> list[Optional[bool]]:
+    """What the scorer's own stage gate says about each company_stage_evidence item we are about to send.
+
+    True/False are its verdict; None means the gate could not be reached, and a caller must not read that as a
+    failure. The judge's investigator calls this with the compacted identity names and the first-party domain set,
+    so we build both here exactly as ``company_evidence_investigator`` does.
+    """
+
+    gates = judge_gates()
+    if gates is None:
+        return []
+    name = str(company.get("company_name") or "")
+    website = str(company.get("company_website") or "")
+    stage = str(company.get("company_stage") or "")
+    out: list[Optional[bool]] = []
+    for item in company.get("company_stage_evidence") or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            out.append(gates.stage_verdict(stage, item.get("quote"), url=item.get("url"), name=name,
+                                           website=website))
+        except Exception:  # noqa: BLE001
+            out.append(None)
+    return out
+
+
+def judge_intent_urls(companies: list, tools: Any) -> dict:
+    """Read every cited intent URL the way the judge classifies a fetch, from pages we already hold.
+
+    `_evaluate_sd_response` is the function that decides whether an intent URL was readable at all; a URL it
+    calls `body_too_short`, `anti_bot_marker` or `js_shell` ends as `intent: unavailable`, which cost the field
+    93 companies that had already cleared every fit dimension on arena-2026-10-14. Nothing is fetched here --
+    only pages this run already paid for are re-read -- and a signal is dropped only when the company has
+    another one left.
+    """
+
+    gates = judge_gates()
+    pages = getattr(tools, "pages", None)
+    if gates is None or not isinstance(pages, Mapping) or not companies:
+        return {}
+    notes: dict[str, str] = {}
+    for company in companies:
+        signals = [s for s in (company.get("intent_signals") or []) if isinstance(s, Mapping)]
+        if len(signals) < 2:
+            continue
+        # The judge's primary intent is the signal whose matched_icp_signal is 0
+        # (`competition.has_verified_primary_intent`), and the paragraph is written from the signals it can
+        # see, so neither the primary nor any signal the paragraph describes may be removed here: a row with
+        # no primary intent cannot score at all, and a paragraph about an event no longer cited fails
+        # `intent_details`. Only an unreadable BONUS signal the paragraph does not lean on is dropped.
+        paragraph = sm.normalize_text(company.get("intent_details") or "")
+        keep = []
+        for signal in signals:
+            url = str(signal.get("url") or "")
+            page = pages.get(url)
+            text = " ".join(str(getattr(page, "text", "") or "").split()) if page is not None else ""
+            if not text:
+                keep.append(signal)
+                continue
+            # Only the two tests that are honest about already-extracted text: `_evaluate_sd_response` calls
+            # anything under 3000 characters a JS shell, which is a rule about raw HTML, not about text.
+            verdict = "" if len(text) >= 300 else "body_too_short"
+            verdict = verdict or (gates.antibot(text) and "anti_bot_marker") or ""
+            primary = signal.get("matched_icp_signal") == 0
+            described = bool(paragraph) and sm.normalize_text(signal.get("description") or "")[:60] in paragraph
+            if verdict and not primary and not described and len(keep) + 1 < len(signals):
+                notes["%s|%s" % (company.get("company_name"), url[:60])] = verdict
+                continue
+            keep.append(signal)
+        if keep and len(keep) != len(signals):
+            company["intent_signals"] = keep
+    if notes:
+        LAST_REPORT["judge_intent_urls"] = notes
+        _log("intent URLs the scorer's fetch classifier would reject: %s" % json.dumps(notes)[:300])
+    return notes
+
+
+def judge_preflight(companies: list, *, schema: str, report: Any = None, tools: Any = None) -> list:
+    """Hand the document to the host's own validators before the sandbox does, and record every verdict.
+
+    Until now we checked our output against ``scorer_mirror.py``, a copy of rules the organizer changes several
+    times a week; a copy is always a round behind, and an output shape we have never seen loses a whole ICP
+    (2026-09-24, when ``contact`` was retired). ``lab_arena.output.output_document_from_bytes`` is the function
+    that will actually read this document. When it rejects the document we find the rows it cannot read, drop
+    them, and validate again: a document the host refuses scores nothing at all, while the remaining rows score
+    normally.
+
+    Nothing is dropped on an unknown verdict, and nothing here raises.
+    """
+
+    gates = judge_gates()
+    if gates is None or not companies:
+        return companies
+    if tools is not None:
+        try:
+            judge_intent_urls(companies, tools)
+        except Exception:  # noqa: BLE001 - a diagnostic must never end a run
+            pass
+    try:
+        LAST_REPORT["judge_gates"] = gates.status()
+        # What the gate says about every item we are about to send. It decides the ORDER of the rows and
+        # nothing else (the conditional rates in `drop_unprovable` say why), but the next round's analysis
+        # starts from this line, so it is written down.
+        LAST_REPORT["judge_stage_items"] = {str(c.get("company_name")): judge_stage_verdicts(c)
+                                            for c in companies}
     except Exception:  # noqa: BLE001
         pass
+    rows = [dict(c) for c in companies]
+    reasons = {}
+    for index, row in enumerate(rows):
+        try:
+            reason = gates.row_reason(row)
+        except Exception:  # noqa: BLE001
+            reason = None
+        if reason:
+            reasons[str(row.get("company_name") or index)] = reason
+    if reasons:
+        LAST_REPORT["judge_row_reasons"] = reasons
+        _log("the scorer's own company model complains about %d row(s): %s"
+             % (len(reasons), json.dumps(reasons)[:400]))
+    try:
+        document = gates.document_reason(rows, schema=schema)
+    except Exception:  # noqa: BLE001
+        document = None
+    if not document:
+        LAST_REPORT["judge_document"] = "accepted" if document == "" else "unknown"
+        return companies
+    LAST_REPORT["judge_document"] = document
+    _log("the host's own output validator REJECTS this document (%s): finding the rows it cannot read" % document[:160])
+    kept, removed = [], []
+    for company, row in zip(companies, rows):
+        if gates.document_reason([row], schema=schema):
+            removed.append(str(row.get("company_name") or ""))
+            continue
+        kept.append(company)
+    if removed and kept and not gates.document_reason([dict(c) for c in kept], schema=schema):
+        LAST_REPORT["judge_document_dropped"] = removed
+        _log("dropped %s; the rest of the document validates" % ", ".join(removed))
+        if report is not None:
+            for name in removed:
+                try:
+                    report.dropped_companies.append((name, "the host's output validator cannot read this row"))
+                except Exception:  # noqa: BLE001
+                    break
+        return kept
+    return companies
+
+
+def checkpoint(companies: list[dict], *, schema: str, limit: int) -> bool:
+    """Publish the current companies as the sandbox's output document, atomically.
+
+    LAB-LOG #308.  agent_entrypoint writes our final return through the same
+    ``lab_arena_checkpoint.write``; writing earlier makes every phase boundary a
+    recoverable state under atomic_checkpoint_45m_v1 (runtime.observe_checkpoint
+    reads the last VALID document at the deadline).  Validated through the mirror
+    first so a checkpoint is never the malformed document that policy discards.
+    Never raises; False means nothing was written.
+
+    LAB-LOG #316 (independent review of #315): an EMPTY list is written when an
+    earlier checkpoint of this run put companies on disk -- the sonar pre-check
+    rejecting the last company must not leave that company as the document a
+    timeout would recover.  It is NOT written when nothing was ever checkpointed:
+    under the checkpoint policy a valid empty document turns a run that RAISES
+    into an accepted zero (runtime: nonzero exit + valid checkpoint = accepted),
+    which would forfeit the confirmation attempt a model_error still earns.
+    """
+
+    if not companies and not LAST_REPORT.get("checkpoints"):
+        return False
+    path = str(os.environ.get("LAB_ARENA_OUTPUT_PATH") or "").strip()
+    if not path.startswith("/"):
+        return False
+    try:
+        rows = sm.validate_output([strip_internal(c) for c in companies], max_companies=max(1, int(limit)),
+                                  schema_version=schema)
+    except Exception as exc:
+        LAST_REPORT.setdefault("checkpoint_errors", []).append(f"validate: {str(exc)[:100]}")
+        return False
+    try:
+        import lab_arena_checkpoint
+    except ImportError:
+        return False
+    try:
+        from pathlib import Path
+
+        lab_arena_checkpoint.write(rows, output_path=Path(path))
+    except Exception as exc:
+        LAST_REPORT.setdefault("checkpoint_errors", []).append(f"write: {type(exc).__name__}")
+        return False
+    LAST_REPORT["checkpoints"] = int(LAST_REPORT.get("checkpoints") or 0) + 1
+    return True
+
+
+def read_quota(tools: Any) -> dict | None:
+    """The SAFE v2 quota read; adopt the real Deepline ceiling and record our spend.
+
+    ⚠️ Only ``include_sourcing_cost=True``.  A failed plain (v1) read marks
+    ``trusted_quota_failure`` on the host, and a non-accepted run after that is an
+    infrastructure failure that cancels the round for every miner (#299, upstream
+    1aa25db8).  The v2 cost read is exempt: bc083c46 keeps its failures out of run
+    health (#307).  Bounded to QUOTA_READS_MAX per run, far under the host's 256.
+    """
+
+    with _QUOTA_READ_LOCK:
+        reads = int(LAST_REPORT.get("quota_reads") or 0)
+        if reads >= QUOTA_READS_MAX:
+            return None
+        LAST_REPORT["quota_reads"] = reads + 1
+    try:
+        import lab_arena_checkpoint
+    except ImportError:
+        return None
+    try:
+        snapshot = lab_arena_checkpoint.quota_usage(include_sourcing_cost=True)
+    except Exception as exc:
+        LAST_REPORT["quota_error"] = type(exc).__name__
+        return None
+    global _LAST_SNAPSHOT
+    _LAST_SNAPSHOT = snapshot if isinstance(snapshot, dict) else _LAST_SNAPSHOT
+    try:
+        LAST_REPORT["quota_adopted"] = tools.adopt_quota(snapshot)
+        cost = snapshot.get("sourcing_cost") if isinstance(snapshot, dict) else None
+        if isinstance(cost, dict):
+            LAST_REPORT["sourcing_cost_usd"] = {
+                k: round(int(cost.get(k) or 0) / 1e6, 4)
+                for k in ("successful_microusd", "success_unresolved_microusd", "settled_microusd")
+                if isinstance(cost.get(k), int)}
+    except Exception:
+        pass
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def confirmed_spend_usd(snapshot: dict | None, tools: Any) -> float:
+    """What the ICP has spent so far: the host's number when readable, else our estimate."""
+
+    cost = snapshot.get("sourcing_cost") if isinstance(snapshot, dict) else None
+    if isinstance(cost, dict):
+        try:
+            return (int(cost.get("successful_microusd") or 0) + int(cost.get("success_unresolved_microusd") or 0)) / 1e6
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(tools.estimated_spend_usd())
+    except Exception:
+        return 0.0
+
+
+def _paid_allowed(tools: Any, estimate_usd: float = 0.0) -> bool:
+    """The LIVE spend decision (#314); a tools object without the guard allows everything."""
+
+    check = getattr(tools, "paid_allowed", None)
+    if not callable(check):
+        return True
+    try:
+        return bool(check(estimate_usd))
+    except Exception:
+        return True
+
+
+def _note_spend(tools: Any, usd: float) -> None:
+    """Tell the ledger about a model-side charge it cannot see."""
+
+    note = getattr(tools, "note_external_spend", None)
+    if callable(note):
+        try:
+            note(usd)
+        except Exception:
+            pass
+
+
+def refresh_spend(tools: Any) -> float:
+    """Re-base the tools' ledger on the host's sourcing_cost when it is readable.
+
+    Returns the spend the run now plans against.  ⚠️ Only the v2 read (read_quota)
+    is used; a failed v1 read cancels the round (#299).  A missing or unreadable
+    snapshot leaves the local estimate in charge.
+    """
+
+    read_started = time.monotonic()
+    reads_before = int(LAST_REPORT.get("quota_reads") or 0)
+    snapshot = read_quota(tools)
+    attempted = int(LAST_REPORT.get("quota_reads") or 0) > reads_before
+    as_of = read_started - SNAPSHOT_CACHE_MARGIN_S
+    pending = getattr(tools, "_pending_read_cutoff", None)
+    if isinstance(pending, (int, float)):
+        as_of = min(as_of, float(pending))
+    spend = confirmed_spend_usd(snapshot, tools)
+    cost = snapshot.get("sourcing_cost") if isinstance(snapshot, dict) else None
+    if not isinstance(cost, dict) and attempted:
+        try:
+            tools._pending_read_cutoff = as_of
+        except Exception:
+            pass
+    if isinstance(cost, dict):
+        settled = snapshot_settled(cost)
+        LAST_REPORT["spend_basis"] = "host_settled" if settled else "host"
+        try:
+            tools._pending_read_cutoff = None
+            if getattr(tools, "_unknown_start", False):
+                tools._unknown_start = False
+                tools.spend_cap_usd = getattr(tools, "_phase_cap_usd", RESEARCH_CAP_USD)
+                LAST_REPORT["unknown_start_resolved"] = True
+        except Exception:
+            pass
+        try:
+            tools.set_confirmed_spend(spend, settled=settled, as_of=as_of)
+        except TypeError:
+            try:
+                tools.set_confirmed_spend(spend)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    else:
+        LAST_REPORT["spend_basis"] = "local"
+    try:
+        spend = float(tools.spend_usd())
+    except Exception:
+        pass
+    LAST_REPORT["spend_usd"] = round(spend, 4)
+    LAST_REPORT["allow_paid"] = _paid_allowed(tools)
+    return spend
+
+
+def snapshot_settled(cost: Mapping[str, Any]) -> bool:
+    """s32 C1: the host number is the whole spend only with no inflight and no success-unresolved calls."""
+
+    try:
+        return int(cost.get("inflight_calls")) == 0 and int(cost.get("success_unresolved_calls")) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def arm_spend_guard(tools: Any) -> float:
+    """s32 C1: research cap + host re-read hook + one read NOW, so a retry sees what earlier attempts spent.
+
+    Codex review-s32e: the sandbox cannot tell a retry from a first attempt, so an UNKNOWN starting balance fails
+    closed -- the cap is $0 (no paid call) until a host read succeeds; every refused call re-reads (10 s cooldown)."""
+
+    try:
+        tools.spend_cap_usd = RESEARCH_CAP_USD
+        tools._phase_cap_usd = RESEARCH_CAP_USD
+        tools.spend_refresh = lambda: refresh_spend(tools)
+    except Exception:
+        pass
+    try:
+        from . import scout as _scout
+
+        _scout.SPEND_GUARD = getattr(tools, "paid_allowed", None)
+        _scout.SPEND_NOTE = getattr(tools, "note_external_spend", None)
+        _scout.SPEND_REFRESH = getattr(tools, "maybe_refresh_spend", None)
+    except Exception:
+        pass
+    spend = refresh_spend(tools)
+    for _ in range(START_READ_RETRIES):
+        if str(LAST_REPORT.get("spend_basis") or "").startswith("host"):
+            break
+        time.sleep(START_READ_BACKOFF_S)
+        spend = refresh_spend(tools)
+    if not str(LAST_REPORT.get("spend_basis") or "").startswith("host"):
+        LAST_REPORT["spend_basis"] = "unknown_start"
+        try:
+            tools.spend_cap_usd = 0.0
+            tools._unknown_start = True
+        except Exception:
+            pass
+    try:
+        tools._last_spend_refresh = time.monotonic()
+    except Exception:
+        pass
+    LAST_REPORT["start_spend_usd"] = round(float(spend), 4)
+    apply_cost_policy(tools, _LAST_SNAPSHOT)
+    LAST_REPORT["caps_usd"] = {"research": RESEARCH_CAP_USD, "total": ICP_SPEND_CAP_USD}
+    return spend
+
+
+def flat_policy(snapshot: Any) -> bool:
+    """The round froze the flat $4 per-ICP cost policy (or a local test forces it)."""
+
+    if FLAT_FORCE:
+        return True
+    cost = snapshot.get("sourcing_cost") if isinstance(snapshot, dict) else None
+    try:
+        return int((cost or {}).get("per_qualified_pair_cap_microusd")) >= FLAT_POLICY_PAIR_CAP_MICROUSD
+    except (TypeError, ValueError):
+        return False
+
+
+def apply_cost_policy(tools: Any, snapshot: Any) -> None:
+    """Under the flat policy, lift the per-ICP caps to FLAT_ICP_CAP_USD and open what the old $0.72 kept shut: the
+    scout's own budget, the second discovery pass, LinkedIn look-ups and, on a round without a Deepline call quota,
+    the call ceiling. Under the old policy nothing changes."""
+
+    global ICP_SPEND_CAP_USD, RESEARCH_CAP_USD, RESERVE_DRAFTS, REVERIFY_MAX_COMPANIES, POOL_CHECKED, DEPTH_RANK
+    global AGENT_SHARE, AGENT_SHARE_V5, AGENT_LONG_SECONDS, REVERIFY_ASKS
+    if FLAT_ICP_CAP_USD <= 0 or not flat_policy(snapshot):
+        LAST_REPORT["cost_policy"] = "per_qualified"
+        return
+    ICP_SPEND_CAP_USD = max(ICP_SPEND_CAP_USD, FLAT_ICP_CAP_USD)
+    RESEARCH_CAP_USD = round(max(0.0, ICP_SPEND_CAP_USD - FLAT_HOLDBACK_USD), 4)
+    try:
+        tools._phase_cap_usd = RESEARCH_CAP_USD
+        if not getattr(tools, "_unknown_start", False):
+            tools.spend_cap_usd = RESEARCH_CAP_USD
+        deepline = ((snapshot or {}).get("providers") or {}).get("deepline") or {}
+        if FLAT_FORCE or (deepline.get("limit") == 0 and deepline.get("remaining") is None):
+            tools.call_budget = max(int(getattr(tools, "call_budget", 0) or 0), FLAT_CALL_BUDGET)
+    except Exception:
+        pass
+    try:
+        _scout = _sibling_module("scout")
+        _scout.BUDGET_USD = max(_scout.BUDGET_USD, ICP_SPEND_CAP_USD)
+        _scout.LINKEDIN_SEARCH_MAX = max(_scout.LINKEDIN_SEARCH_MAX, 20)
+        if _strategy_number("flat_second_pass", 1, 0, 1) >= 1:
+            _scout.SECOND_PASS = True
+        if _strategy_number("flat_sonar_seed", 0, 0, 1) >= 1:
+            _scout.SEED_LANE = True
+        # s59: a company whose headquarters country is unknown is kept and ranked last (scout.HQ_UNKNOWN_KEEP).
+        if _strategy_number("flat_hq_unknown_keep", 1, 0, 1) >= 1:
+            _scout.HQ_UNKNOWN_KEEP = True
+        # s61: one dated search for a candidate's own primary event before dropping it (scout.retry_primary_event).
+        if _strategy_number("flat_event_retry", 1, 0, 1) >= 1:
+            _scout.EVENT_RETRY = True
+        _sf = _sibling_module("stagefirst")
+        if _strategy_number("flat_wide_all", 0, 0, 1) >= 1:
+            _sf.WIDE_CATEGORIES = frozenset()
+        # 2026-10-19 Hardware Series B replay under the flat cap: the stage-first lane found Lumotive (the field's one
+        # qualifier) 18th by round date, and its event search stops at 12 companies, so Lumotive never got one.
+        _sf.MAX_COMPANIES = max(_sf.MAX_COMPANIES, FLAT_EVENT_COMPANIES)
+        _sf.LATE_COMPANIES = max(_sf.LATE_COMPANIES, FLAT_EVENT_COMPANIES)
+        _sf.EVENT_RESULTS = max(_sf.EVENT_RESULTS, 10)   # flat-priced up to ten results
+        _scout.MAX_CANDIDATES = max(_scout.MAX_CANDIDATES, FLAT_CANDIDATES)
+        _scout.EXTRACT_MAX_ROWS = max(_scout.EXTRACT_MAX_ROWS, FLAT_EXTRACT_ROWS)
+        _sf.STAGE_CANDIDATES = max(_sf.STAGE_CANDIDATES, FLAT_CANDIDATES)
+    except Exception as exc:  # noqa: BLE001 - recorded, so a silent half-applied policy shows in the report
+        LAST_REPORT["cost_policy_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    RESERVE_DRAFTS = max(RESERVE_DRAFTS, FLAT_RESERVE_DRAFTS)
+    if _strategy_number("flat_pool", 1, 0, 1) >= 1:
+        POOL_CHECKED = max(POOL_CHECKED, FLAT_POOL_CHECKED)
+        REVERIFY_MAX_COMPANIES = max(REVERIFY_MAX_COMPANIES, FLAT_POOL_CHECKED)
+    if _strategy_number("flat_depth_rank", 0, 0, 1) >= 1:
+        DEPTH_RANK = True
+    AGENT_SHARE = max(AGENT_SHARE, FLAT_AGENT_SHARE)
+    AGENT_SHARE_V5 = max(AGENT_SHARE_V5, FLAT_AGENT_SHARE)
+    AGENT_LONG_SECONDS = max(AGENT_LONG_SECONDS, FLAT_AGENT_LONG_SECONDS)
+    REVERIFY_ASKS = max(REVERIFY_ASKS, FLAT_REVERIFY_ASKS)
+    LAST_REPORT["cost_policy"] = "flat"
+
+
+def fit_free_policy(icp: Any) -> bool:
+    """The round penalizes only proven fit mismatches (see FIT_FREE_FROM), or a local test forces it."""
+
+    if FIT_FREE_FORCE:
+        return True
+    match = re.match(r"icp_(\d{8})_", str((icp or {}).get("icp_id") or "") if isinstance(icp, Mapping) else "")
+    return bool(match) and FIT_FREE_FROM.isdigit() and len(FIT_FREE_FROM) == 8 and match.group(1) >= FIT_FREE_FROM
+
+
+_EMIT_GATE_SHIPPED: Optional[bool] = None
+
+
+def apply_fit_policy(icp: Any) -> None:
+    """Under fit-receipt penalties, keep the rows the attribute/stage gates would withhold; else ship as configured."""
+
+    global EMIT_GATE, FIT_FREE, _EMIT_GATE_SHIPPED
+    if _EMIT_GATE_SHIPPED is None:
+        _EMIT_GATE_SHIPPED = EMIT_GATE
+    FIT_FREE = fit_free_policy(icp) and _strategy_number("fit_free_gates_off", 1, 0, 1) >= 1
+    EMIT_GATE = bool(_EMIT_GATE_SHIPPED) and not FIT_FREE
+    try:
+        _px = _sibling_module("precision")
+        _px.FIT_FREE = FIT_FREE
+    except Exception as exc:  # noqa: BLE001 - recorded, so a half-applied policy shows in the report
+        LAST_REPORT["fit_policy_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    try:   # o3: parked drafts and extra discovery passes in the scout
+        _sc = _sibling_module("scout")
+        _sc.FIT_FREE = FIT_FREE
+        _sc.DISCOVERY_PASSES = DISCOVERY_PASSES if FIT_FREE else 1
+    except Exception as exc:  # noqa: BLE001
+        LAST_REPORT["fit_policy_scout_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    LAST_REPORT["fit_policy"] = "free" if FIT_FREE else "penalized"
+
+
+def evidence_depth(row: Mapping[str, Any]) -> tuple[int, int, int]:
+    """(two-plus stage proofs and five-plus distinct evidence URLs, stage proofs, distinct URLs): the depth-times-
+    breadth reading of a row, highest first."""
+
+    def bare(url: Any) -> str:
+        return str(url or "").split("#")[0].rstrip("/")
+
+    stage = [bare(i.get("url")) for i in row.get("company_stage_evidence") or [] if isinstance(i, Mapping) and i.get("url")]
+    urls = set(stage)
+    urls |= {bare(i.get("url")) for i in row.get("intent_signals") or [] if isinstance(i, Mapping) and i.get("url")}
+    attribute = row.get("required_attribute")
+    if isinstance(attribute, Mapping) and attribute.get("evidence_url"):
+        urls.add(bare(attribute["evidence_url"]))
+    urls.discard("")
+    return (int(len(stage) >= 2) + int(len(urls) >= 5), len(stage), len(urls))
+
+
+def _sibling_module(name: str) -> Any:
+    """A bundle module by name whether the harness was loaded as a package member or by its file path (the round's
+    runner does the latter, where a relative import raises ImportError)."""
+
+    try:
+        return importlib.import_module("." + name, __package__) if __package__ else importlib.import_module(
+            f"{os.path.basename(_HERE)}.{name}")
+    except ImportError:
+        return importlib.import_module(f"{os.path.basename(_HERE)}.{name}")
+
+
+def release_holdback(tools: Any) -> None:
+    """s32 C1: the paragraph and final re-checks may use the holdback, never more than the total."""
+
+    try:
+        tools._phase_cap_usd = ICP_SPEND_CAP_USD
+        if not getattr(tools, "_unknown_start", False):
+            tools.spend_cap_usd = ICP_SPEND_CAP_USD
+    except Exception:
+        pass
+
+
+def draft_limit(limit: int) -> int:
+    """How many drafts research may return: the public cap plus the reserve (#314 §5)."""
+
+    return max(1, int(limit)) + max(0, int(RESERVE_DRAFTS))
+
+
+def completion_plan(spend_usd: float, have: int, left: int) -> dict[str, Any]:
+    """The eligibility zone the remaining paid work may aim for (campaign H2).
+
+    ``have`` companies already hold a contact, ``left`` can still get one.  Zone 1: one pair suffices,
+    so spend may rise to $0.80 minus the completion reserve.  Zone 2 (bounded rescue): settled spend
+    already rules out one-pair eligibility, at least two companies can still complete, and two completions
+    fit under $1.60.  Zone 0: no affordable route -- no more paid work; the valid output stays.
+    Two required pairs with fewer than two attainable companies is never a plan.
+    """
+
+    spend = max(0.0, float(spend_usd or 0.0))
+    have, left = max(0, int(have)), max(0, int(left))
+    attainable = have + left
+    need_new = 0 if have > 0 else 1
+    base = max(1, have)
+    zone = 0
+    if attainable >= 1 and spend + need_new * MIN_CONTACT_USD + COMPLETION_RESERVE_USD <= base * PAIR_ALLOWANCE_USD + 1e-9:
+        zone = base
+    else:
+        for pairs in range(max(2, have + 1), min(attainable, MAX_PAIRS) + 1):
+            if spend + (pairs - have) * MIN_CONTACT_USD + COMPLETION_RESERVE_USD <= pairs * PAIR_ALLOWANCE_USD + 1e-9:
+                zone = pairs
+                break
+    cap = round(zone * PAIR_ALLOWANCE_USD, 4)
+    return {"zone": zone, "spend_usd": round(spend, 4), "have": int(have), "left": int(left),
+            "cap_usd": cap, "contact_cap_usd": round(max(spend, cap - COMPLETION_RESERVE_USD), 4) if zone else round(spend, 4),
+            "pairs_required": zone, "proven_infeasible": zone == 0 and attainable >= 1}
+
+
+def _apply_plan(tools: Any, plan: Mapping[str, Any], *, phase: str) -> None:
+    try:
+        tools.spend_cap_usd = min(ICP_SPEND_CAP_USD, float(plan["contact_cap_usd"] if phase == "contacts" else plan["cap_usd"]))
+    except Exception:
+        pass
+
+
+def attach_contacts(companies: list[dict], icp: dict, tools: Any, *, deadline: float,
+                    allow_paid: bool = True, checkpoint_fn: Any = None, planner: Any = None) -> dict[str, Any]:
+    """Phase B: one verified contact per company, in place; bounded by the deadline.
+
+    ``allow_paid`` is the phase's ceiling; the LIVE decision is taken again before
+    every company from the tools' spend guard (#314 §1), and every attached contact
+    is checkpointed at once through ``checkpoint_fn`` (#314 §6) so a kill after the
+    first contact keeps that contact.
+    """
+
+    notes: dict[str, Any] = {"attempted": 0, "attached": 0, "details": {}}
+    for company in companies:
+        if company.get("contact"):
+            continue
+        if time.monotonic() >= deadline - 5.0:
+            notes["stopped"] = "deadline"
+            break
+        if callable(planner):
+            planner_ok = planner(companies, company)
+        else:
+            planner_ok = True
+        paid_now = bool(allow_paid) and planner_ok and _paid_allowed(tools)
+        notes["attempted"] += 1
+        try:
+            claim, detail = contacts_module.find_contact(company, icp, tools, candidates=CONTACT_CANDIDATES,
+                                                         deadline=deadline, allow_paid=paid_now)
+        except Exception as exc:
+            claim, detail = None, {"error": f"{type(exc).__name__}: {str(exc)[:80]}"}
+        notes["details"][str(company.get("company_name") or "?")[:60]] = detail
+        if claim:
+            company["contact"] = claim
+            notes["attached"] += 1
+            if callable(checkpoint_fn):
+                try:
+                    checkpoint_fn()
+                except Exception:
+                    pass
+        if detail.get("stopped") == "budget":
+            notes["stopped"] = "budget"
+            break
+    return notes
+
+
+def fill_contacts_from_reserve(companies: list[dict], report: Any, icp: dict, tools: Any, *,
+                               deadline: float, limit: int, schema: str,
+                               checkpoint_fn: Any = None, exclude: Optional[set[str]] = None) -> dict[str, Any]:
+    """Replace a company that found no contact with a verified reserve company that has one.
+
+    LAB-LOG #314 §5.  ``report.surplus`` holds every company that passed the FULL
+    local verification and lost only to the ``limit`` truncation (each validated
+    alone).  Under contacts_v1 a row without a contact scores 0, so a reserve
+    company WITH a contact is strictly better in that slot.  Rules: the reserve
+    company must not share a name or host with anything emitted; the emitted list
+    never exceeds ``limit``; the swapped-in row goes LAST (model order is scoring
+    order -- backfill_empty_slots explains why); a reserve company that finds no
+    contact either is left out; the contactless company stays when nothing
+    replaces it.  Bounded by the deadline and the live spend guard.
+    """
+
+    notes: dict[str, Any] = {"missing": 0, "tried": 0, "swapped": []}
+    missing = [c for c in companies if not c.get("contact")]
+    notes["missing"] = len(missing)
+    pool = [c for c in list(getattr(report, "surplus", None) or []) if isinstance(c, dict)]
+    if not missing or not pool:
+        return notes
+    keys = {sm.company_name_key(c.get("company_name")) for c in companies}
+    hosts = {sm.registrable_host(str(c.get("company_website") or "")) for c in companies}
+    banned = set(exclude or ())
+    for candidate in pool:
+        if not missing:
+            break
+        if time.monotonic() >= deadline - 10.0:
+            notes["stopped"] = "deadline"
+            break
+        if not _paid_allowed(tools):
+            notes["stopped"] = "budget"
+            break
+        key = sm.company_name_key(candidate.get("company_name"))
+        host = sm.registrable_host(str(candidate.get("company_website") or ""))
+        if key in keys or (host and host in hosts) or (banned & identity_keys(candidate)):
+            continue
+        notes["tried"] += 1
+        original = candidate
+        try:
+            claim, detail = contacts_module.find_contact(candidate, icp, tools, candidates=CONTACT_CANDIDATES,
+                                                         deadline=deadline, allow_paid=True)
+        except Exception as exc:
+            claim, detail = None, {"error": f"{type(exc).__name__}: {str(exc)[:80]}"}
+        if not claim:
+            if detail.get("stopped") == "budget":
+                notes["stopped"] = "budget"
+                break
+            continue
+        candidate = dict(candidate)
+        candidate["contact"] = claim
+        dropped = missing.pop(0)
+        trial = [c for c in companies if c is not dropped] + [candidate]
+        try:
+            sm.validate_output([strip_internal(c) for c in trial], max_companies=max(1, int(limit)),
+                               schema_version=schema)
+        except Exception as exc:
+            notes.setdefault("refused", []).append(
+                f"{str(candidate.get('company_name') or '?')[:40]}: {str(exc)[:60]}")
+            missing.insert(0, dropped)
+            continue
+        companies[:] = trial
+        keys.add(key)
+        hosts.add(host)
+        try:
+            report.surplus = [c for c in report.surplus if c is not original]
+        except Exception:
+            pass
+        notes["swapped"].append({"out": str(dropped.get("company_name") or "")[:60],
+                                 "in": str(candidate.get("company_name") or "")[:60]})
+        if callable(checkpoint_fn):
+            try:
+                checkpoint_fn()
+            except Exception:
+                pass
+    return notes
+
+
+def run_icp(icp: dict) -> list[dict]:
+    """Return up to LAB_ARENA_COMPANY_LIMIT verified companies, best first."""
+
+    started = time.monotonic()
+    if not isinstance(icp, dict):
+        raise TypeError("icp must be a dict")
+    limit = _company_limit()
+    LAST_REPORT.clear()
+    LAST_REPORT.update({"icp_id": icp.get("icp_id"), "limit": limit})
+    apply_fit_policy(icp)
+    if _yieldmap is not None:
+        try:
+            LAST_REPORT["icp_prior"] = {"prior": round(_yieldmap.prior(icp), 4), "pays": _yieldmap.pays(icp),
+                                        "industry": icp.get("industry"), "stage": icp.get("company_stage"),
+                                        "category": icp.get("intent_category")}
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never end a run
+            LAST_REPORT["icp_prior"] = {"error": f"{type(exc).__name__}: {str(exc)[:80]}"}
+    else:
+        LAST_REPORT["icp_prior"] = {"error": "yieldmap unavailable"}
+    _announce_judge_gates()
+
+    try:
+        skip = SKIP_PRIVATE_EQUITY and sm.normalize_stage(icp.get("company_stage")) == "private equity"
+    except Exception:
+        skip = False
+    if skip:
+        _log("Private Equity ICP: research not started (skip_private_equity=1)")
+        LAST_REPORT["skipped"] = "private_equity"
+        _emit_report()
+        return []
+
+    socket_path = str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip()
+    if not socket_path and not os.environ.get("ARENA_TOOLS_FACTORY"):
+        _log("no LAB_ARENA_WORKER_SOCKET; returning an empty result")
+        LAST_REPORT["error"] = "no worker socket"
+        return []
+
+    tools_factory = _tools_factory()
+    tools = tools_factory()
+    arm_spend_guard(tools)
+    try:
+        from . import role_judge as _role_judge
+
+        tools.role_classifier = lambda title, targets, seniority, duties: _role_judge.classify(
+            title, targets, seniority, duties, http_client_factory=_http_client_factory())
+    except Exception:
+        pass
+    diagnostics.reset()
+    agent_exc: BaseException | None = None
+    companies: list[dict[str, Any]] = []
+    schema = announced_schema(icp)
+    v5 = sm.v5_family(schema)
+    contacts_on = (v5 and CONTACTS_ENABLED and str(icp.get("contact_policy") or "") == "contacts_v1"
+                   and contacts_module is not None)
+    paragraph_on = v5 and PARAGRAPH_ENABLED
+    clock = plan_clock()
+    horizon = clock["horizon"]
+    short_clock = clock["short"]
+    short_deadline = started + short_clock - SAFETY_SECONDS
+    phase_deadline = (started + horizon - SAFETY_SECONDS) if clock["long"] else short_deadline
+    LAST_REPORT.update({"schema": schema, "contacts": contacts_on, "paragraph": paragraph_on,
+                        "short_clock": short_clock, "horizon": horizon,
+                        "clock_source": clock["source"], "announced_clock": clock["announced"],
+                        "long_path": clock["long"]})
+    try:
+        share = AGENT_SHARE_V5 if (contacts_on or paragraph_on) else AGENT_SHARE
+        budget = short_clock - SAFETY_SECONDS - (time.monotonic() - started)
+        agent_timeout = max(30.0, budget * share)
+        if clock["long"]:
+            agent_timeout = max(agent_timeout, min(AGENT_LONG_SECONDS, (horizon - SAFETY_SECONDS) * share))
+        LAST_REPORT["agent_timeout"] = round(agent_timeout, 1)
+        drafts: list[dict[str, Any]] = []
+        agent_module = _agent_module()
+        tools.deadline = time.monotonic() + max(20.0, agent_timeout - 35.0)
+        LAST_REPORT["draft_limit"] = draft_limit(limit)
+        mode = str(_STRATEGY.get("research_mode") or "agent")
+        LAST_REPORT["research_mode"] = mode
+        if mode in ("scout", "hybrid"):
+            try:
+                from . import scout as scout_module
+            except ImportError:
+                import importlib
+
+                scout_module = importlib.import_module(f"{os.path.basename(_HERE)}.scout")
+            try:
+                drafts = scout_module.run_scout(icp, tools, limit=draft_limit(limit), run_timeout=agent_timeout,
+                                                http_client_factory=_http_client_factory())
+            except Exception as exc:
+                _log(f"scout failed: {type(exc).__name__}: {str(exc)[:200]}")
+                LAST_REPORT["scout_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                agent_exc = exc
+            LAST_REPORT["scout"] = dict(getattr(scout_module, "LAST", {}) or {})
+        if mode == "agent" or (mode == "hybrid" and len(drafts) < 2 and time.monotonic() < tools.deadline - 60.0):
+            try:
+                found = agent_module.run_agent(icp, tools, limit=draft_limit(limit), run_timeout=agent_timeout,
+                                               http_client_factory=_http_client_factory())
+                seen_keys = {sm_keys for d in drafts for sm_keys in identity_keys(d)}
+                drafts = drafts + [d for d in found if not (identity_keys(d) & seen_keys)]
+            except Exception as exc:
+                _log(f"agent failed: {type(exc).__name__}: {str(exc)[:200]}")
+                LAST_REPORT["agent_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                agent_exc = exc
+        LAST_REPORT["drafts"] = len(drafts)
+        LAST_REPORT["agent_seconds"] = round(time.monotonic() - started, 1)
+        try:
+            meter = agent_module.LAST_USAGE.get("platform_meter_usd")
+            LAST_REPORT["platform_meter_usd"] = meter
+            if isinstance(meter, (int, float)) and not isinstance(meter, bool):
+                _note_spend(tools, float(meter))
+        except Exception:
+            pass
+        if not drafts:
+            LAST_REPORT["funnel"] = _funnel(tools, drafted=0, verify_out=None, reverify_out=None,
+                                            returned=0, terminal="no_drafts")
+            _write_empty_snapshot(icp, tools, getattr(agent_module, "LAST_USAGE", None))
+            return _no_companies(agent_exc, tools)
+        tools.deadline = max(verification_deadline(started), phase_deadline)
+        companies, report = verify_companies(drafts, icp=icp, tools=tools, limit=limit, schema=schema)
+        LAST_REPORT["verify"] = report.as_dict()
+        checkpoint(companies, schema=schema, limit=limit)
+        allow_paid = _paid_allowed(tools)
+        if companies:
+            refresh_spend(tools)
+            allow_paid = _paid_allowed(tools)
+
+        def write_checkpoint() -> bool:
+            return checkpoint(companies, schema=schema, limit=limit)
+
+        rejected: set[str] = set()
+
+        plans: list[dict[str, Any]] = []
+
+        def planner(rows: list[dict], current: Any = None) -> bool:
+            """campaign H2: re-plan from the host-confirmed spend before each paid contact attempt."""
+            spend = refresh_spend(tools)
+            have = sum(1 for c in rows if c.get("contact"))
+            left = sum(1 for c in rows if not c.get("contact"))
+            plan = completion_plan(spend, have, left)
+            plan["before"] = str((current or {}).get("company_name") or "")[:60] if isinstance(current, dict) else ""
+            plans.append(plan)
+            _apply_plan(tools, plan, phase="contacts")
+            LAST_REPORT["completion_plans"] = plans
+            return plan["zone"] > 0
+
+        if companies and contacts_on:
+            saved_timeout = tools.timeout
+            tools.timeout = min(saved_timeout, 35.0)
+            tools.deadline = phase_deadline
+            try:
+                allow_paid = planner(companies) and allow_paid
+                LAST_REPORT["contacts_phase"] = attach_contacts(companies, icp, tools, deadline=phase_deadline,
+                                                                allow_paid=allow_paid, checkpoint_fn=write_checkpoint,
+                                                                planner=planner)
+                if any(not c.get("contact") for c in companies) and time.monotonic() < phase_deadline - 20.0:
+                    LAST_REPORT["reserve_phase"] = fill_contacts_from_reserve(
+                        companies, report, icp, tools, deadline=phase_deadline, limit=limit, schema=schema,
+                        checkpoint_fn=write_checkpoint, exclude=rejected)
+            finally:
+                tools.timeout = saved_timeout
+            checkpoint(companies, schema=schema, limit=limit)
+            spend_now = refresh_spend(tools)
+            final_plan = completion_plan(spend_now, sum(1 for c in companies if c.get("contact")), 0)
+            final_plan["before"] = "paragraph"
+            plans.append(final_plan)
+            LAST_REPORT["completion_plans"] = plans
+            _apply_plan(tools, final_plan, phase="completion")
+            allow_paid = _paid_allowed(tools)
+            LAST_REPORT["completion_state"] = [
+                {"company": str(c.get("company_name") or "")[:60], "fit_intent": "verified_local",
+                 "contact": "complete" if c.get("contact") else "missing",
+                 "state": "awaiting_paragraph" if c.get("contact") else "incomplete_no_contact"}
+                for c in companies]
+        if companies and ATS_BONUS and time.monotonic() < phase_deadline - 60.0:
+            try:
+                try:
+                    from . import ats_bonus as _ats
+                except ImportError:
+                    _ats = importlib.import_module(f"{os.path.basename(_HERE)}.ats_bonus")
+                try:
+                    from . import scout as _scout_llm
+                except ImportError:
+                    _scout_llm = importlib.import_module(f"{os.path.basename(_HERE)}.scout")
+                _factory = _http_client_factory()
+
+                def _pick_llm(prompt: str, deadline: float) -> Any:
+                    return _scout_llm.llm_json(prompt, http_client_factory=_factory, max_tokens=200,
+                                               model=ATS_PICK_MODEL, deadline=deadline)
+
+                LAST_REPORT["ats_bonus"] = _ats.attach_hiring_signals(
+                    companies, icp, report.evidence, sm.company_name_key, today=sm.evaluation_date(),
+                    deadline=min(phase_deadline - 45.0, time.monotonic() + ATS_BONUS_SECONDS), llm_json=_pick_llm)
+                for c in companies:
+                    key = sm.company_name_key(str(c.get("company_name") or ""))
+                    if paragraph_on and key in report.evidence:
+                        c["intent_details"] = details_module.fallback_paragraph(
+                            company_name=str(c.get("company_name") or ""), icp=icp, signals=report.evidence[key])
+                checkpoint(companies, schema=schema, limit=limit)
+            except Exception as exc:
+                LAST_REPORT["ats_bonus"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        release_holdback(tools)
+        if companies and paragraph_on:
+            remaining_short = phase_deadline - time.monotonic()
+            if not _paid_allowed(tools, PARAGRAPH_MAX_USD):
+                LAST_REPORT["paragraph_phase"] = {"skipped": "spend cap; deterministic paragraphs stand"}
+            elif remaining_short > 30.0:
+                _agent_for_model = _agent_module()
+                model_name = str(_STRATEGY.get("paragraph_model") or "").strip() or \
+                    os.environ.get("ARENA_MODEL", str(_STRATEGY.get("model") or "")).strip() or _agent_for_model.DEFAULT_MODEL
+                reserve = [c for c in list(getattr(report, "surplus", None) or [])[:RESERVE_CHECKED] if isinstance(c, dict)]
+                LAST_REPORT["paragraph_phase"] = details_module.write_paragraphs(
+                    companies + reserve, icp, evidence=report.evidence, model_name=model_name,
+                    timeout=min(60.0, remaining_short - 15.0), http_client_factory=_http_client_factory())
+                billed = (LAST_REPORT.get("paragraph_phase") or {}).get("cost_usd")
+                _note_spend(tools, max(PARAGRAPH_MAX_USD, float(billed) if isinstance(billed, (int, float)) else 0.0))
+                checkpoint(companies, schema=schema, limit=limit)
+                refresh_spend(tools)
+            else:
+                LAST_REPORT["paragraph_phase"] = {"skipped": "no time; deterministic paragraphs stand"}
+        try:
+            counts = getattr(report, "counts", None)
+            if callable(counts):
+                LAST_REPORT["verify_counts"] = counts()
+        except Exception:
+            pass
+        verify_out = len(companies)
+        remaining = phase_deadline - time.monotonic()
+        pool = list(companies)
+        pool_keys = {k for c in pool for k in identity_keys(c)}
+        for extra in list(getattr(report, "surplus", None) or [])[:POOL_CHECKED or RESERVE_CHECKED]:
+            if isinstance(extra, dict) and not (identity_keys(extra) & pool_keys):
+                pool.append(extra)
+                pool_keys |= identity_keys(extra)
+        if DEPTH_RANK:
+            # Stable: equal depth keeps verify's order, so the emitted rows still lead their tier.
+            pool.sort(key=evidence_depth, reverse=True)
+            LAST_REPORT["depth_ranked"] = [str(c.get("company_name") or "?") for c in pool[:12]]
+        # As many as the money left allows, the emitted rows first (they lead the pool). The all-or-nothing gate
+        # skipped the whole check on 2026-10-18's wide stage-first run: research had reached its cap, 8 companies
+        # did not fit, and five rows went out unchecked when the holdback covered all five of them.
+        reverify_n = min(len(pool), REVERIFY_MAX_COMPANIES)
+        while reverify_n > 1 and not _paid_allowed(tools, REVERIFY_EST_USD * reverify_n * REVERIFY_ASKS):
+            reverify_n -= 1
+        reverify_est = REVERIFY_EST_USD * reverify_n * REVERIFY_ASKS
+        if companies and not _paid_allowed(tools, reverify_est):
+            LAST_REPORT["reverify_skipped"] = {"reason": "spend cap", "estimate_usd": round(reverify_est, 4)}
+        elif companies and remaining > 40.0 and str(os.environ.get("ARENA_REVERIFY", "1")).strip() != "0":
+            try:
+                try:
+                    from . import reverify as reverify_module
+                except ImportError:
+                    reverify_module = importlib.import_module(f"{os.path.basename(_HERE)}.reverify")
+                head = pool[:reverify_n]
+                tail = companies[reverify_n:]
+                mirror_key = None
+                if JUDGE_MIRROR and phase_deadline - time.monotonic() > 120.0:
+                    try:
+                        try:
+                            from . import judgemirror as _jm
+                            from . import scout as _scout_jm
+                        except ImportError:
+                            _jm = importlib.import_module(f"{os.path.basename(_HERE)}.judgemirror")
+                            _scout_jm = importlib.import_module(f"{os.path.basename(_HERE)}.scout")
+                        _jm_factory = _http_client_factory()
+
+                        def _jm_llm(prompt: str, **kw: Any) -> Any:
+                            return _scout_jm.llm_json(prompt, http_client_factory=_jm_factory, **kw)
+
+                        LAST_REPORT["judge_mirror"] = _jm.grade(
+                            head, icp, llm_json=_jm_llm,
+                            deadline=min(phase_deadline - 60.0, time.monotonic() + 90.0))
+                        _note_spend(tools, 0.01)
+                        mirror_key = _jm.order_key
+                    except Exception as exc:  # noqa: BLE001 - grading is optional
+                        LAST_REPORT["judge_mirror"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+                checked, notes = reverify_module.rerank(
+                    head, icp, http_client_factory=_http_client_factory(),
+                    timeout=min(reverify_module.TIMEOUT_S, phase_deadline - time.monotonic() - 12.0),
+                    asks=REVERIFY_ASKS, order_key=mirror_key)
+                _note_spend(tools, REVERIFY_EST_USD * len(head) * REVERIFY_ASKS)
+                survivors = {id(c) for c in checked}
+                # o3: only rows the re-check actually dropped are rejected. rerank builds a new dict when it adopts
+                # the observed name, so the old id test also rejected every renamed survivor (sn71-ab-f0: "artifact"
+                # with a match verdict) and kept its identity out of every later refill.
+                entries = notes.get("companies") or []
+                if len(entries) == len(head):
+                    evicted_rows = [row for row, entry in zip(head, entries)
+                                    if isinstance(entry, Mapping) and entry.get("dropped")]
+                else:
+                    kept_keys = {k for c in checked for k in identity_keys(c)}
+                    evicted_rows = [c for c in head if id(c) not in survivors and not (identity_keys(c) & kept_keys)]
+                for evicted in evicted_rows:
+                    rejected |= identity_keys(evicted)
+                if rejected:
+                    notes["rejected_identities"] = sorted(rejected)
+                companies = (checked + tail)[:limit]
+                try:
+                    companies = sm.validate_output(companies, max_companies=limit, schema_version=schema)
+                except Exception as exc:
+                    notes["pool_rejected"] = type(exc).__name__
+                    companies = [c for c in checked if any(c is x for x in pool[:verify_out])][:limit] or pool[:verify_out]
+                notes["checked"] = len(head)
+                notes["unchecked_tail"] = len(tail)
+                companies, added = backfill_empty_slots(companies, report, limit=limit, schema=schema,
+                                                        exclude=rejected)
+                # The floor decides how many companions a confident row can afford beside it; see
+                # precision.confident_only. Applied after the re-check, which is where its verdicts exist, and
+                # after the backfill, so a slot the re-check emptied is refilled before the count is taken.
+                try:
+                    try:
+                        from . import precision as _px
+                    except ImportError:
+                        _px = importlib.import_module(f"{os.path.basename(_HERE)}.precision")
+                    verdicts = {str(row.get("company")): str(row.get("overall"))
+                                for row in (notes.get("companies") or []) if isinstance(row, Mapping)}
+                    kept, withheld = _px.confident_only(companies, verdicts)
+                    if withheld and kept:
+                        companies = kept
+                        notes["confident_only"] = [str(c.get("company_name") or "?") for c, _ in withheld]
+                except Exception as exc:  # noqa: BLE001 - a pricing rule must never empty the output
+                    notes["confident_only_error"] = type(exc).__name__
+                if added:
+                    notes["backfilled"] = added
+                    if contacts_on and time.monotonic() < phase_deadline - 20.0:
+                        attach_contacts([c for c in companies if not c.get("contact")], icp, tools,
+                                        deadline=phase_deadline, allow_paid=_paid_allowed(tools),
+                                        checkpoint_fn=write_checkpoint)
+                if not companies and getattr(report, "companions", None):
+                    # Loop v5 (companion_drop): the re-check emptied the list, so no strong row is left and the rows
+                    # set aside beside it cost nothing again; they go out as they would have before the drop.
+                    try:
+                        back = [c for c in report.companions if isinstance(c, dict) and not (identity_keys(c) & rejected)]
+                        companies = sm.validate_output(back[:limit], max_companies=limit, schema_version=schema)
+                        notes["companions_restored"] = [str(c.get("company_name") or "") for c in companies]
+                    except Exception:
+                        companies = []
+                LAST_REPORT["reverify"] = notes
+                _REVERIFY_MATCHED.clear()
+                _REVERIFY_MATCHED.update(
+                    sm.company_name_key(entry.get("company")) for entry in (notes.get("companies") or [])
+                    if isinstance(entry, Mapping) and entry.get("overall") == "match")
+                checkpoint(companies, schema=schema, limit=limit)
+                refresh_spend(tools)
+            except Exception as exc:
+                LAST_REPORT["reverify"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        if clock["long"] and companies:
+            long_deadline = phase_deadline
+            tools.deadline = long_deadline
+            missing = [c for c in companies if contacts_on and not c.get("contact")]
+            if missing and _paid_allowed(tools) and time.monotonic() < long_deadline - 60.0:
+                LAST_REPORT["contacts_phase_d"] = attach_contacts(missing, icp, tools, deadline=long_deadline,
+                                                                  allow_paid=True, checkpoint_fn=write_checkpoint)
+                checkpoint(companies, schema=schema, limit=limit)
+        if companies and time.monotonic() < phase_deadline - 30.0:
+            companies = recheck_ashby_postings(companies, report, tools, deadline=phase_deadline - 15.0, limit=limit,
+                                               schema=schema, exclude=rejected)
+        before_gates = len(companies)
+        companies = drop_unprovable(companies, icp, report)
+        companies = refill_after_gates(companies, icp, report, emptied=before_gates - len(companies), limit=limit,
+                                       schema=schema, exclude=rejected)
+        if FIT_FREE and FILL_TO_LIMIT and len(companies) < limit:
+            verdicts = {sm.company_name_key(entry.get("company")): str(entry.get("overall") or "")
+                        for entry in ((LAST_REPORT.get("reverify") or {}).get("companies") or [])
+                        if isinstance(entry, Mapping)}
+            companies, filled = fill_to_limit(companies, report, icp, limit=limit, schema=schema,
+                                              exclude=rejected, verdicts=verdicts)
+            if filled:
+                fill_notes: dict[str, Any] = {"added": filled}
+                LAST_REPORT["fill_to_limit"] = fill_notes
+                if paragraph_on and time.monotonic() < phase_deadline - 75.0 and _paid_allowed(tools, PARAGRAPH_MAX_USD):
+                    try:
+                        _agent_for_model = _agent_module()
+                        model_name = str(_STRATEGY.get("paragraph_model") or "").strip() or \
+                            os.environ.get("ARENA_MODEL", str(_STRATEGY.get("model") or "")).strip() or \
+                            _agent_for_model.DEFAULT_MODEL
+                        picks = [c for c in companies if str(c.get("company_name") or "") in set(filled)]
+                        fill_notes["paragraphs"] = details_module.write_paragraphs(
+                            picks, icp, evidence=report.evidence, model_name=model_name,
+                            timeout=min(60.0, phase_deadline - time.monotonic() - 20.0),
+                            http_client_factory=_http_client_factory())
+                        _note_spend(tools, PARAGRAPH_MAX_USD)
+                    except Exception as exc:  # noqa: BLE001 - the deterministic paragraph stands
+                        fill_notes["paragraph_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+                checkpoint(companies, schema=schema, limit=limit)
+        companies = judge_preflight(companies, schema=schema, report=report, tools=tools)
+        LAST_REPORT["calls"] = tools.calls
+        try:
+            LAST_REPORT["spend_usd"] = round(float(tools.spend_usd()), 4)
+            LAST_REPORT["spend_refusals"] = int(getattr(tools, "spend_refusals", 0) or 0)
+        except Exception:
+            pass
+        try:
+            LAST_REPORT["calls_by_tool"] = dict(getattr(tools, "calls_by_tool", {}) or {})
+        except Exception:
+            pass
+        LAST_REPORT["seconds"] = round(time.monotonic() - started, 1)
+        LAST_REPORT["diagnostics"] = diagnostics.snapshot()
+        LAST_REPORT["funnel"] = _funnel(
+            tools, drafted=len(drafts), verify_out=verify_out,
+            reverify_out=len(companies) if LAST_REPORT.get("reverify") else None,
+            returned=len(companies),
+            terminal="returned" if companies else "empty_after_verify", companies=companies)
+        if v5 and contacts_on:
+            LAST_REPORT["contacts_attached"] = sum(1 for c in companies if c.get("contact"))
+        return [strip_internal(c) for c in companies]
+    except Exception as exc:
+        if exc is agent_exc:
+            raise
+        _log(f"harness failed: {type(exc).__name__}: {str(exc)[:200]}")
+        LAST_REPORT["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if companies:
+            return [strip_internal(c) for c in companies]
+        return _no_companies(exc, tools)
+    finally:
+        try:
+            LAST_REPORT["diagnostics"] = diagnostics.snapshot()
+        except Exception:
+            pass
+        try:
+            LAST_REPORT.setdefault("funnel", _funnel(
+                tools, drafted=int(LAST_REPORT.get("drafts") or 0), verify_out=None,
+                reverify_out=None, returned=len(companies),
+                terminal=str(LAST_REPORT.get("no_output") or LAST_REPORT.get("error") or "unknown")[:60],
+                companies=companies))
+        except Exception:
+            pass
+        try:
+            LAST_REPORT.setdefault("direct_fetch", tools.direct_stats())
+        except Exception:
+            pass
+        _emit_report()
+        try:
+            tools.close()
+        except Exception:
+            pass
 
 
 def _tools_factory():
@@ -157,606 +2158,55 @@ def _tools_factory():
     if not spec:
         return lambda: ArenaTools(timeout=float(os.environ.get("ARENA_TOOL_TIMEOUT_SECONDS", "60") or 60))
     module_name, _, attr = spec.partition(":")
+    import importlib
+
     return getattr(importlib.import_module(module_name), attr)
 
 
-def _print_gates() -> dict[str, str]:
-    if _GATES_PRINTED["done"]:
-        return {}
-    _GATES_PRINTED["done"] = True
+def _http_client_factory():
+    spec = str(os.environ.get("ARENA_HTTP_CLIENT_FACTORY") or "").strip()
+    if not spec:
+        return None
+    module_name, _, attr = spec.partition(":")
+    import importlib
+
+    return getattr(importlib.import_module(module_name), attr)
+
+
+class _NoAgent:
+    """Loop s22: the scout bundle ships without agent.py/context.py (91 KB of full-source review headroom; research_mode
+    'scout' never runs the agent loop).  What the harness reads from the agent module -- an empty usage record and the
+    default model name -- comes from here; asking for the agent loop itself fails like an agent error."""
+
+    DEFAULT_MODEL = "openai/gpt-5.5"
+    LAST_USAGE: dict = {}
+
+    @staticmethod
+    def run_agent(*args: Any, **kwargs: Any) -> list:
+        raise RuntimeError("agent mode is not bundled in this build")
+
+
+def _agent_module() -> Any:
     try:
-        report = gates.print_self_test()
-    except Exception as exc:  # noqa: BLE001
-        _log(f"gate self-test failed: {type(exc).__name__}")
-        return {}
-    return {k: sum(1 for v in report.values() if v == k) for k in ("pass", "fail", "unknown")}
-
-
-LEAN_CAP_USD = 0.40
-# Rescue retains the existing $0.02 distance below the host allowance.
-RESCUE_CAP_MARGIN_USD = 0.02
-RESCUE_MARGIN_USD = 0.03
-RESCUE_RESERVE_USD = 0.02
-RESCUE_POST_SCOUT_USD = 0.03
-# v98: was 0.08, and the bonus phase was skipped at headroom 0.070 and 0.074 (two of three v98 runs on Public ICPs).
-# The phase costs next to nothing (job boards and news through free tools, one cheap yes/no call per news row)
-# and a verified bonus row lifts a qualified company from 54 to 80.
-BONUS_MIN_HEADROOM_USD = 0.02
-
-
-def _start_governor(clock: Any, tools: Any, tier_cap_usd: float | None = None) -> Any:
-    """Earlier attempts' spend from the host snapshot.  Unknown or unsettled prior spend lowers the cap; settled
-    prior spend within FRUGAL_BELOW_USD of the cap switches to rescue mode.  ``tier_cap_usd`` (the yield plan's
-    spend cap) lowers the mode cap further; the host allowance still bounds it."""
-
-    gov = governor.Governor(clock=clock)
-    prior, settled = governor.read_prior(gov=gov)
-    if prior is None:
-        gov.set_mode_cap(LEAN_CAP_USD)
-    else:
-        gov.prior = prior + (0.0 if settled else 0.10)
-        gov.note_snapshot(gov.prior)
-        if not settled:
-            gov.set_mode_cap(min(gov.cap, gov.prior + LEAN_CAP_USD))
-        elif gov.cap - gov.prior < FRUGAL_BELOW_USD and gov.prior < gov.allowance_usd - RESCUE_CAP_MARGIN_USD - RESCUE_MARGIN_USD:
-            gov.cap_margin_usd = RESCUE_CAP_MARGIN_USD
-            gov.cap = max(gov.cap, gov.allowance_usd - RESCUE_CAP_MARGIN_USD)
-            gov.reserve = min(gov.reserve, RESCUE_RESERVE_USD)
-            gov.set_mode_cap(gov.cap)
-            LAST_REPORT["rescue"] = True
-    _refresh_snapshot(gov, tools)
-    if tier_cap_usd is not None:
-        gov.set_mode_cap(min(float(getattr(gov, "_mode_limit_usd", float("inf"))), float(tier_cap_usd)))
-    LAST_REPORT["prior_spend_usd"] = None if prior is None else round(prior, 4)
-    LAST_REPORT["prior_settled"] = settled
-    return gov
-
-
-def scout_budget(gov: Any, rescue: bool = False, reserve: float = POST_SCOUT_RESERVE_USD) -> float:
-    """Discovery's budget: the strategy budget within what the cap leaves after ``reserve`` (the yield plan's
-    post-discovery reserve; rescue: the rescue remainder)."""
-
-    left = float(gov.mode_cap) - float(gov.committed()) - float(reserve)
-    if rescue:
-        return max(0.03, float(gov.mode_cap) - float(gov.committed()) - RESCUE_POST_SCOUT_USD)
-    if float(gov.mode_cap) - float(gov.prior) < FRUGAL_BELOW_USD:
-        return 0.05
-    # Preserve the promoted strategy's legacy budget and its fixed reserve as the host allowance grows.
-    budget = SCOUT_BUDGET_USD + max(0.0, gov.allowance_usd - 0.80)
-    return max(0.05, min(budget, left))
-
-
-def _hold_calls(tools: Any) -> int:
-    """Lower the call ceiling during discovery so POST_SCOUT_CALLS (at most a quarter of what is left) stay for the
-    later phases; returns the number held."""
-
-    try:
-        held = min(POST_SCOUT_CALLS, max(0, int(tools.remaining()) // 4))
-        tools.call_budget = int(tools.call_budget) - held
-        LAST_REPORT["calls_held"] = held
-        return held
-    except Exception:  # noqa: BLE001 - a tool client without a call ceiling
-        return 0
-
-
-def _release_calls(tools: Any, held: int) -> None:
-    if held:
+        from . import agent as module
+        return module
+    except ImportError:
         try:
-            tools.call_budget = int(tools.call_budget) + held
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _yield_modules() -> dict[str, Any]:
-    return {"scout": scout_module, "roster": roster_module, "stagefirst": stagefirst_module, "admission": admission,
-            "arena_tools": _tools_mod}
-
-
-def start_plan(icp: Mapping[str, Any], clock: Any, tools: Any) -> tuple[dict[str, Any], Any]:
-    """(the ICP's yield plan for this round's host allowance, its governor).
-
-    The first snapshot refresh in _start_governor adopts the round's Deepline call quota, and in a round without a
-    call cap that ceiling becomes max(current, arena_tools.UNCAPPED_CALL_BUDGET).  So the legacy plan (the lower
-    ceiling) is applied before the governor starts; once the governor holds the host allowance the final plan is
-    applied, and when it raises the ceiling the quota is adopted once more.  When the earlier attempts' spend is
-    unknown or still settling, the governor runs under its lean or retry cap, and the final plan is the legacy one."""
-
-    plan = yieldplan.plan_for(icp)
-    modules = _yield_modules()
-    first = yieldplan.apply(yieldplan.legacy_plan(plan), modules)
-    gov = _start_governor(clock, tools, tier_cap_usd=float(plan["cap_usd"]))
-    plan = yieldplan.for_allowance(plan, gov.allowance_usd)
-    if LAST_REPORT.get("prior_spend_usd") is None or not LAST_REPORT.get("prior_settled"):
-        plan = dict(yieldplan.legacy_plan(plan), regime="legacy")
-    knobs = yieldplan.apply(plan, modules)
-    if knobs.get("arena_tools.UNCAPPED_CALL_BUDGET") != first.get("arena_tools.UNCAPPED_CALL_BUDGET"):
-        _refresh_snapshot(gov, tools)
-    LAST_REPORT["yield_plan"] = {"tier": plan["tier"], "regime": plan["regime"], "cap_usd": plan["cap_usd"],
-                                 "allowance_usd": round(float(gov.allowance_usd), 4),
-                                 "draft_limit": plan.get("draft_limit"),
-                                 "post_scout_reserve_usd": plan.get("post_scout_reserve_usd"),
-                                 "discovery_max_s": plan.get("discovery_max_s"),
-                                 "call_budget": getattr(tools, "call_budget", None), "knobs": knobs}
-    return plan, gov
-
-
-def discovery_reserve(plan: Mapping[str, Any], gov: Any) -> float:
-    """The spend discovery leaves for the later phases: the plan's reserve, but at most a quarter of what the cap still
-    leaves (never below POST_SCOUT_RESERVE_USD), so an attempt that starts with most of the cap spent keeps the
-    promoted discovery budget."""
-
-    raw = plan.get("post_scout_reserve_usd")
-    reserve = POST_SCOUT_RESERVE_USD if raw is None else float(raw)
-    left = float(gov.mode_cap) - float(gov.committed())
-    return min(reserve, max(POST_SCOUT_RESERVE_USD, 0.25 * left))
-
-
-# A plan with ``discovery_max_s`` may run discovery until this share of the wall clock (at most that many seconds) when
-# that is later than the clock's own discovery end; a compressed clock keeps its own end.
-LONG_DISCOVERY_SHARE = 0.5
-
-
-def discovery_end(plan: Mapping[str, Any], clock: Any) -> float:
-    """When discovery stops (a time.monotonic value)."""
-
-    end = float(clock.discovery_end)
-    longest = plan.get("discovery_max_s")
-    if not longest or getattr(clock, "compressed", True):
-        return end
-    return max(end, float(clock.t0) + min(LONG_DISCOVERY_SHARE * float(clock.wall), float(longest)))
-
-
-def _refresh_snapshot(gov: Any, tools: Any) -> None:
-    """Re-base the governor on the host's spend and adopt the round's real Deepline call quota (never raises)."""
-
-    marker = gov.marker()
-    snap = governor.read_snapshot()
-    gov.adopt_quota(snap)
-    usd = governor.snapshot_committed(snap)
-    if usd is not None:
-        gov.note_snapshot(usd, marker)
-    if snap is not None:
-        try:
-            tools.adopt_quota(snap)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _bonus_order(rows: list[dict[str, Any]], icp: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The rows in the order bonus attempts go: admission's own order when it ranks by evidence, else by expected
-    value."""
-
-    if admission.EVIDENCE_RANK:
-        return sorted(rows, key=lambda r: admission.rank_key(r, icp))
-    return sorted(rows, key=lambda r: -admission.estimates(r, icp)["q"] * admission.value(r, icp))
-
-
-def _evidence_for(row: Mapping[str, Any], report: Any) -> list[dict[str, Any]]:
-    urls = {(s.get("matched_icp_signal"), s.get("url")) for s in row.get("intent_signals") or []}
-    items = report.evidence.get(sm.company_name_key(row.get("company_name")), [])
-    return [e for e in items if (e.get("index"), e.get("url")) in urls]
-
-
-def _bonus_paragraph_guard(chosen: list[dict[str, Any]], report: Any, icp: Mapping[str, Any], notes: dict) -> None:
-    """v112: a bonus signal is kept only with a model-written paragraph the local review accepted.
-
-    A verified bonus lifts a qualified row from 54 to 80, but a row whose paragraph fails the judge's review scores
-    nothing.  When the writer fell back to the template for a row that carries a bonus signal, the bonus signal is
-    taken out and the paragraph is written again for the primary event alone."""
-
-    dropped: list[str] = []
-    for row in chosen:
-        if not (row.get("_flags") or {}).get("paragraph_fallback"):
-            continue
-        signals = row.get("intent_signals") or []
-        if not any(isinstance(s.get("matched_icp_signal"), int) and s["matched_icp_signal"] >= 1 for s in signals):
-            continue
-        row["intent_signals"] = [s for s in signals if s.get("matched_icp_signal") in (0, None)]
-        row["_flags"].pop("bonus", None)
-        key = sm.company_name_key(row.get("company_name"))
-        again = details_module.write_paragraphs([row], icp, evidence={key: _evidence_for(row, report)},
-                                                model_name=PARAGRAPH_MODEL)
-        dropped.append(f"{str(row.get('company_name') or '')[:40]}: "
-                       f"{'model paragraph' if again.get('accepted') else 'template'} for the primary event")
-    if dropped:
-        notes["bonus_dropped_for_paragraph"] = dropped
-
-
-def _refresh_fallbacks(rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any]) -> None:
-    for row in rows:
-        signals = _evidence_for(row, report)
-        if signals:
-            row["intent_details"] = details_module.fallback_paragraph(
-                company_name=str(row.get("company_name") or ""), icp=icp, signals=signals)
-
-
-def _reverify(rows: list[dict[str, Any]], icp: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict]:
-    """The Sonar re-check: drop only a name/website mismatch; other contradictions stay, marked ``rank_last``."""
-
-    kept, notes = reverify_module.rerank([strip_internal(r) for r in rows], icp)
-    contested = {str(site) for site in (notes or {}).get("contested") or []}
-    blanked = {str(site) for site in (notes or {}).get("linkedin_blanked") or []}
-    adopted = (notes or {}).get("website_adopted") or {}
-    by_site = {str(r.get("company_website") or ""): r for r in rows}
-    out = []
-    for match in kept:
-        site = str(match.get("company_website") or "")
-        move = adopted.get(site) if isinstance(adopted, Mapping) else None
-        row = by_site.pop(str(move.get("from") or "") if isinstance(move, Mapping) else site, None)
-        if row is None:
-            continue
-        if isinstance(move, Mapping):
-            # v105: the re-check named the company's real website; the row follows it (see reverify.rerank)
-            old_host = sm.registrable_host(str(row.get("company_website") or ""))
-            row["company_website"], row["company_linkedin"] = site, ""
-            if move.get("employee_count"):
-                row["employee_count"] = str(move["employee_count"])
-            claim = row.get("required_attribute")
-            if isinstance(claim, Mapping) and old_host and sm.registrable_host(str(claim.get("evidence_url") or "")) == old_host:
-                row.pop("required_attribute", None)          # a quote read on the wrong site proves nothing
-        if str(row.get("company_website") or "") in blanked:
-            row["company_linkedin"] = ""          # v102c: the re-check contradicted the slug, not the company
-        if str(row.get("company_website") or "") in contested:
-            row.setdefault("_flags", {})["rank_last"] = True
-            row["_flags"]["recheck_mismatch"] = True
-        out.append(row)
-    return out, notes
-
-
-REPLACE_MIN_S = 90.0
-
-
-def _site(row: Mapping[str, Any]) -> str:
-    return str(row.get("company_website") or "")
-
-
-def _signal_keys(row: Mapping[str, Any]) -> list[tuple[Any, Any]]:
-    return [(s.get("matched_icp_signal"), s.get("url")) for s in row.get("intent_signals") or []]
-
-
-def _rv_reasons(notes: Mapping[str, Any]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for entry in (notes or {}).get("companies") or []:
-        if isinstance(entry, Mapping):
-            why = entry.get("reason") or entry.get("error") or entry.get("overall") or ""
-            extra = ""
-            if entry.get("identity_code"):
-                extra += f" [identity {entry.get('identity_code')}, observed {entry.get('observed_domain')}]"
-            if entry.get("website_adopted"):
-                extra += f" [website adopted: {entry.get('website_adopted')}]"
-            if entry.get("linkedin_blanked"):
-                extra += " [LinkedIn slug blanked]"
-            out[str(entry.get("company") or "?")[:60]] = (f"{entry.get('overall') or ''}: {str(why)[:160]}".strip(": ") + extra)
-    return out
-
-
-def _has_bonus(row: Mapping[str, Any]) -> bool:
-    return any(isinstance(s.get("matched_icp_signal"), int) and s["matched_icp_signal"] >= 1
-               for s in row.get("intent_signals") or [])
-
-
-def _contested(row: Mapping[str, Any]) -> bool:
-    return bool((row.get("_flags") or {}).get("recheck_mismatch"))
-
-
-def _reverify_step(chosen: list[dict[str, Any]], rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any],
-                   clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """v102: the re-check step, then a row it contradicted on a fit dimension is not sent beside another row.
-
-    On-chain (10-09 and 10-11) the rows our re-check called a mismatch and we sent anyway qualified 0 times in 58
-    (ClearJet, Cohere, Ivee, soCash, Auger, ...); beside a qualifier each such row costs 10 points.  Alone it stays:
-    an ICP score cannot go below zero.  With time to spare, the slots of the rows held back are filled once
-    (``_refill``)."""
-
-    checked_sites: set[str] = set()
-    final, notes = _reverify_step_inner(chosen, rows, report, icp, clock, limit, checked_sites=checked_sites)
-    contested = [r for r in final if _contested(r)]
-    held = [r for r in contested if not _has_bonus(r)]      # v111: a bonus row is worth 80 against a 10-point risk
-    if len(held) < len(contested):
-        notes["contested_kept_for_bonus"] = [str(r.get("company_name")) for r in contested if _has_bonus(r)]
-    if held and len(held) < len(final):
-        final = [r for r in final if not any(r is h for h in held)]
-        notes["withheld_contested"] = [str(r.get("company_name")) for r in held]
-        if time.monotonic() < clock.paid_cutoff - REPLACE_MIN_S:
-            try:
-                final, notes["refill"] = _refill(final, rows, checked_sites, report, icp, clock, limit)
-            except Exception as exc:  # noqa: BLE001 - the rows held back stay out; the others go as they are
-                notes["refill"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
-    return final, notes
-
-
-def _refill(final: list[dict[str, Any]], rows: list[dict[str, Any]], checked_sites: set[str], report: Any,
-            icp: Mapping[str, Any], clock: Any, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """(the rows to submit, notes): the free slots after rows were held back.  Admission runs once more over the rows
-    kept plus the verified rows whose company no re-check has seen; its picks beyond the kept rows, up to the free
-    slots, get their paragraph and one re-check.  A new pick the re-check drops, or contests while it carries no bonus
-    row, stays out; the kept rows are not changed."""
-
-    def host(row: Mapping[str, Any]) -> str:
-        return sm.registrable_host(_site(row)) or _site(row)
-
-    have = {host(r) for r in final}
-    seen = {sm.registrable_host(site) or site for site in checked_sites}
-    pool = list(final) + [r for r in rows if host(r) not in seen and host(r) not in have]
-    again, adm = admission.select(pool, icp, limit=limit)
-    free = max(0, int(adm.get("cap") or limit) - len(final))
-    new = [r for r in again if host(r) not in have][:free]
-    notes: dict[str, Any] = {"admission": adm, "new": [r.get("company_name") for r in new]}
-    if not new or time.monotonic() >= clock.paid_cutoff - 30.0:
-        return final, notes
-    _refresh_fallbacks(new, report, icp)
-    evidence = {sm.company_name_key(r.get("company_name")): _evidence_for(r, report) for r in new}
-    notes["paragraph"] = details_module.write_paragraphs(new, icp, evidence=evidence, model_name=PARAGRAPH_MODEL)
-    try:
-        _bonus_paragraph_guard(new, report, icp, notes["paragraph"])
-    except Exception as exc:  # noqa: BLE001 - the rows stay as the writer left them
-        notes["paragraph"]["bonus_guard_error"] = type(exc).__name__
-    checked, rv_notes = _reverify(new, icp)
-    added: list[dict[str, Any]] = []
-    for row in checked:
-        if (_contested(row) and not _has_bonus(row)) or host(row) in have:    # a website the re-check moved
-            continue
-        have.add(host(row))
-        added.append(row)
-    notes.update(added=[r.get("company_name") for r in added],
-                 left_out=[r.get("company_name") for r in new if not any(r is a for a in added)],
-                 reasons=_rv_reasons(rv_notes))
-    return final + added, notes
-
-
-def _reverify_step_inner(chosen: list[dict[str, Any]], rows: list[dict[str, Any]], report: Any, icp: Mapping[str, Any],
-                         clock: Any, limit: int, checked_sites: set[str] | None = None
-                         ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """(the rows to submit, notes).  A company the re-check drops leaves the output even when nothing is left.
-    With time to spare, admission runs again over the verified rows minus every dropped company, and the new picks
-    get their paragraph and one re-check of their own.  ``checked_sites`` collects the website of every row sent to
-    a re-check, as it was before the re-check."""
-
-    if checked_sites is not None:
-        checked_sites.update(_site(r) for r in chosen)
-    checked, rv_notes = _reverify(chosen, icp)
-    dropped = {_site(r) for r in chosen} - {_site(r) for r in checked}
-    notes: dict[str, Any] = {"kept": [r.get("company_name") for r in checked],
-                             "dropped": [r.get("company_name") for r in chosen if _site(r) in dropped],
-                             "reasons": _rv_reasons(rv_notes)}
-    if rv_notes.get("error"):
-        notes["error"] = str(rv_notes["error"])[:160]
-    if not dropped:
-        return checked, notes
-    final = checked
-    if time.monotonic() < clock.paid_cutoff - REPLACE_MIN_S:
-        pool = [r for r in rows if _site(r) not in dropped]
-        again, adm = admission.select(pool, icp, limit=limit)
-        done = {_site(r): r for r in checked}
-        fresh = [r for r in again if _site(r) not in done]
-        replacement: dict[str, Any] = {"admission": adm, "new": [r.get("company_name") for r in fresh]}
-        if fresh and time.monotonic() < clock.paid_cutoff - 30.0:
-            _refresh_fallbacks(fresh, report, icp)
-            evidence = {sm.company_name_key(r.get("company_name")): _evidence_for(r, report) for r in fresh}
-            replacement["paragraph"] = details_module.write_paragraphs(fresh, icp, evidence=evidence,
-                                                                       model_name=PARAGRAPH_MODEL)
-            if checked_sites is not None:
-                checked_sites.update(_site(r) for r in fresh)
-            checked_new, rv_new = _reverify(fresh, icp)
-            dropped |= {_site(r) for r in fresh} - {_site(r) for r in checked_new}
-            done.update({_site(r): r for r in checked_new})
-            replacement.update(kept=[r.get("company_name") for r in checked_new],
-                               dropped=[r.get("company_name") for r in fresh if _site(r) in dropped],
-                               reasons=_rv_reasons(rv_new))
-        picked: list[dict[str, Any]] = []
-        for row in again:
-            prior = done.get(_site(row))
-            if prior is None or _site(row) in dropped:
-                continue
-            if _signal_keys(prior) != _signal_keys(row):
-                _refresh_fallbacks([row], report, icp)
-                prior = row
-            picked.append(prior)
-        notes["replacement"] = replacement
-        final = picked or checked
-    return final, notes
-
-
-# crown18 (ARENA_DISCOVERY_RETRY): on 2026-10-14 eleven execute runs in the whole field ended in under 300 s with fewer
-# than 60 provider calls and no page fetch; ten were ours (crown17 four, including its ICP 5: 120 s, 15 calls, 0 rows,
-# while the byte-identical crown17b took 723 s, 172 calls and sent 5 rows).  All eleven started 04:23-06:39Z; none of
-# the 199 runs before 04h did.  The path: llm.chat returns None after its short retries, scout records "no reply",
-# discovery yields no candidates, and run_icp returned [] with ~15 minutes of paid window unused.  When discovery
-# found NOTHING and the model path reported errors, wait and run discovery again (twice at most) while the paid cutoff
-# and the scout budget leave room.  A dead ICP (model fine, nothing found) never retries; 0 restores the single pass.
-DISCOVERY_RETRY_WAITS = (45.0, 120.0)
-DISCOVERY_RETRY_MARGIN_S = 240.0
-DISCOVERY_RETRY_SPEND_FRACTION = 0.3
-
-
-def discovery_retry_enabled() -> bool:
-    return str(os.environ.get("ARENA_DISCOVERY_RETRY", "1")).strip().lower() not in ("0", "false", "no")
-
-
-def _spent_usd(tools: Any) -> float:
-    try:
-        return float(tools.spend_usd())
-    except Exception:  # noqa: BLE001
-        return 0.0
-
-
-def discovery_outage(drafts: Any, scout_module: Any, tools: Any, clock: Any, wait_s: float) -> str:
-    """'' unless discovery produced nothing because the model path failed and a second pass still fits."""
-
-    if drafts or not discovery_retry_enabled():
-        return ""
-    last = getattr(scout_module, "LAST", {}) or {}
-    errors = [str(e) for e in (last.get("llm_errors") or []) if str(e) != "deadline"]
-    if not errors or last.get("candidates") or last.get("drafts"):
-        return ""
-    if time.monotonic() + wait_s + DISCOVERY_RETRY_MARGIN_S >= clock.paid_cutoff:
-        return ""
-    try:
-        if float(tools.spend_usd()) >= DISCOVERY_RETRY_SPEND_FRACTION * float(scout_module.BUDGET_USD):
-            return ""
-    except Exception:  # noqa: BLE001 - an unreadable ledger is no reason to spend again
-        return ""
-    return f"{len(errors)} model errors ({errors[0][:40]}), no candidates"
-
-
-def run_icp(icp: dict) -> list[dict]:
-    """Return up to LAB_ARENA_COMPANY_LIMIT companies for one ICP (the last locked list)."""
-
-    if not isinstance(icp, dict):
-        raise TypeError("icp must be a dict")
-    arena_training.reset()
-    clock = governor.Clock()
-    limit = _company_limit()
-    LAST_REPORT.clear()
-    LAST_REPORT.update({"icp_id": icp.get("icp_id"), "limit": limit, "clock": clock.as_dict()})
-    gate_counts = _print_gates()
-    if gate_counts:
-        LAST_REPORT["gates"] = gate_counts
-    if not str(os.environ.get("LAB_ARENA_WORKER_SOCKET") or "").strip() and not os.environ.get("ARENA_TOOLS_FACTORY"):
-        _log("no LAB_ARENA_WORKER_SOCKET; returning an empty result")
-        LAST_REPORT["error"] = "no worker socket"
-        _emit_report()
-        return []
-    schema = announced_schema(icp)
-    if not sm.v5_family(schema):
-        schema = gates.V6
-    tools = _tools_factory()()
-    try:
-        import random
-        random.seed(int(str(os.environ.get("LAB_ARENA_RANDOM_SEED") or "0").strip() or 0))
-    except ValueError:
-        pass
-    plan, gov = start_plan(icp, clock, tools)
-    draft_limit = int(plan.get("draft_limit") or DRAFT_LIMIT)
-    rescue = bool(LAST_REPORT.get("rescue"))
-    frugal = gov.mode_cap - gov.prior < FRUGAL_BELOW_USD and not rescue
-    governor.install(gov, clock)
-    llm.reset()
-    lock.reset_decisions()
-    diagnostics.reset()
-    locker = lock.Locker(icp, schema=schema, limit=limit)
-    rows: list[dict[str, Any]] = []
-    lock.decide("investigate", "find companies that match this ICP and prove its intent criteria",
-                evidence=[str(icp.get("icp_id") or ""), str(icp.get("intent_category") or "")])
-    try:
-        tools.deadline = clock.paid_cutoff
-        reserve = discovery_reserve(plan, gov)
-        scout_module.BUDGET_USD = scout_budget(gov, rescue=rescue, reserve=reserve)
-        LAST_REPORT["scout_budget_usd"] = round(scout_module.BUDGET_USD, 4)
-        LAST_REPORT["scout_reserve_usd"] = round(reserve, 4)
-        LAST_REPORT["mode"] = "rescue" if rescue else ("frugal" if frugal else "full")
-        discovery_s = max(60.0, discovery_end(plan, clock) - time.monotonic())
-        LAST_REPORT["discovery_s"] = round(discovery_s, 1)
-        agent_exc: BaseException | None = None
-        drafts: list[dict[str, Any]] = []
-        held = _hold_calls(tools)
-        try:
-            budget0, spend0 = float(scout_module.BUDGET_USD), _spent_usd(tools)
-            drafts = scout_module.run_scout(icp, tools, limit=draft_limit, run_timeout=discovery_s)
-            for attempt, wait_s in enumerate(DISCOVERY_RETRY_WAITS, start=1):   # crown18: see discovery_outage
-                why = discovery_outage(drafts, scout_module, tools, clock, wait_s)
-                if not why:
-                    break
-                LAST_REPORT.setdefault("discovery_retries", []).append({"attempt": attempt, "wait_s": wait_s, "why": why})
-                _log(f"discovery found nothing after a model-path outage ({why}); pass {attempt + 1} in {wait_s:.0f}s")
-                time.sleep(wait_s)
-                # The second pass spends what the first left of the scout budget, never a fresh window.
-                scout_module.BUDGET_USD = max(0.10, budget0 - (_spent_usd(tools) - spend0))
-                drafts = scout_module.run_scout(
-                    icp, tools, limit=draft_limit,
-                    run_timeout=max(90.0, clock.paid_cutoff - DISCOVERY_RETRY_MARGIN_S - time.monotonic()))
-        except Exception as exc:  # noqa: BLE001
-            agent_exc = exc
-            LAST_REPORT["scout_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
-        finally:
-            _release_calls(tools, held)
-        LAST_REPORT["scout"] = dict(getattr(scout_module, "LAST", {}) or {})
-        LAST_REPORT["drafts"] = len(drafts)
-        arena_training.phase("after_discovery", drafts, details={"count": len(drafts),
-                              "drops": LAST_REPORT["scout"].get("drops", {}),
-                              "error_type": type(agent_exc).__name__ if agent_exc is not None else None})
-        if not drafts:
-            return _no_companies(agent_exc, tools)
-        _refresh_snapshot(gov, tools)
-        rows, report = verify_companies(drafts, icp=icp, tools=tools, schema=schema)
-        LAST_REPORT["verify"] = report.counts()
-        LAST_REPORT["verify_drops"] = report.details()
-        LAST_REPORT["verified"] = [r.get("company_name") for r in rows]
-        arena_training.phase("after_verification", rows, details={"counts": LAST_REPORT["verify"],
-                              "drops": LAST_REPORT["verify_drops"]})
-        try:                                        # v110: one cheap call grades each row's cited announcement
-            LAST_REPORT["eventgrade"] = eventgrade.grade(rows, icp) if rows else {}
-        except Exception as exc:  # noqa: BLE001 - grading is optional
-            LAST_REPORT["eventgrade"] = {"error": type(exc).__name__}
-        if rows and time.monotonic() < clock.paid_cutoff and (rescue or gov.headroom() < BONUS_MIN_HEADROOM_USD):
-            LAST_REPORT["bonus"] = {"skipped": "rescue" if rescue else "headroom %.3f" % gov.headroom()}
-        elif rows and time.monotonic() < clock.paid_cutoff:
-            ranked = _bonus_order(rows, icp)
-            LAST_REPORT["bonus"] = bonus.attach(ranked[:BONUS_ROWS], report, icp, tools, verify_signal=verify_signal,
-                                                deadline=clock.paid_cutoff - 60.0, clock=time.monotonic)
-        if rows and time.monotonic() < clock.paid_cutoff:
-            LAST_REPORT["preflight"] = preflight.check(rows, tools, deadline=clock.paid_cutoff - 30.0)
-        _refresh_snapshot(gov, tools)
-        chosen, notes = admission.select(rows, icp, limit=limit)
-        LAST_REPORT["admission"] = notes
-        arena_training.phase("after_admission", chosen, details={"verified_count": len(rows), "admission": notes})
-        try:
-            LAST_REPORT["rows"] = [admission.explain(r, icp) for r in rows]
-        except Exception as exc:  # noqa: BLE001 - diagnostics only
-            LAST_REPORT["rows"] = f"{type(exc).__name__}"
-        _refresh_fallbacks(chosen, report, icp)
-        for row in rows:
-            accepted = any(row is c or row.get("company_name") == c.get("company_name") for c in chosen)
-            lock.decide("accept" if accepted else "reject", "choose companies to submit",
-                        candidate=str(row.get("company_name") or ""),
-                        evidence=[f"tier {(row.get('_flags') or {}).get('fit_tier')}",
-                                  f"stage proven {(row.get('_flags') or {}).get('stage_proven')}"])
-        if not chosen:
-            return locker.locked
-        locker.lock(chosen)
-        if time.monotonic() < clock.paid_cutoff - 30.0:
-            evidence = {sm.company_name_key(r.get("company_name")): _evidence_for(r, report) for r in chosen}
-            LAST_REPORT["paragraph"] = details_module.write_paragraphs(chosen, icp, evidence=evidence,
-                                                                       model_name=PARAGRAPH_MODEL)
-            try:
-                _bonus_paragraph_guard(chosen, report, icp, LAST_REPORT["paragraph"])
-            except Exception as exc:  # noqa: BLE001 - the rows stay as the writer left them
-                LAST_REPORT["paragraph"]["bonus_guard_error"] = type(exc).__name__
-            locker.lock(chosen)
-        if REVERIFY_ENABLED and locker.locked and time.monotonic() < clock.paid_cutoff - 30.0:
-            final, LAST_REPORT["reverify"] = _reverify_step(chosen, rows, report, icp, clock, limit)
-            locker.replace(final)
-        return locker.locked
-    except Exception as exc:  # noqa: BLE001
-        LAST_REPORT["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
-        if locker.locked:
-            return locker.locked
-        return _no_companies(exc, tools)
-    finally:
-        LAST_REPORT["locker"] = locker.as_dict()
-        LAST_REPORT["governor"] = gov.as_dict()
-        LAST_REPORT["llm"] = dict(llm.STATS)
-        LAST_REPORT["tools"] = {"calls": getattr(tools, "calls", None),
-                                "by_tool": dict(getattr(tools, "calls_by_tool", None) or {}),
-                                "provider_state": dict(getattr(tools, "__dict__", {}).get("_provider_state") or {}),
-                                "fallbacks": dict(getattr(tools, "__dict__", {}).get("fallbacks") or {}),
-                                "egress": dict(getattr(tools, "egress", None) or {})}
-        LAST_REPORT["seconds"] = round(time.monotonic() - clock.t0, 1)
-        LAST_REPORT["diagnostics"] = diagnostics.snapshot()
-        arena_training.phase("final", locker.locked, details={"locker": LAST_REPORT["locker"],
-                              "reverify": LAST_REPORT.get("reverify")})
-        LAST_REPORT["training_capture_summary"] = arena_training.final_summary()
-        lock.decide("finish", "submit the locked companies", evidence=[f"{len(locker.locked)} companies"])
-        governor.install(None)
-        _emit_report()
-        try:
-            tools.close()
-        except Exception:  # noqa: BLE001
-            pass
+            import importlib
+
+            return importlib.import_module(f"{os.path.basename(_HERE)}.agent")
+        except ImportError:
+            return _NoAgent
 
 
 def get_last_usage() -> dict:
-    return {"report": dict(LAST_REPORT)}
+    agent_module = _agent_module()
+    usage = dict(agent_module.LAST_USAGE)
+    usage["report"] = dict(LAST_REPORT)
+    return usage
 
 
-__all__ = ["run_icp", "get_last_usage", "provider_infrastructure_error"]
+__all__ = ["run_icp", "get_last_usage", "backfill_empty_slots", "verification_deadline", "checkpoint",
+           "read_quota", "attach_contacts", "confirmed_spend_usd", "refresh_spend", "draft_limit",
+           "arm_spend_guard", "release_holdback", "snapshot_settled",
+           "fill_contacts_from_reserve", "identity_keys"]
