@@ -353,6 +353,45 @@ def company_events(tools: Any, companies: list[Mapping[str, Any]], icp: Mapping[
     return [row for rows in found for row in rows]
 
 
+# s75: the funded companies' own news, read free over the bridge, beside the news lookup and the per-company search.
+# On launch ICPs we kept 22% of the best score in the field (58 of 269 points over 10 paying ICPs, 10-14..10-21) while
+# the baseline took 51.0 on 10-14 #5 and 39.8 on 10-20 #2; a launch mostly lives on the company's own changelog, blog
+# or newsroom (ownnews.py). Offline, ownnews.own_rows found a dated post inside the window on the sites of 30 of 45
+# companies the field qualified on launch ICPs. A company this lane finds already carries its stage proof, so its own
+# post is the missing half; roster.pick_events still decides which row reports the ICP's event.
+OWN_SITE = bool(STRATEGY.get("stage_first_own_site", 1))
+OWN_SITE_SECONDS = float(STRATEGY.get("stage_first_own_site_seconds") or 90)
+
+
+def own_site_rows(icp: Mapping[str, Any], tools: Any, companies: list[dict[str, Any]], category: str, *, age_days,
+                  deadline: float, clock, feed: dict[str, Any], seen: set) -> list[dict[str, Any]]:
+    """Dated own-site rows (roster.story_rows shape, own_site=True) for the lane's companies; [] when off or idle."""
+
+    if not OWN_SITE or not companies:
+        return []
+    try:
+        from . import ownnews, roster, scout
+    except ImportError:
+        return []
+    if category not in ownnews.CATEGORIES or category == "FUNDING":
+        return []
+    words = re.compile(roster.CATEGORY_WORDS[category], re.I) if category in roster.CATEGORY_WORDS else None
+    last: dict[str, Any] = {}
+    try:
+        rows = ownnews.own_rows(icp, tools, companies, find_date=scout.find_date, age_days=age_days,
+                                deadline=min(deadline, clock() + OWN_SITE_SECONDS), clock=clock, last=last, words=words)
+    except Exception as exc:  # noqa: BLE001 - a free lane that fails adds nothing and breaks nothing
+        feed["own_site_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        return []
+    out = []
+    for row in rows:
+        if row.get("url") and row["url"] not in seen:
+            seen.add(row["url"])
+            out.append(dict(row, own_site=True))
+    feed["own_site"] = dict(last.get("own_news") or {}, added=len(out))
+    return out
+
+
 def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, age_days, deadline: float, clock,
                     http_client_factory=None, last: dict[str, Any], started_spend: float = 0.0,
                     over_budget: Optional[Callable[[], bool]] = None) -> list[dict[str, Any]]:
@@ -454,6 +493,8 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
                     continue
                 seen.add(row["url"])
                 story.append(dict(row, id=len(story)))
+            story.extend(own_site_rows(icp, tools, companies, category, age_days=age_days, deadline=deadline,
+                                       clock=clock, feed=feed, seen=seen))
             for i, row in enumerate(story):
                 row["id"] = i
             feed.update(with_news=sum(1 for c in companies if news.get(c["domain"])), story_rows=len(story),

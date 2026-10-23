@@ -98,6 +98,44 @@ _FAILED: dict[str, str] = {}
 V6 = "leadpoet.lab_arena.output.v6"
 
 
+def _optional_dependency_stubs() -> None:
+    """s79: since organizer 26e94088d (2026-10-21 16:37Z) the investigator module imports lab_arena.deepline_catalog,
+    which imports jsonschema to validate research catalogs. None of the gates here touches a catalog, but without the
+    package every _CEI symbol (quote_occurs, plain_page, the stage and headcount quotes ...) fails to import and the
+    whole module reads as unknown -- it did on our sandbox mirror, which has no jsonschema. When the real package is
+    absent, register an inert stand-in so the import chain completes; a real install is always used as is."""
+
+    import importlib.util
+    import types
+
+    if "jsonschema" in sys.modules or importlib.util.find_spec("jsonschema") is not None:
+        return
+
+    class _Inert:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        @classmethod
+        def check_schema(cls, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def validate(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def iter_errors(self, *args: Any, **kwargs: Any) -> list:
+            return []
+
+        def is_valid(self, *args: Any, **kwargs: Any) -> bool:
+            return True
+
+    stub = types.ModuleType("jsonschema")
+    stub.Draft202012Validator = stub.Draft7Validator = stub.Draft4Validator = _Inert
+    stub.ValidationError = stub.SchemaError = type("ValidationError", (Exception,), {})
+    stub.validate = lambda *args, **kwargs: None
+    stub.__sn71_stub__ = True
+    sys.modules["jsonschema"] = stub
+
+
 def _load(name: str) -> Any:
     if name in _LOADED:
         return _LOADED[name]
@@ -108,6 +146,7 @@ def _load(name: str) -> Any:
         _FAILED[name] = "not allowed"
         return None
     try:
+        _optional_dependency_stubs()
         value = getattr(importlib.import_module(module_name), attr)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 - an unimportable symbol is simply unknown
         # SystemExit is caught on purpose: a scorer module that calls sys.exit() at import time would

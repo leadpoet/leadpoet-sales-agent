@@ -132,6 +132,18 @@ FLAT_EVENT_COMPANIES = int(_strategy_number("flat_event_companies", 30, 0, 60))
 # qualified, but still sent 2 qualified of 5 -- the extra drafts queue behind the earlier ones in the re-check -- for
 # $2.50 and 35 minutes against $1.78 and 15. Back to 15 reserve drafts (20 in all).
 FLAT_RESERVE_DRAFTS = int(_strategy_number("flat_reserve_drafts", 15, 0, 25))
+# s73: under the flat policy an ICP of a kind that has historically paid nothing (yieldmap.pays False: prior under
+# ~4%) runs lean. Over the published rows of 10-08..10-20 FACILITY_OPENING, HIRING, PARTNERSHIP outside Series B,
+# MARKET_EXPANSION outside Public and every Private Equity kind produced 0-3 field qualifiers per ICP, and in the 10-20
+# rehearsal the three such ICPs took 28 of 85 credits for none. Each ICP has its own $4 allowance, so the saving buys
+# no depth elsewhere -- it is money (four hotkeys a round), not score. Paying kinds keep the full flat depth.
+# OFF (2026-10-21 23:55Z): yieldmap.pays labels whole ICPs, and 23 of our 55 qualified rows in the published rounds came
+# from ICPs it calls unpaid -- among them arena-2026-10-18 ICP 7 (Professional Services / Public / LEADERSHIP_CHANGE,
+# prior 0.044), our 5/5 crown with 11 of the field's 38 qualified rows. A lean cap there would have cost the +10 slot.
+FLAT_LEAN_UNPAID = _strategy_number("flat_lean_unpaid", 0, 0, 1) >= 1
+FLAT_LEAN_CAP_USD = _strategy_number("flat_lean_cap_usd", 1.0, 0.3, 3.5)
+FLAT_LEAN_RESERVE_DRAFTS = int(_strategy_number("flat_lean_reserve_drafts", 5, 0, 25))
+FLAT_LEAN_POOL = int(_strategy_number("flat_lean_pool", 8, 3, 30))
 # s63: rounds created after the organizer's 7ca91bf4d deployed (2026-10-20 ~05Z) freeze ARENA_FIT_FP_CLASSIFICATION =
 # company_fit_receipt_v1. A row carrying a company_fit receipt is then penalized only for a proven fit mismatch, an
 # exclusion, a duplicate or a data-quality issue, plus an unverified primary intent once fit passes. A required
@@ -143,11 +155,6 @@ FLAT_RESERVE_DRAFTS = int(_strategy_number("flat_reserve_drafts", 15, 0, 25))
 FIT_FREE_FROM = str(_STRATEGY.get("fit_free_from") or "20261021").strip()
 FIT_FREE_FORCE = _strategy_number("fit_free_force", 0, 0, 1) >= 1   # local tests only
 FIT_FREE = False
-# o3: what this bundle adds on top of s63 under FIT_FREE (both inert while the round penalizes unproven fits):
-# fill_to_limit fills every open slot from the verified surplus; discovery_passes is how many second-pass rounds of
-# discovery an ICP short of drafts may run (1 = the old single second pass).
-FILL_TO_LIMIT = _strategy_number("fill_to_limit", 1, 0, 1) >= 1
-DISCOVERY_PASSES = int(_strategy_number("discovery_passes", 3, 1, 6))
 QUOTA_READS_MAX = 16
 START_READ_RETRIES = 2
 START_READ_BACKOFF_S = 1.5
@@ -161,7 +168,7 @@ MAX_PAIRS = 5
 REVERIFY_EST_USD = 0.016
 PARAGRAPH_MAX_USD = 0.06
 ATS_BONUS = _strategy_number("ats_bonus", 1, 0, 1) >= 1
-ATS_PICK_MODEL = str(_STRATEGY.get("ats_pick_model") or "google/gemini-3.5-flash-lite")
+ATS_PICK_MODEL = str(_STRATEGY.get("ats_pick_model") or "google/gemini-3-flash-preview")
 ATS_BONUS_SECONDS = _strategy_number("ats_bonus_seconds", 150.0, 10.0, 400.0)
 # Loop s33: an operator's cost switch, OFF by default -- every ICP is researched.  Set to 1, research is not started for
 # a Private Equity ICP (no row of that stage class has qualified in the field; the research costs about $0.29 a round).
@@ -206,11 +213,6 @@ FLAT_CANDIDATES = int(_strategy_number("flat_candidates", 40, 12, 40))
 FLAT_EXTRACT_ROWS = int(_strategy_number("flat_extract_rows", 400, 60, 800))
 FLAT_REVERIFY_ASKS = int(_strategy_number("flat_reverify_asks", 3, 1, 5))
 FLAT_AGENT_LONG_SECONDS = _strategy_number("flat_agent_long_seconds", 2900.0, 60.0, 3600.0)
-# o2: judge mirror, off by default. One cheap model call per 12 rows grades whether each row's cited announcement is
-# really the criterion's event and proves the attribute's change clause (agent/judgemirror.py, ported from the V-line's
-# eventgrade). The grade breaks ties inside a re-check vote tier before draft order: on rich ICPs the pool held 4-11
-# field-qualified companies while 2-4 went out, because that tier fell back to draft order.
-JUDGE_MIRROR = _strategy_number("judge_mirror", 0, 0, 1) >= 1
 RESERVE_CHECKED = 3
 LAST_REPORT: dict[str, Any] = {}
 
@@ -507,85 +509,6 @@ def backfill_empty_slots(companies: list[dict], report: Any, *, limit: int,
     return out, added
 
 
-# o3: stages where a row with no stage evidence and a silent signal never qualified (0 of 466 published rows, 10-14..10-19).
-_STAGE_PROOF_STAGES = ("series a", "series b", "series c", "private equity")
-
-
-def fill_to_limit(companies: list[dict], report: Any, icp: Mapping[str, Any], *, limit: int,
-                  schema: str = sm.SCHEMA_V1, exclude: Optional[set[str]] = None,
-                  verdicts: Optional[Mapping[str, str]] = None) -> tuple[list[dict], list[str]]:
-    """o3: under fit-receipt penalties (FIT_FREE) fill every open slot from the verified surplus.
-
-    From arena-2026-10-22 a row whose fit the judge leaves "unavailable" costs nothing, while a qualified row adds
-    16-18 of the ICP's points, so an empty slot is a ticket thrown away. Still penalized: a proven mismatch, an
-    exclusion, a duplicate, a data-quality issue, and an unverified primary signal on a row whose fit passed. So a
-    surplus row joins only if it shares no identity with the output or with a row the re-check rejected, carries a
-    dated primary signal, was not read as a mismatch by the re-check, and -- on a Series A/B/C+ or Private Equity
-    ICP -- has stage evidence or a signal that names the round. Ranked by stage evidence, re-check verdict, a
-    81-160 character attribute quote, then distinct URLs (59.7% qualified-first on published pairs against 56% for
-    draft order). Appended after the existing rows; never more than ``limit``; re-validated, and the list is
-    returned unchanged if the contract refuses it."""
-
-    limit = max(1, int(limit))
-    if len(companies) >= limit:
-        return companies, []
-    pool = [c for c in list(getattr(report, "surplus", None) or []) if isinstance(c, dict)]
-    if not pool:
-        return companies, []
-    try:
-        signal_round = _sibling_module("precision")._signal_round
-    except Exception:  # noqa: BLE001
-        signal_round = None
-    stage = str(icp.get("company_stage") or "")
-    needs_stage = stage.strip().lower().startswith(_STAGE_PROOF_STAGES)
-    taken = {k for c in companies for k in identity_keys(c)}
-    banned = set(exclude or ())
-    verdicts = dict(verdicts or {})
-    ranked: list[tuple[tuple, dict]] = []
-    for order, row in enumerate(pool):
-        keys = identity_keys(row)
-        if not keys or keys & taken or keys & banned:
-            continue
-        primary = [sig for sig in row.get("intent_signals") or []
-                   if isinstance(sig, Mapping) and sig.get("matched_icp_signal") in (0, None) and sig.get("url")]
-        if not primary or not any(str(sig.get("date") or "").strip() for sig in primary):
-            continue
-        verdict = str(verdicts.get(sm.company_name_key(row.get("company_name")), ""))
-        if verdict == "mismatch":
-            continue
-        proofs = len(row.get("company_stage_evidence") or [])
-        if needs_stage and not proofs and not (signal_round and signal_round(row, stage)):
-            continue
-        attribute = row.get("required_attribute") if isinstance(row.get("required_attribute"), Mapping) else {}
-        quote = len(str(attribute.get("evidence_quote") or ""))
-        try:
-            urls = int(evidence_depth(row)[2])
-        except Exception:  # noqa: BLE001
-            urls = 0
-        tier = {"match": 0, "unavailable": 1}.get(verdict, 2)
-        ranked.append(((-min(proofs, 3), tier, not 81 <= quote <= 160, -urls, order), row))
-    ranked.sort(key=lambda item: item[0])
-    out = list(companies)
-    added: list[str] = []
-    for _, row in ranked:
-        if len(out) >= limit:
-            break
-        keys = identity_keys(row)
-        if keys & taken:
-            continue
-        taken |= keys
-        out.append(row)
-        added.append(str(row.get("company_name") or ""))
-    if not added:
-        return companies, []
-    try:
-        out = sm.validate_output(out, max_companies=limit, schema_version=schema)
-    except Exception as exc:  # noqa: BLE001
-        _log("fill rejected by the output contract (%s): emitting the list unchanged" % type(exc).__name__)
-        return companies, []
-    return out, added
-
-
 def recheck_ashby_postings(companies: list[dict], report: Any, tools: Any, *, deadline: float, limit: int,
                            schema: str, exclude: set[str]) -> list[dict]:
     """Loop s22 (teardown-0925 #6, upstream ab3a1e33): just before output, re-read the Ashby board API (free) and
@@ -824,7 +747,7 @@ def drop_unprovable(companies: list, icp: Mapping[str, Any], report: Any = None)
         # says plainly that a navigation label is not evidence (`91d26d2a`),
         # so such a row can only fail. On arena-2026-10-14 the attribute was
         # the first failing check on five of our sixteen companies.
-        if company.get("_attribute_unproven"):
+        if company.get("_attribute_unproven") and not _recheck_vouches_attribute(company):
             return False
         if stage in _PROOF_MATTERS:
             # Any evidence counts. Two tempting refinements were measured against every published round and
@@ -855,6 +778,149 @@ def drop_unprovable(companies: list, icp: Mapping[str, Any], report: Any = None)
 # Companies our own re-verification confirmed on every dimension, by name key. Filled after `reverify.rerank`
 # and read by the attribute-shape rule, which must never outrank a full re-check.
 _REVERIFY_MATCHED: set = set()
+# s68: companies whose re-check returned "match" on the required attribute itself, by name key. The judge settles the
+# attribute by its own web research (its prompt forbids relying on our citation), and our re-check asks sonar that same
+# question in the judge's words -- so its attribute verdict outranks the shape of OUR quote. On the 10-20 Data
+# Observability ICP (replayed live, 18:30Z) the shape rule dropped Credible Data -- a re-check attribute match that
+# the field qualified 2 of 3 times -- beside Respan, whose three field rows all failed industry. "Every dimension
+# matched" was too strict a pass: Credible Data's size came back unavailable.
+_REVERIFY_ATTRIBUTE_MATCHED: set = set()
+# s70: before the re-check, a strong model reads each company's OWN homepage and says whether the company itself
+# supplies the requested industry + subindustry + product/service -- the question the judge's investigator settles
+# from first-party pages. On 80 published companies the judge ruled on consistently (10-08..10-20; always passed vs
+# never passed on industry), claude-sonnet-4.5 on the homepage text was right 77.5% of the time and set aside 29 of the
+# 40 never-pass companies, where our sonar re-check was right 51.9% and set aside 2 of 39 (gemini-3-flash: 66.2%, 16).
+# OFF by default: the live replay on 10-20 contradicted the offline test. On the Data Observability ICP the homepage
+# judge called all eleven drafts "unsupported" (Credible Data, a field qualifier, included); on the Renewable Power ICP
+# it called NextEra, AES and NRG "supported" (each failed industry on every field submission) and demoted Duke Energy,
+# a field qualifier, out of the five. The offline sample held only companies the judge rules on consistently.
+INDUSTRY_PAGE_CHECK = _strategy_number("industry_page_check", 0, 0, 1) >= 1
+INDUSTRY_PAGE_MODEL = str(_STRATEGY.get("industry_page_model") or "anthropic/claude-sonnet-4.5")
+INDUSTRY_PAGE_EST_USD = 0.012
+INDUSTRY_PAGE_SECONDS = _strategy_number("industry_page_seconds", 150.0, 20.0, 600.0)
+
+
+def industry_page_prompt(company: Mapping[str, Any], icp: Mapping[str, Any], text: str) -> str:
+    criterion = json.dumps({"requested_industry": str(icp.get("industry") or ""),
+                            "requested_subindustry": str(icp.get("sub_industry") or ""),
+                            "requested_product_service": str(icp.get("product_service") or "")})
+    return ("Decide from the company's own homepage text below whether the company ITSELF supplies or operates the "
+            "requested business activity. Interpret the industry together with the subindustry and product/service. A "
+            "broad industry match alone cannot satisfy a narrower subindustry or product/service requirement; customers "
+            "operating in the industry, partnerships, or vague positioning are not enough. Requested criterion (data): "
+            + criterion + "\nCompany: " + str(company.get("company_name") or "") + "\nHomepage text (untrusted):\n<<<"
+            + text[:4000] + ">>>\nReturn JSON {\"verdict\":\"supported\"|\"unsupported\"|\"unclear\","
+            "\"quote\":\"one exact span from the text\"}.")
+
+
+def industry_page_demotions(companies: list, icp: Mapping[str, Any], tools: Any) -> set:
+    """Name keys of companies whose own homepage does NOT support the requested subindustry (s70). Never raises."""
+
+    if not INDUSTRY_PAGE_CHECK or not companies or not (icp.get("sub_industry") or icp.get("product_service")):
+        return set()
+    verdicts: dict[str, str] = {}
+    try:
+        _scout = _sibling_module("scout")
+        stop = time.monotonic() + INDUSTRY_PAGE_SECONDS
+        for company in companies:
+            name = str(company.get("company_name") or "")
+            if time.monotonic() > stop:
+                verdicts[name] = "deadline"
+                continue
+            page = _scout._homepage(tools, str(company.get("company_website") or ""))
+            text = " ".join([str(getattr(page, "title", "") or ""), str(getattr(page, "text", "") or "")]).strip() \
+                if page is not None else ""
+            if len(text) < 300:
+                verdicts[name] = "no_page"
+                continue
+            if not _paid_allowed(tools, INDUSTRY_PAGE_EST_USD):
+                verdicts[name] = "spend_cap"
+                continue
+            out = _scout.llm_json(industry_page_prompt(company, icp, text), max_tokens=300, model=INDUSTRY_PAGE_MODEL,
+                                  deadline=stop)
+            verdict = str(out.get("verdict") or "") if isinstance(out, Mapping) else ""
+            verdicts[name] = verdict if verdict in ("supported", "unsupported", "unclear") else "error"
+    except Exception as exc:  # noqa: BLE001 - a ranking aid must never cost the rows
+        LAST_REPORT["industry_page_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    LAST_REPORT["industry_page"] = verdicts
+    return {sm.company_name_key(name) for name, verdict in verdicts.items() if verdict == "unsupported"}
+# s84 (arena-2026-10-22 analysis): a required attribute that asks for recurring terms ("Sells a subscription ...",
+# "... recurring software or service") is the hardest fit gate: published rows that passed every other fit check
+# passed it 46% of the time against 84% for other attributes. The judge's investigator proves recurrence on its own
+# ("a generic platform, software, pricing contact ... never proves recurring terms"; "an annual fee for the same
+# supplied platform proves recurrence") and our cited quote does not move it (pricing-page citations 28% vs 36%
+# within a company). What predicts it is whether the company publishes a price list: a free GET of <site>/pricing
+# showing a per-month / per-year price found 30 such companies passing 63% against 40% for the other 92 (10-10..
+# 10-22). For those ICPs only, a company without one ranks behind the priced ones of its re-check tier.
+PRICING_RANK = _strategy_number("pricing_rank", 1, 0, 1) >= 1
+PRICING_SECONDS = _strategy_number("pricing_seconds", 45.0, 10.0, 180.0)
+_RECURRING_ATTRIBUTE_RE = re.compile(r"\bsubscription|\brecurring|\bSaaS\b|\bsoftware-as-a-service", re.I)
+_PRICE_LIST_RE = re.compile(
+    r"(?:\$|€|£|USD\s?)\s?\d[\d,.]*\s*(?:/|per)\s*(?:mo\b|month|yr\b|year|user|seat|annum)|per\s+(?:month|year|user|seat)|"
+    r"\b(?:billed|paid)\s+(?:monthly|annually|yearly)\b|/\s?(?:mo|month)\b|\bmonthly\s+plan|\bannual\s+plan", re.I)
+
+
+def _price_list(tools: Any, website: str, deadline: float) -> str:
+    """'priced' when <site>/pricing or /plans reads (free direct GET) as a price list, else 'none'. Never raises."""
+
+    from urllib.parse import urlsplit
+
+    raw = str(website or "").strip()
+    host = (urlsplit(raw if "//" in raw else "https://" + raw).hostname or "").lower()
+    direct = getattr(tools, "_direct", None)
+    if not host or direct is None:
+        return "none"
+    for path in ("/pricing", "/plans"):
+        if time.monotonic() > deadline:
+            return "deadline"
+        try:
+            got = direct.read("https://%s%s" % (host, path), 24_000, deadline=deadline)
+        except Exception:  # noqa: BLE001
+            got = None
+        if not got or not got.get("ok"):
+            continue
+        final = str(got.get("final_url") or "")
+        if ("/pricing" in final or "/plans" in final) and _PRICE_LIST_RE.search(str(got.get("text") or "")):
+            return "priced"
+    return "none"
+
+
+def unpriced_companies(companies: list, icp: Mapping[str, Any], tools: Any) -> set:
+    """Names of companies that publish no price list, for an ICP whose required attribute asks for recurring terms
+    (s84); empty for any other ICP, when the free direct lane is off, or when no company could be read. Never raises."""
+
+    if not PRICING_RANK or not companies or not _RECURRING_ATTRIBUTE_RE.search(str(icp.get("required_attribute") or "")):
+        return set()
+    direct = getattr(tools, "_direct", None)
+    try:
+        if direct is None or not direct.available():
+            return set()
+    except Exception:  # noqa: BLE001
+        return set()
+    verdicts: dict[str, str] = {}
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        stop = time.monotonic() + PRICING_SECONDS
+        names = [str(c.get("company_name") or "") for c in companies]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            found = list(pool.map(lambda c: _price_list(tools, str(c.get("company_website") or ""), stop), companies))
+        verdicts = dict(zip(names, found))
+    except Exception as exc:  # noqa: BLE001 - a ranking aid must never cost the rows
+        LAST_REPORT["pricing_page_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        return set()
+    LAST_REPORT["pricing_page"] = verdicts
+    if not any(v == "priced" for v in verdicts.values()):
+        return set()   # nothing to rank by: an unreadable lane must not reorder the tier
+    return {name for name, verdict in verdicts.items() if verdict != "priced"}
+
+
+ATTRIBUTE_GATE_TRUSTS_RECHECK = _strategy_number("attribute_gate_trusts_recheck", 1, 0, 1) >= 1
+
+
+def _recheck_vouches_attribute(company: Mapping[str, Any]) -> bool:
+    key = sm.company_name_key(company.get("company_name"))
+    return key in _REVERIFY_MATCHED or (ATTRIBUTE_GATE_TRUSTS_RECHECK and key in _REVERIFY_ATTRIBUTE_MATCHED)
 _ATTRIBUTE_RANK_FLOOR = 3
 _NO_ATTRIBUTE_QUOTE = -1   # kept, not dropped: it qualifies 18.1%, above the 17% break-even
 
@@ -911,7 +977,7 @@ def refill_after_gates(companies: list, icp: Mapping[str, Any], report: Any, *, 
         if stage in _PROOF_MATTERS and not row.get("company_stage_evidence"):
             skipped[name] = "no stage evidence"
             continue
-        if asks_attribute and sm.company_name_key(name) not in _REVERIFY_MATCHED:
+        if asks_attribute and not _recheck_vouches_attribute(row):
             rank = attribute_strength(row)
             if rank is None or rank < GATE_REFILL_FLOOR:
                 skipped[name] = "attribute rank %s" % rank
@@ -965,8 +1031,7 @@ def drop_weak_attribute(companies: list, icp: Mapping[str, Any], report: Any = N
     # two rows the same re-check had returned "unavailable" on. Knowledgehook is the only company that has
     # ever qualified on that ICP: the field sent it fifteen times and it passed six. A quote's shape is a
     # weaker signal than five dimensions confirmed, and must not overrule it.
-    confirmed = {c_id for c_id, c in ((id(c), c) for c in companies)
-                 if sm.company_name_key(c.get("company_name")) in _REVERIFY_MATCHED}
+    confirmed = {id(c) for c in companies if _recheck_vouches_attribute(c)}
     strong = [c for c in companies if ranks[id(c)] >= _ATTRIBUTE_RANK_FLOOR or id(c) in confirmed]
     weak = [c for c in companies if 0 <= ranks[id(c)] < _ATTRIBUTE_RANK_FLOOR and id(c) not in confirmed]
     if not strong or not weak:
@@ -1475,6 +1540,22 @@ def apply_cost_policy(tools: Any, snapshot: Any) -> None:
     AGENT_SHARE_V5 = max(AGENT_SHARE_V5, FLAT_AGENT_SHARE)
     AGENT_LONG_SECONDS = max(AGENT_LONG_SECONDS, FLAT_AGENT_LONG_SECONDS)
     REVERIFY_ASKS = max(REVERIFY_ASKS, FLAT_REVERIFY_ASKS)
+    prior = LAST_REPORT.get("icp_prior") if isinstance(LAST_REPORT.get("icp_prior"), Mapping) else {}
+    if FLAT_LEAN_UNPAID and prior.get("pays") is False:
+        ICP_SPEND_CAP_USD = min(ICP_SPEND_CAP_USD, FLAT_LEAN_CAP_USD)
+        RESEARCH_CAP_USD = round(max(0.0, ICP_SPEND_CAP_USD - min(FLAT_HOLDBACK_USD, ICP_SPEND_CAP_USD / 3)), 4)
+        try:
+            tools._phase_cap_usd = RESEARCH_CAP_USD
+            if not getattr(tools, "_unknown_start", False):
+                tools.spend_cap_usd = RESEARCH_CAP_USD
+            _sibling_module("scout").BUDGET_USD = ICP_SPEND_CAP_USD
+        except Exception:  # noqa: BLE001 - a lean cap must never stop the run
+            pass
+        RESERVE_DRAFTS = min(RESERVE_DRAFTS, FLAT_LEAN_RESERVE_DRAFTS)
+        POOL_CHECKED = min(POOL_CHECKED, FLAT_LEAN_POOL) if POOL_CHECKED else POOL_CHECKED
+        REVERIFY_MAX_COMPANIES = min(REVERIFY_MAX_COMPANIES, FLAT_LEAN_POOL)
+        LAST_REPORT["cost_policy"] = "flat_lean"
+        return
     LAST_REPORT["cost_policy"] = "flat"
 
 
@@ -1503,12 +1584,6 @@ def apply_fit_policy(icp: Any) -> None:
         _px.FIT_FREE = FIT_FREE
     except Exception as exc:  # noqa: BLE001 - recorded, so a half-applied policy shows in the report
         LAST_REPORT["fit_policy_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
-    try:   # o3: parked drafts and extra discovery passes in the scout
-        _sc = _sibling_module("scout")
-        _sc.FIT_FREE = FIT_FREE
-        _sc.DISCOVERY_PASSES = DISCOVERY_PASSES if FIT_FREE else 1
-    except Exception as exc:  # noqa: BLE001
-        LAST_REPORT["fit_policy_scout_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     LAST_REPORT["fit_policy"] = "free" if FIT_FREE else "penalized"
 
 
@@ -1968,44 +2043,15 @@ def run_icp(icp: dict) -> list[dict]:
                     reverify_module = importlib.import_module(f"{os.path.basename(_HERE)}.reverify")
                 head = pool[:reverify_n]
                 tail = companies[reverify_n:]
-                mirror_key = None
-                if JUDGE_MIRROR and phase_deadline - time.monotonic() > 120.0:
-                    try:
-                        try:
-                            from . import judgemirror as _jm
-                            from . import scout as _scout_jm
-                        except ImportError:
-                            _jm = importlib.import_module(f"{os.path.basename(_HERE)}.judgemirror")
-                            _scout_jm = importlib.import_module(f"{os.path.basename(_HERE)}.scout")
-                        _jm_factory = _http_client_factory()
-
-                        def _jm_llm(prompt: str, **kw: Any) -> Any:
-                            return _scout_jm.llm_json(prompt, http_client_factory=_jm_factory, **kw)
-
-                        LAST_REPORT["judge_mirror"] = _jm.grade(
-                            head, icp, llm_json=_jm_llm,
-                            deadline=min(phase_deadline - 60.0, time.monotonic() + 90.0))
-                        _note_spend(tools, 0.01)
-                        mirror_key = _jm.order_key
-                    except Exception as exc:  # noqa: BLE001 - grading is optional
-                        LAST_REPORT["judge_mirror"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
-                checked, notes = reverify_module.rerank(
-                    head, icp, http_client_factory=_http_client_factory(),
-                    timeout=min(reverify_module.TIMEOUT_S, phase_deadline - time.monotonic() - 12.0),
-                    asks=REVERIFY_ASKS, order_key=mirror_key)
+                demote = industry_page_demotions(head, icp, tools) if remaining > 240.0 else set()
+                unpriced = unpriced_companies(head, icp, tools) if remaining > 240.0 else set()
+                remaining = phase_deadline - time.monotonic()
+                checked, notes = reverify_module.rerank(head, icp, http_client_factory=_http_client_factory(),
+                                                        timeout=min(reverify_module.TIMEOUT_S, remaining - 12.0),
+                                                        asks=REVERIFY_ASKS, demote=demote, unpriced=unpriced)
                 _note_spend(tools, REVERIFY_EST_USD * len(head) * REVERIFY_ASKS)
                 survivors = {id(c) for c in checked}
-                # o3: only rows the re-check actually dropped are rejected. rerank builds a new dict when it adopts
-                # the observed name, so the old id test also rejected every renamed survivor (sn71-ab-f0: "artifact"
-                # with a match verdict) and kept its identity out of every later refill.
-                entries = notes.get("companies") or []
-                if len(entries) == len(head):
-                    evicted_rows = [row for row, entry in zip(head, entries)
-                                    if isinstance(entry, Mapping) and entry.get("dropped")]
-                else:
-                    kept_keys = {k for c in checked for k in identity_keys(c)}
-                    evicted_rows = [c for c in head if id(c) not in survivors and not (identity_keys(c) & kept_keys)]
-                for evicted in evicted_rows:
+                for evicted in (c for c in head if id(c) not in survivors):
                     rejected |= identity_keys(evicted)
                 if rejected:
                     notes["rejected_identities"] = sorted(rejected)
@@ -2055,6 +2101,11 @@ def run_icp(icp: dict) -> list[dict]:
                 _REVERIFY_MATCHED.update(
                     sm.company_name_key(entry.get("company")) for entry in (notes.get("companies") or [])
                     if isinstance(entry, Mapping) and entry.get("overall") == "match")
+                _REVERIFY_ATTRIBUTE_MATCHED.clear()
+                _REVERIFY_ATTRIBUTE_MATCHED.update(
+                    sm.company_name_key(entry.get("company")) for entry in (notes.get("companies") or [])
+                    if isinstance(entry, Mapping) and isinstance(entry.get("dimensions"), Mapping)
+                    and entry["dimensions"].get("required_attribute") == "match")
                 checkpoint(companies, schema=schema, limit=limit)
                 refresh_spend(tools)
             except Exception as exc:
@@ -2074,30 +2125,6 @@ def run_icp(icp: dict) -> list[dict]:
         companies = drop_unprovable(companies, icp, report)
         companies = refill_after_gates(companies, icp, report, emptied=before_gates - len(companies), limit=limit,
                                        schema=schema, exclude=rejected)
-        if FIT_FREE and FILL_TO_LIMIT and len(companies) < limit:
-            verdicts = {sm.company_name_key(entry.get("company")): str(entry.get("overall") or "")
-                        for entry in ((LAST_REPORT.get("reverify") or {}).get("companies") or [])
-                        if isinstance(entry, Mapping)}
-            companies, filled = fill_to_limit(companies, report, icp, limit=limit, schema=schema,
-                                              exclude=rejected, verdicts=verdicts)
-            if filled:
-                fill_notes: dict[str, Any] = {"added": filled}
-                LAST_REPORT["fill_to_limit"] = fill_notes
-                if paragraph_on and time.monotonic() < phase_deadline - 75.0 and _paid_allowed(tools, PARAGRAPH_MAX_USD):
-                    try:
-                        _agent_for_model = _agent_module()
-                        model_name = str(_STRATEGY.get("paragraph_model") or "").strip() or \
-                            os.environ.get("ARENA_MODEL", str(_STRATEGY.get("model") or "")).strip() or \
-                            _agent_for_model.DEFAULT_MODEL
-                        picks = [c for c in companies if str(c.get("company_name") or "") in set(filled)]
-                        fill_notes["paragraphs"] = details_module.write_paragraphs(
-                            picks, icp, evidence=report.evidence, model_name=model_name,
-                            timeout=min(60.0, phase_deadline - time.monotonic() - 20.0),
-                            http_client_factory=_http_client_factory())
-                        _note_spend(tools, PARAGRAPH_MAX_USD)
-                    except Exception as exc:  # noqa: BLE001 - the deterministic paragraph stands
-                        fill_notes["paragraph_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
-                checkpoint(companies, schema=schema, limit=limit)
         companies = judge_preflight(companies, schema=schema, report=report, tools=tools)
         LAST_REPORT["calls"] = tools.calls
         try:

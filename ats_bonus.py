@@ -54,6 +54,8 @@ LAST: dict[str, Any] = {}
 # A second posting is added next to an existing one: the judge counts the strongest verified signal per criterion
 # and a rejected bonus posting does not zero the company (09-29 local: ScaleOps qualified with one rejected).
 ATS_URL = re.compile(r"greenhouse\.io|ashbyhq\.com|lever\.co|workable\.com", re.I)
+# s66: boards whose posting date the judge can read; others are not attached as a dated bonus.
+JUDGE_DATED_BOARDS = frozenset({"greenhouse", "ashby"})
 
 
 def _client() -> httpx.Client:
@@ -293,6 +295,16 @@ def attach_hiring_signals(companies: list[dict[str, Any]], icp: Mapping[str, Any
         notes["skipped"] = "no HIRING second criterion"
         return notes
     index, text, max_age = crit
+    try:
+        from .arena_tools import bonus_category_allowed
+        allowed = bonus_category_allowed("HIRING")
+    except Exception:  # noqa: BLE001 - standalone loads keep the s69 default (HIRING withheld)
+        allowed = False
+    if not allowed:
+        notes["skipped"] = "HIRING bonus withheld (s69)"
+        LAST.clear()
+        LAST.update(notes)
+        return notes
     for company in companies:
         if time.monotonic() > deadline - 5:
             notes["stopped"] = "deadline"
@@ -311,6 +323,12 @@ def attach_hiring_signals(companies: list[dict[str, Any]], icp: Mapping[str, Any
             continue
         if not post:
             notes["missed"].append(name)
+            continue
+        if post.get("ats") not in JUDGE_DATED_BOARDS:
+            # s66: the judge reads a posting date only from Greenhouse (first_published) and Ashby (publishedAt)
+            # (intent_verification_three_stage.py); a Lever or Workable posting reaches it undated, so the paragraph's
+            # "first published <date>" clause is unprovable and the review zeroes the whole company for a bonus.
+            notes["missed"].append(f"{name}: {post.get('ats')} posting carries no date the judge can read")
             continue
         if any(str(s.get("url") or "").rstrip("/") == post["url"].rstrip("/") for s in existing):
             notes["missed"].append(f"{name}: same posting already attached")

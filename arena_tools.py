@@ -83,6 +83,21 @@ def load_strategy() -> dict[str, Any]:
 
 
 STRATEGY = load_strategy()
+
+# s69: which BONUS criteria (matched_icp_signal > 0) may carry a signal at all. The judge zeroes a company whose
+# paragraph states a bonus it could not verify, and must see every bonus it did verify; over the published rows of
+# 2026-10-08..10-20 that reached the paragraph check, rows carrying a bonus failed it 27.2% of the time against 7.6%
+# without, while a verified bonus lifts a lone qualified row from about 15.5 to 20 points. Break-even is a bonus that
+# verifies about 78% of the time. By the bonus criterion's category: FUNDING failed 16% (n=73, pays), MARKET_EXPANSION
+# 25% (n=20, about even), HIRING 56% (n=9) and PRODUCT_LAUNCH 63% (n=19) (both lose). "ALL" restores every category.
+BONUS_CATEGORIES_DEFAULT = "FUNDING,MARKET_EXPANSION,LEADERSHIP_CHANGE,REGULATORY_CLEARANCE"
+
+
+def bonus_category_allowed(category: Any) -> bool:
+    raw = str(STRATEGY.get("bonus_categories", BONUS_CATEGORIES_DEFAULT) or "").strip()
+    if raw.upper() == "ALL":
+        return True
+    return str(category or "").strip().upper() in {c.strip().upper() for c in raw.split(",") if c.strip()}
 # Call ceiling on a round whose snapshot carries no Deepline quota (limit 0, remaining null); 0 keeps the default.
 QUOTA_OPEN_BUDGET = int(STRATEGY.get("quota_open_budget") or 300)
 

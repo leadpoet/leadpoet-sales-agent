@@ -176,6 +176,91 @@ _RUBRIC_RE = re.compile(r"\b(?:aligns?|fits?|match(?:es|ing)?)\s+(?:with\s+)?(?:
                         r"\b(?:ideal\s+customer\s+profile|requested\s+ICP|the\s+ICP|this\s+ICP)\b", re.I)
 _TIMING_WORDS = frozenset({"recent", "recently", "newly"})
 _TIMING_WORD_RE = re.compile(r"\b(?:recently|newly)\s+|\brecent\s+(?=\w)", re.I)
+# s66: the judge drops ANY sentence holding "recent", "recently" or "newly" from its second-chance recheck of unproven
+# sentences (intent_details._RELATIVE_TIMING_QUALIFIER), even when the sentence carries a calendar date. The words add
+# nothing a date does not say, so they are removed from every paragraph we send.
+DROP_RECENCY = _knob("paragraph_drop_recency", 1)
+_QUALIFIER_RE = re.compile(r"\b(?:recently|newly),?\s+|\brecent\s+(?=\w)", re.I)
+
+
+# s82: a description cut from a wire release can open inside its dateline ("19, 2025 (GLOBE NEWSWIRE) -- LakeFusion,
+# ..."); the deterministic fallback then wrote "A source dated November 19, 2025 reports that 19, 2025 (GLOBE
+# NEWSWIRE) -- LakeFusion ..." on a 10-22 replay. Only the fallback's own wording is cleaned; the signal is untouched.
+_WIRE_DATELINE_RE = re.compile(
+    r"^.{0,140}?(?:\((?:GLOBE ?NEWSWIRE|BUSINESS ?WIRE|ACCESS ?WIRE|ACCESS Newswire|NEWSFILE[^)]{0,30})\)|"
+    r"--\s*\(BUSINESS ?WIRE\)\s*--|/PRNewswire(?:-[A-Za-z]+)?/|/CNW/|/EINPresswire/)\s*[-\u2013\u2014]*\s*", re.I)
+
+
+# s83 (arena-2026-10-22 analysis): three wordings the judge's paragraph review rejects far more often than the rest.
+# Published rows that passed every other check, 10-09..10-22 (852 rows, 99 paragraph failures; ours failed 12 of 48
+# since 10-18, the field 31 of 187), pass rates within the same company: a generic closing noun ("This activity /
+# These developments / moves / initiatives may ...") 65% vs 85%; a copied Title Case headline ("says Acme Launches
+# New Platform", a " | " site name, "Title: subtitle") 52% vs 77%; a promotional descriptor ("pioneering", "the
+# first", "leading", "the only") 68% vs 91%, attributed or not (Phreesia "described as a pioneering offering" failed
+# 3 of 3). Together they mark 63% of the failures and 10% of the passes. Such a paragraph is sent back once with the
+# rule; a redraft that still breaks only these rules is kept, because the deterministic paragraph is worse (31
+# published paragraphs in its style, 74% failed). 0 = as before.
+STYLE_RULES = _knob("paragraph_style_rules", 1)
+_PROMO_RE = re.compile(
+    r"\b(?:pioneering|groundbreaking|revolutionary|industry[- ]first|first[- ]ever|first[- ]in[- ]class|"
+    r"first[- ]of[- ]its[- ]kind|(?:the|a)\s+first(?!\s+(?:quarter|half|phase|round|close|closing|tranche|day|week|month|"
+    r"year|stage|step|time))|leading(?!\s+(?:to|up|into|the\s+way))|an?\s+leader\s+in|the\s+leader\s+in|"
+    r"market[- ]leading|the\s+only|best[- ]in[- ]class|cutting[- ]edge|new\s+standard|innovative|state[- ]of[- ]the[- ]art|"
+    r"world[- ]class|award[- ]winning)\b", re.I)
+_GENERIC_EVENT_RE = re.compile(r"\b(?:This|These)\s+(?:[\w-]+\s+){0,4}?(?:activit(?:y|ies)|developments|moves?|initiatives?|"
+                               r"growth|efforts?)\s+(?:may|could|might|suggests?|would|can)\b")
+# A headline verb in Title Case ("Acme Launches New ...", "Acme Accepted to FDA's ..."), not a name of several words.
+_HEADLINE_RE = re.compile(r"\b(?:says|reports\s+that|states\s+that|announced\s+that)\s+(?:[A-Z][\w.&'-]*\s+){1,3}"
+                          r"(?:[A-Z][a-z]+(?:s|ed)|Bring|Launch|Unveil|Introduce|Partner|Open|Sign|Debut|Raise|Expand|Join|"
+                          r"Name|Appoint|Add|Win|Set|Make|Hire|Acquire|Close|Secure|Complete|Release|Roll)\s+"
+                          r"(?:(?:in|of|for|with|and|the|to|a|an|on|at|by|from)\s+)*[A-Z][\w.'-]*")
+_TITLE_PASTE_RE = re.compile(r"\s\|\s|\|\s*[\w.&'-]+\s*\.|\b(?:says|reports\s+that|states\s+that)\s+[^.]{0,60}?:\s")
+
+
+def style_rule(text: Any, company_name: str = "") -> str:
+    """The s83 wording rule the paragraph breaks ('' when none). The company's own name is masked first, so a name of
+    several capitalised words is not read as a copied headline."""
+
+    if not STYLE_RULES:
+        return ""
+    flat = " ".join(str(text or "").split())
+    hit = _PROMO_RE.search(flat)
+    if hit:
+        return (f"Leave out promotional or superlative wording ('{hit.group(0)}'), even when the source uses it; state "
+                "only the plain activity.")
+    hit = _GENERIC_EVENT_RE.search(flat)
+    if hit:
+        return (f"In the conditional clause, name the event itself ('This launch may ...', 'This funding may ...', "
+                f"'This partnership may ...'), not a generic '{' '.join(hit.group(0).split()[:-1])}'.")
+    name = " ".join(str(company_name or "").split())
+    masked = flat.replace(name, "Acme") if len(name) >= 2 else flat
+    if _TITLE_PASTE_RE.search(masked) or _HEADLINE_RE.search(masked):
+        return ("Do not copy a page title or headline (Title Case words, a ' | ' site name, 'Title: subtitle'); restate "
+                "the event as a plain sentence with a lower-case verb, e.g. 'A report dated May 4, 2026 says Acme "
+                "launched ...'.")
+    return ""
+
+
+def strip_wire_dateline(text: Any) -> str:
+    """The text without a leading press-wire dateline, when enough of a sentence remains."""
+
+    value = " ".join(str(text or "").split())
+    m = _WIRE_DATELINE_RE.match(value)
+    if not m:
+        return value
+    rest = value[m.end():].lstrip(" -\u2013\u2014")
+    return rest if len(rest) >= 40 and rest[:1].isupper() else value
+
+
+def drop_timing_qualifiers(text: str) -> str:
+    """Remove "recent/recently/newly" qualifiers, re-capitalising a sentence that started with one."""
+
+    def repl(match: re.Match) -> str:
+        return "\0" if match.start() == 0 or re.search(r"[.!?][\"'’”]?\s*$", text[:match.start()]) else ""
+
+    out = _QUALIFIER_RE.sub(repl, text)
+    out = re.sub(r"\0(\W*)(\w)", lambda m: m.group(1) + m.group(2).upper(), out).replace("\0", "")
+    return " ".join(out.split())
 _SENTENCE_CUT_RE = re.compile(r"(?<=[.!?])[\"'’”]?\s+(?=[A-Z\"'“‘])")
 _UNIT_SPLIT_RE = re.compile(r"(?<=[.!?][\"'’”])\s+|(?<=[.!?])\s+")
 _FIRST_PERSON_RE = re.compile(r"^\W*(?:\S+\s+){0,3}?(?:[Ww]e|[Ww]e['’](?:re|ve|ll|d)|[Oo]ur|[Oo]urs|I['’](?:m|ve)|[Mm]y)\b")
@@ -404,7 +489,9 @@ _CLOSINGS = {
     "LEADERSHIP_CHANGE": "This leadership change may shape {name}'s own work on {focus}.",
     "HIRING": "This open role may extend {name}'s own work on {focus}.",
 }
-_DEFAULT_CLOSING = "This activity may extend {name}'s own work on {focus}."
+# s83: "This activity may ..." is the closing the judge rejects most (35 published paragraphs, 54% failed).
+_DEFAULT_CLOSING = ("This may extend {name}'s own work on {focus}." if STYLE_RULES
+                    else "This activity may extend {name}'s own work on {focus}.")
 _KIND_WORDS = (
     ("HIRING", r"\bis\s+hiring\b|\bjob\s+posting\b|\bopen\s+(?:role|position)s?\b|\brecruit\w*|\bis\s+looking\s+for\s+an?\b"),
     ("FUNDING", r"\bfunding\b|\braise[sd]?\b|\braising\b|\bseed\s+round\b|\bseries\s+[a-z]\b|\bfinancing\b|\binvestment\s+round\b"),
@@ -469,6 +556,7 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
             headline = ""
         if headline:
             desc = headline
+        desc = strip_wire_dateline(desc)
         clause = _clause(name, desc)
         when = human_date(signal.get("date")) if signal.get("date_visible", True) else ""
         sentence = (f"A source dated {when} reports that {clause}." if when and when.casefold() not in clause.casefold()
@@ -477,8 +565,8 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
             body = " ".join(desc.split()).strip("\"'“” ").rstrip(".")
             sentence = f'A source dated {when} reports that "{body}."' if when else f'A source reports that "{body}."'
         sentence = _CONTROL_RE.sub(" ", sentence)
-        if unbound_timing(sentence):
-            sentence = " ".join(_TIMING_WORD_RE.sub("", sentence).split())
+        if unbound_timing(sentence) or DROP_RECENCY:
+            sentence = drop_timing_qualifiers(sentence)
         rubric = _RUBRIC_RE.search(sentence)
         if rubric:
             head = re.sub(r"(?:,|\s)+(?:that|which|and|to|it|this)?\s*$", "", sentence[:rubric.start()], flags=re.I)
@@ -487,7 +575,7 @@ def fallback_paragraph(*, company_name: str, icp: Mapping[str, Any],
             break
         sentences.append(sentence)
     if not sentences:
-        sentences.append(f"{name} shows recent activity that the cited sources describe.")
+        sentences.append(f"{name} shows activity that the cited sources describe.")
     focus = _icp_focus(icp)
     category = str(icp.get("intent_category") or "").strip().upper()
     try:
@@ -520,7 +608,7 @@ def covers_signals(text: str, signals: list[Mapping[str, Any]], *, company_name:
         generic |= set(sm.normalize_text(_icp_focus(icp or {})).split())
     except Exception:
         pass
-    for signal in signals:
+    def covered(signal: Mapping[str, Any]) -> bool:
         described = str(signal.get("description") or "")
         try:   # s37: a paragraph that states the headline covers a signal whose snippet was cut in mid-sentence
             described += " " + (page_title(signal, company_name) if _cut_off(described) else "")
@@ -532,13 +620,52 @@ def covers_signals(text: str, signals: list[Mapping[str, Any]], *, company_name:
         when = str(signal.get("date") or "")[:10]
         dated = bool(when) and (when in text or human_date(when).casefold() in text.casefold())
         if content:
-            if sum(1 for w in content if w in words) >= max(1, min(2, len(content)) - (1 if dated else 0)):
+            return sum(1 for w in content if w in words) >= max(1, min(2, len(content)) - (1 if dated else 0))
+        return dated
+
+    return all(any(covered(s) for s in group) for group in event_groups(signals))
+
+
+# s87 (arena-2026-10-22 live replay of 10-22 #6): two sources for one funding round, same day, worded differently. The
+# writer states the round once, as the judge asks ("Combine related evidence without repeating one event merely
+# because it has multiple sources"), and the word check above then failed the second description: 3 of 8 paragraphs
+# fell back to the deterministic one, whose style failed 74% of 31 published uses. Signals that share a URL or an
+# event date are one event here: stating any of them covers the group. 0 = every signal on its own, as before.
+EVENT_GROUPS = _knob("paragraph_event_groups", 1)
+
+
+def _event_url(url: Any) -> str:
+    split = urlsplit(str(url or "").strip())
+    return ((split.hostname or "").lower().removeprefix("www.") + split.path.rstrip("/")).casefold()
+
+
+def event_groups(signals: list[Mapping[str, Any]]) -> list[list[Mapping[str, Any]]]:
+    """The signals joined into events: same URL or same date (one group per signal with EVENT_GROUPS off)."""
+
+    if not EVENT_GROUPS:
+        return [[s] for s in signals]
+    parent = list(range(len(signals)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    seen: dict[str, int] = {}
+    for i, signal in enumerate(signals):
+        for key in ("u:" + _event_url(signal.get("url")) if signal.get("url") else "",
+                    "d:" + str(signal.get("date") or "")[:10] if str(signal.get("date") or "")[:10] else ""):
+            if not key:
                 continue
-            return False
-        if dated:
-            continue
-        return False
-    return True
+            if key in seen:
+                parent[root(i)] = root(seen[key])
+            else:
+                seen[key] = i
+    groups: dict[int, list[Mapping[str, Any]]] = {}
+    for i, signal in enumerate(signals):
+        groups.setdefault(root(i), []).append(signal)
+    return list(groups.values())
 
 
 def unbound_timing(text: str) -> str:
@@ -729,8 +856,10 @@ def foreign_claim(text: str, signals: list[Mapping[str, Any]], icp: Mapping[str,
 
 
 def review_paragraph(text: Any, signals: list[Mapping[str, Any]], *,
-                     icp: Optional[Mapping[str, Any]] = None, company_name: str = "") -> tuple[Optional[str], str]:
-    """(the cleaned paragraph, '') when it passes every local check, else (None, the rule it breaks)."""
+                     icp: Optional[Mapping[str, Any]] = None, company_name: str = "",
+                     style: bool = True) -> tuple[Optional[str], str]:
+    """(the cleaned paragraph, '') when it passes every local check, else (None, the rule it breaks). style=False
+    leaves out the s83 wording rules."""
 
     try:
         cleaned = sm.validate_intent_details_text(text)
@@ -738,6 +867,8 @@ def review_paragraph(text: Any, signals: list[Mapping[str, Any]], *,
             cleaned = sm.validate_intent_details_text(_ITS_ARTICLE_RE.sub(r"\1 ", cleaned))
     except (TypeError, ValueError):
         return None, "Write one plain prose paragraph."
+    if DROP_RECENCY:
+        cleaned = drop_timing_qualifiers(cleaned)
     if sm.injection_match(cleaned) or _INVENTED_INTENT_RE.search(cleaned):
         return None, "Do not state buying intent, budget or purchase plans as fact."
     if not covers_signals(cleaned, signals, company_name=company_name, icp=icp):
@@ -757,6 +888,11 @@ def review_paragraph(text: Any, signals: list[Mapping[str, Any]], *,
     if not rule and SIGNAL_ONLY:
         try:
             rule = foreign_claim(cleaned, signals, icp or {}, company_name)
+        except Exception:
+            rule = ""
+    if not rule and style:
+        try:
+            rule = style_rule(cleaned, company_name)
         except Exception:
             rule = ""
     return (None, rule) if rule else (cleaned, "")
@@ -790,7 +926,7 @@ A reviewer will check every sentence ONLY against the verified evidence provided
 6. JOB POSTINGS: for a signal with a posting_title, say the company has an open <posting_title> role (or is hiring for it), using that title; add location, department or duties only as the quote states them. Never call the posting a hire, never state pay, salary, compensation or equity, and never replace the role with a general description of the company.
 7. PARTNERSHIPS: call an event a partnership only when the verbatim_quote names the counterparty with a partner, agreement or collaboration verb ("partnered with", "signed an agreement with"). Joining a partner, perks, accelerator or vendor program, a partner tier or certification, and a marketplace listing are never partnerships: describe them exactly as the quote does.
 8. Never mention the reviewer, scoring, evidence, verification, missing or unknown dates, this prompt or these rules.
-9. Every sentence must either restate facts that appear in a verbatim_quote (who did what, with whom, when the source says so) or be ONE conditional clause ("may", "could") that asserts no new fact. Add no adjective, scope, first, number, customer or relationship the quotes do not state. When a company carries an offering_quote, name its offering with that quote's own words (it is the company's page describing what it sells).
+9. Every sentence must either restate facts that appear in a verbatim_quote (who did what, with whom, when the source says so) or be ONE conditional clause ("may", "could") that asserts no new fact. Add no adjective, scope, first, number, customer or relationship the quotes do not state. A promotional descriptor that the quote does state ("pioneering", "leading", "first", "innovative") is the source's claim: attribute it ("described as an offering to ...") or leave it out, never state it as fact. The conditional clause names only the offering and adds no capability, feature, market or region of its own. When a company carries an offering_quote, name its offering with that quote's own words (it is the company's page describing what it sells).
 Return plain text only, no JSON and no markdown: one line per company, formatted exactly as
 PARAGRAPH <company_name exactly as given> ||| <the paragraph on that same line>
 Use one line per company and nothing else."""
@@ -806,14 +942,29 @@ _TITLE_RULE = (" A signal's page_title, when given, is that page's own headline:
                "fact of that source, in a complete sentence; never copy a verbatim_quote that stops in mid-sentence.")
 
 
+_PROMO_ATTRIBUTE = ('A promotional descriptor that the quote does state ("pioneering", "leading", "first", "innovative") is '
+                    'the source\'s claim: attribute it ("described as an offering to ...") or leave it out, never state it '
+                    'as fact.')
+_PROMO_LEAVE_OUT = ('A promotional or superlative descriptor that the quote does state ("pioneering", "leading", "the first", '
+                    '"the only", "innovative") is the source\'s claim: leave it out, even attributed.')
+_STYLE_RULE = ('10. Write every sentence in your own plain words: never copy a headline or page title (no Title Case phrases, '
+               'no " | " site names, no "Title: subtitle"); use a lower-case verb ("A report dated May 4, 2026 says Acme '
+               'launched ..."). In the conditional clause name the event as the criterion names it ("This launch may ...", '
+               '"This funding may ...", "This launch and partnership may ..."), never a generic "This activity", "These '
+               'developments", "These moves", "These initiatives" or "This growth".')
+
+
 def _instructions(title: bool = False) -> str:
     """The writer's rules; with paragraph_signal_only the offering is named in the ICP's words, not the homepage's.
-    The headline rule goes only into a request that carries a page_title."""
+    The headline rule goes only into a request that carries a page_title. s83 adds the wording rules."""
 
-    if not SIGNAL_ONLY:
-        return _INSTRUCTIONS
-    rules = (_INSTRUCTIONS.replace(_OFFERING_QUOTE_RULE, _SIGNAL_ONLY_RULE + (_TITLE_RULE if PARAGRAPH_TITLE and title else ""))
-             .replace("with the icp offering_phrase or a close paraphrase (", "with the icp offering_phrase ("))
+    rules = _INSTRUCTIONS
+    if SIGNAL_ONLY:
+        rules = (rules.replace(_OFFERING_QUOTE_RULE, _SIGNAL_ONLY_RULE + (_TITLE_RULE if PARAGRAPH_TITLE and title else ""))
+                 .replace("with the icp offering_phrase or a close paraphrase (", "with the icp offering_phrase ("))
+    if STYLE_RULES:
+        rules = (rules.replace(_PROMO_ATTRIBUTE, _PROMO_LEAVE_OUT)
+                 .replace("\nReturn plain text only", "\n" + _STYLE_RULE + "\nReturn plain text only", 1))
     return rules
 
 
@@ -1009,6 +1160,7 @@ def write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
             (None, "No paragraph was returned for this company.")
         verdicts[key] = (text, rule, candidate or "")
     redo = [c for c in companies if not verdicts[sm.company_name_key(c.get("company_name"))][0]]
+    first_drafts = {k: v[2] for k, v in verdicts.items()}
     reask_timeout = min(float(timeout), 30.0)
     if called and redo and float(timeout) >= 40.0 and time.monotonic() - started + reask_timeout <= 2.0 * float(timeout) + 2.0:
         feedback = {k: (v[2], v[1]) for k, v in verdicts.items() if not v[0]}
@@ -1030,6 +1182,15 @@ def write_paragraphs(companies: list[dict[str, Any]], icp: Mapping[str, Any], *,
     for company in companies:
         key = sm.company_name_key(company.get("company_name"))
         text, rule, _ = verdicts[key]
+        if not text and STYLE_RULES:
+            # s83: a draft that breaks only a wording rule beats the deterministic paragraph; the redraft first.
+            for draft in (verdicts[key][2], first_drafts.get(key)):
+                kept = review_paragraph(draft, evidence.get(key, []), icp=icp, company_name=str(company.get("company_name") or ""),
+                                        style=False)[0] if draft else None
+                if kept:
+                    text = kept
+                    notes["style_kept"] = notes.get("style_kept", 0) + 1
+                    break
         if text:
             company["intent_details"] = text
             notes["accepted"] += 1

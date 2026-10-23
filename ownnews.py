@@ -290,6 +290,238 @@ def found_rows(icp: Mapping[str, Any], tools: Any, companies: list, *, find_date
     return rows
 
 
+# s74 -- the company's own announcement of an event we found in a third-party story. Over the published rows of
+# 2026-10-01..10-21, pairing submissions that cited the same company on the same ICP from its own domain and from
+# elsewhere, and weighting every company once (a fleet sending one company ten times otherwise decides the answer):
+#
+#   category              10-01..13 own vs not        10-14..21 own vs not
+#   PRODUCT_LAUNCH        20% vs  7% (9 companies)    36% vs 24% (19 companies)
+#   FUNDING               25% vs 33% (3)              53% vs 53% (19)
+#   LEADERSHIP_CHANGE     67% vs 60% (5)              30% vs 30% (10)
+#   PARTNERSHIP            7% vs  0% (7)              13% vs 11% (9)
+#
+# Only a launch gains, in both periods; against a wire copy the launch gap is 33% vs 21% (26 companies), while a
+# funding round reads as well from PR Newswire as from the newsroom (54% vs 66% over 9). So for a launch ICP a
+# third-party primary gets its own-domain twin offered first, and the usual signal checks in verify.py decide.
+# Offline on published cases (sn71-work/tools/own_copy_eval.py), with the launch rules below (address words shared
+# with the story's, 14 days at most): 11 PRODUCT_LAUNCH finds held no wrong page -- 5 of the 7 with a known own copy
+# were that page, the other 2 another launch of the same company. The FUNDING matcher (round + amount) took the
+# right page 7 of 7 times and stays available through ``categories``, unused.
+COPY_CATEGORIES = ("PRODUCT_LAUNCH",)
+COPY_INDEX_PATHS = ("/news", "/newsroom", "/press", "/press-releases", "/insights", "/company/news", "/media",
+                    "/blog", "/resources/news", "/changelog", "/whats-new", "/releases")
+MAX_COPY_INDEXES = 4        # index pages read per company
+MAX_COPY_POSTS = 3          # candidate posts read per company
+MAX_COPY_DRIFT_DAYS = 45    # an own post this far from the story's date reports a different event
+_ROUND_RE = re.compile(r"\b(pre-seed|seed|series\s+[a-k](?:-?\d)?|growth\s+(?:round|equity))\b", re.I)
+_AMOUNT_RE = re.compile(r"(?:US\s?)?[$€£]\s?(\d+(?:[.,]\d+)?)\s*(million|billion|mn|bn|m|b)\b"
+                        r"|(\d+(?:[.,]\d+)?)\s*(million|billion)\b", re.I)
+_FUNDING_WORDS_RE = re.compile(r"fund|financ|raise|rais|secur|clos|invest|round", re.I)
+_PRODUCT_STOP = frozenset("""the a an and or of for to in on with today announces announced announce launches launched
+launch launching introduces introduced introducing unveils unveiled new now available general availability generally
+platform product products solution solutions company inc llc ltd corp ai its their our your this that from by at as
+first latest next all more most into via is are was were has have will be been being""".split())
+
+
+def _round_label(text: Any) -> str:
+    """'Series C' as 'series c' (spaces and numbering normalised), '' when the text names no round."""
+
+    m = _ROUND_RE.search(str(text or ""))
+    return re.sub(r"[\s-]+", " ", m.group(1).lower()) if m else ""
+
+
+def _amounts(text: Any) -> set:
+    """Money amounts as ('75', 'million') pairs; '$75M', '$75 million' and '75 million' read alike."""
+
+    unit = {"m": "million", "mn": "million", "million": "million", "b": "billion", "bn": "billion", "billion": "billion"}
+    out = set()
+    for m in _AMOUNT_RE.finditer(str(text or "")):
+        number, word = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        value = number.replace(",", ".").rstrip("0").rstrip(".") if "." in number or "," in number else number
+        out.add((value, unit[word.lower()]))
+    return out
+
+
+def _product_terms(text: Any, company: str) -> set:
+    """The capitalised words of a launch story that are neither the company's own name nor launch boilerplate."""
+
+    own = {w.lower() for w in re.findall(r"[A-Za-z0-9]+", company)}
+    terms = set()
+    for word in re.findall(r"\b[A-Z][A-Za-z0-9]{3,}\b", str(text or "")):
+        low = word.lower()
+        if low not in own and low not in _PRODUCT_STOP:
+            terms.add(low)
+    return terms
+
+
+def event_terms(description: Any, company: str, category: str, story_url: Any = "") -> dict:
+    """What an own post has to say to be the same event: {'round', 'amounts', 'products'}; empty when unknown.
+
+    A launch's product words are the capitalised words of the story that its own address repeats ("Palette Neat"
+    in .../sima-ai-launches-palette-neat-...): taken alone, the capitalised words were sentence openers and place
+    names ("After", "Francisco") in the first live runs. Without such an overlap the capitalised words stand."""
+
+    text = str(description or "")
+    if category == "FUNDING":
+        label = _round_label(text)
+        return {"round": label, "amounts": _amounts(text)} if label else {}
+    if category == "PRODUCT_LAUNCH":
+        products = _product_terms(text, company)
+        named = products & _slug_words(story_url, company)
+        return {"products": named or products} if products else {}
+    return {}
+
+
+def _slug_score(url: str, terms: Mapping[str, Any]) -> int:
+    path = urlsplit(url).path.lower()
+    words = set(re.split(r"[^a-z0-9]+", path))
+    score = 0
+    label = terms.get("round") or ""
+    if label:
+        letter = label.split()[-1]
+        if re.search(r"series[-_]?" + re.escape(letter) + r"\b", path) or (label in {"seed", "pre seed"} and "seed" in words):
+            score += 3
+        if any(number in words for number, _ in terms.get("amounts") or ()):
+            score += 2
+        if _FUNDING_WORDS_RE.search(path):
+            score += 1
+    for product in terms.get("products") or ():
+        if product in words:
+            score += 3
+    if _LAUNCH_RE.search(path.replace("-", " ")):
+        score += 1
+    return score
+
+
+def same_event(text: str, company: str, terms: Mapping[str, Any]) -> str:
+    """The sentence of an own page that reports the event, or '' when the page does not report it."""
+
+    body = " ".join(str(text or "").split())
+    if len(body) < 200:
+        return ""
+    name = company.lower()
+    sentences = re.split(r"(?<=[.!?])\s+", body[:20000])
+    label = terms.get("round") or ""
+    if label:
+        page_amounts = _amounts(body)
+        if terms.get("amounts") and not (terms["amounts"] & page_amounts):
+            return ""
+        for sentence in sentences:
+            if _round_label(sentence) == label and (name in sentence.lower() or _FUNDING_WORDS_RE.search(sentence)):
+                return sentence.strip()[:300]
+        return ""
+    products = terms.get("products") or set()
+    if products:
+        for sentence in sentences:
+            low = sentence.lower()
+            if any(re.search(r"\b" + re.escape(p) + r"\b", low) for p in products) and _LAUNCH_RE.search(sentence):
+                return sentence.strip()[:300]
+    return ""
+
+
+def _day(value: Any):
+    try:
+        from datetime import date as _date
+
+        return _date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+MAX_LAUNCH_DRIFT_DAYS = 14   # a launch is announced the same week everywhere it is reported
+_SLUG_STOP = _PRODUCT_STOP | frozenset("""news press release blog post article com www html htm php aspx index story stories
+read amp en us uk releases home newsroom media insights resources updates update announcements announcement about
+events detail details view content pages page articles posts pressroom investor investors newsreleases""".split())
+# ("home" sits in every Business Wire address and "releases" in most press-release ones: left in, two of them
+#  alone passed the two-shared-words rule; the first live query searched "Community Health Systems home releases".)
+
+
+def _slug_words(url: Any, company: str) -> set:
+    """The distinctive words of a URL path: no company-name words, no boilerplate, no bare numbers."""
+
+    own = {w.lower() for w in re.findall(r"[A-Za-z0-9]+", company)}
+    words = set(re.split(r"[^a-z0-9]+", urlsplit(str(url or "")).path.lower()))
+    return {w for w in words if len(w) >= 3 and not w.isdigit() and w not in own and w not in _SLUG_STOP}
+
+
+def own_copy(company: str, domain: str, signal: Mapping[str, Any], category: str, *, reader, find_date, age_days,
+             window: int, deadline: float, clock, searcher=None,
+             categories: tuple = COPY_CATEGORIES) -> Optional[dict[str, Any]]:
+    """The company's own page reporting the event of ``signal`` (a third-party story), as a candidate signal.
+
+    Free: index pages and posts come over the bridge, and the optional ``searcher`` is the zero-credit web
+    search. Returns {url, date, description, snippet, matched_icp_signal, own_copy, _page_text} or None.
+    The date comes from the own page and must sit inside the ICP window and near the story's own date.
+    """
+
+    domain = _bare(domain)
+    if not domain or category not in categories or same_site(signal.get("url"), domain):
+        return None
+    terms = event_terms(signal.get("description"), company, category, signal.get("url"))
+    if not terms:
+        return None
+    story_day = _day(signal.get("date"))
+    links: list[str] = []
+    if callable(searcher):
+        if terms.get("products"):
+            # The story's own address words, in order: they name the product ("palette neat agentic"), where a sorted
+            # pick of capitalised words searched for "Cresta after agent" in the first live run.
+            path = urlsplit(str(signal.get("url") or "")).path.lower()
+            ordered = [w for w in re.split(r"[^a-z0-9]+", path) if w in _slug_words(signal.get("url"), company)]
+            event = list(dict.fromkeys(ordered))[:3] or sorted(terms["products"])[:2]
+        else:
+            event = [terms.get("round") or "", *[" ".join(a) for a in sorted(terms.get("amounts") or ())][:1]]
+        query = " ".join([company, *event]).strip()
+        try:
+            hits = (searcher(query, free_only=True, limit=MAX_FOUND_HITS) or {}).get("results") or []
+        except Exception:  # noqa: BLE001 - a silent search leaves the index pages to try
+            hits = []
+        links.extend(str((h or {}).get("url") or "") for h in hits if same_site((h or {}).get("url"), domain))
+    indexes = 0
+    for path in COPY_INDEX_PATHS:
+        if indexes >= MAX_COPY_INDEXES or clock() >= deadline:
+            break
+        index = reader("https://%s%s" % (domain, path))
+        if index is None:
+            continue
+        indexes += 1
+        for link in list(getattr(index, "links", None) or []):
+            url = str(link or "").split("#")[0]
+            if url and same_site(url, domain) and not _SKIP_LINK_RE.search(url) and url not in links:
+                if len([p for p in (urlsplit(url).path or "/").split("/") if p]) >= 2:
+                    links.append(url)
+    scored = sorted(((_slug_score(u, terms), i, u) for i, u in enumerate(links)), key=lambda t: (-t[0], t[1]))
+    posts = 0
+    products = terms.get("products") or set()
+    for score, _, url in scored:
+        if posts >= MAX_COPY_POSTS or clock() >= deadline or score <= 0:
+            break
+        # A launch post must share its address words with the story's: matched on capitalised words alone, 4 of 10
+        # offline finds were another page (an investor day, a how-to post) that carried one and a launch verb.
+        if products and len(_slug_words(url, company) & _slug_words(signal.get("url"), company)) < 2:
+            continue
+        page = reader(url)
+        if page is None:
+            continue
+        posts += 1
+        text = getattr(page, "text", "") or ""
+        sentence = same_event(text, company, terms)
+        if not sentence:
+            continue
+        day = find_date(text, url)
+        age = age_days(day) if day else None
+        if age is None or not 0 <= age <= max(1, int(window or 365)):
+            continue
+        own_day = _day(day)
+        drift = MAX_LAUNCH_DRIFT_DAYS if products else MAX_COPY_DRIFT_DAYS
+        if story_day and own_day and abs((own_day - story_day).days) > drift:
+            continue
+        url = re.sub(r"^(https://[^/:]+):443(?=/|$)", r"\1", url)
+        return {"url": url, "date": str(day)[:10], "description": sentence, "snippet": sentence,
+                "matched_icp_signal": 0, "own_copy": True, "_page_text": text}
+    return None
+
+
 def _bridge_reader(tools: Any):
     """A reader that only ever uses the free direct lane, or None when that lane is not available."""
 
@@ -316,6 +548,7 @@ def _bridge_reader(tools: Any):
 
 
 __all__ = ["own_rows", "found_rows", "launch_links", "dated_launch", "same_site", "INDEX_PATHS",
+           "own_copy", "event_terms", "same_event", "COPY_CATEGORIES",
            "MAX_COMPANIES", "MAX_FOUND_HITS",
            "DEEP_COMPANIES",
            "CATEGORIES", "PRODUCT_INDEX_PATHS"]
