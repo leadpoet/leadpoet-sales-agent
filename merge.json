@@ -1,0 +1,36 @@
+{
+ "schema": "ops.router.merge.v1",
+ "name": "m01-s64-o3",
+ "reserve_seconds": 75,
+ "spend_margin_usd": 0.3,
+ "merge_policy": "interleave",
+ "agents": [
+  {
+   "pkg": "agent_a",
+   "lib": "p-s64",
+   "window_seconds": 1700,
+   "budget_usd": null,
+   "min_window_seconds": 600,
+   "min_budget_usd": 0.3,
+   "own_cap_usd": 0.72,
+   "allowance": "real",
+   "patches": []
+  },
+  {
+   "pkg": "agent_b",
+   "lib": "p-o3",
+   "window_seconds": null,
+   "budget_usd": null,
+   "min_window_seconds": 900,
+   "min_budget_usd": 0.3,
+   "own_cap_usd": null,
+   "allowance": "real",
+   "patches": [
+    [
+     "harness.FLAT_ICP_CAP_USD",
+     "budget"
+    ]
+   ]
+  }
+ ]
+}
