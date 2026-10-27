@@ -1778,9 +1778,53 @@ def has_bonus(company: Mapping[str, Any]) -> bool:
                for s in company.get("intent_signals") or [])
 
 
+# s90 (2026-10-23, local live runs mapped to the field's verdicts): an "unavailable" whose only open dimension is the
+# employee count qualified 33% of the time against 36% for a full match (39 vs 160 companies) -- sonar cannot find
+# headcounts of small startups, the judge passed their size 92% of the time. On 10-22 #6 that kept Dreambase (field
+# 90%) and Golden Analytics (83%) in the lower tier in 9 of 10 and 5 of 5 runs while Numos (0 of 5) led as a match.
+# Such a company now shares the match tier, and so does one whose other open dimension is stage when the judge's own
+# investigator verified the stage (s88). 0 = as before.
+SOFT_SIZE = bool(_STRATEGY.get("recheck_soft_size", 1))
+
+# s94 (2026-10-24, 79 recorded local runs, 685 re-checked candidates, the field's per-company qualification rate as the
+# label): inside one run, on pairs where a signal differs, the re-check's overall tier ranked the better company first
+# 51% of the time, its match votes 47% and its stage dimension 49% -- and those led the sort. The signals that do
+# separate sat behind them: the judge's own stage investigation 83% (52 pairs), the attribute dimension 75% (148), a
+# public price list 67% (309), the industry dimension 66% (206). Ranking by points over those signals first lifted the
+# expected qualified count of the emitted rows from 95.9 to 105.3 (better on 10-22 and 10-23, worse on none). The tier
+# and the votes now only break ties; a kept free mismatch stays last. 0 = the s88 order.
+SIGNAL_POINTS = bool(_STRATEGY.get("rerank_signal_points", 1))
+STAGE_POINTS = {"verified": 2, "unproven": -2}
+
+
+def signal_points(decision: Optional[Mapping[str, Any]], stage_verdict: Optional[str], unpriced: bool) -> int:
+    """Attribute match 2, industry match 1, stage investigation verified 2 / unproven -2 / other verdict -1 / none 0,
+    no public price list -1. A dimension the ICP does not ask for counts as a match, so it is neutral."""
+
+    dims = (decision or {}).get("dimensions") or {}
+    points = 0
+    if decision is not None:
+        points += 2 * (dims.get("required_attribute", MATCH) == MATCH) + (dims.get("industry", MATCH) == MATCH)
+    if stage_verdict is not None:
+        points += STAGE_POINTS.get(str(stage_verdict), -1)
+    return points - int(unpriced)
+
+
+def soft_unavailable(decision: Mapping[str, Any], *, stage_verified: bool = False) -> bool:
+    """An unavailable verdict whose open dimensions are only employee size (and stage, once stage is verified)."""
+
+    if not SOFT_SIZE or (decision.get("identity") or {}).get("decision") != MATCH:
+        return False
+    dims = decision.get("dimensions") or {}
+    open_dims = {k for k, v in dims.items() if v != MATCH}
+    allowed = {"employee_size"} | ({"stage"} if stage_verified else set())
+    return bool(open_dims) and open_dims <= allowed and all(dims[k] == UNAVAILABLE for k in open_dims)
+
+
 def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_client_factory=None,
            timeout: float = TIMEOUT_S, model: str = MODEL, asks: int = 1,
-           demote: Optional[set] = None, unpriced: Optional[set] = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+           demote: Optional[set] = None, unpriced: Optional[set] = None,
+           stage_seen: Optional[Mapping[str, str]] = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Drop contradicted companies, rank unprovable ones last, adopt the observed name.
 
     asks > 1 puts the same question to the model that many times per company and takes the majority (s58). The
@@ -1802,6 +1846,17 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
         return companies, notes
     if asks > 1:
         notes["asks"] = asks
+    stage_ok = {company_name_key(name) for name, verdict in (stage_seen or {}).items() if verdict == "verified"}
+    stage_by_key = {company_name_key(name): str(verdict) for name, verdict in (stage_seen or {}).items()}
+    no_price = {company_name_key(name) for name in (unpriced or ())}
+    points: dict[int, int] = {}
+
+    def score(index: int, company: Mapping[str, Any], decision: Optional[Mapping[str, Any]], entry: dict) -> None:
+        keys = [company_name_key(company.get("company_name")), company_name_key(entry.get("renamed_from"))]
+        stage = next((stage_by_key[k] for k in keys if k in stage_by_key), None)
+        points[index] = signal_points(decision, stage, any(k in no_price for k in keys))
+        entry["points"] = points[index]
+
     ranked: list[tuple[int, int, int, dict[str, Any]]] = []
     for index, company in enumerate(companies):
         answers = [flat[k * n + index] for k in range(asks)]
@@ -1809,6 +1864,7 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
         entry: dict[str, Any] = {"company": company.get("company_name")}
         if not valid:
             entry["error"] = answers[0][1]
+            score(index, company, None, entry)
             notes["companies"].append(entry)
             ranked.append((1, 0, index, company))
             continue
@@ -1838,6 +1894,7 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
         entry.update(overall=decision["overall"], identity=decision["identity"]["decision"],
                      dimensions=decision["dimensions"], reason=decision["reason"],
                      failure_class=decision.get("failure_class", ""))
+        score(index, company, decision, entry)
         notes["companies"].append(entry)
         if decision["overall"] == MISMATCH and charged_mismatch(decision):
             entry["dropped"] = True
@@ -1852,17 +1909,39 @@ def rerank(companies: list[dict[str, Any]], icp: Mapping[str, Any], *, http_clie
             tier = 0
         else:
             tier = 1 if decision.get("failure_class") == INSUFFICIENT else 2
+            names = {company_name_key(company.get("company_name")), company_name_key(entry.get("renamed_from"))}
+            # Any unavailable, whatever its failure class: a voted unavailable often carries none (18 of 47 in the
+            # 10-23 live runs, Dreambase and Golden Analytics among them) and so sat in tier 2.
+            if decision["overall"] == UNAVAILABLE and soft_unavailable(decision, stage_verified=bool(names & stage_ok)):
+                entry["soft_unavailable"] = True
+                tier = 0
         ranked.append((tier, -match_votes, index, company))
     # s70: a company whose own homepage does not support the requested subindustry (harness.industry_page_demotions)
     # goes behind every company whose homepage does, whatever sonar said -- sonar passed 95% of the judge's
     # never-pass companies on industry -- but ahead of a kept free mismatch, which stays last.
     demoted = {company_name_key(name) for name in (demote or ())}
     # s84: for an attribute that asks for recurring terms, a company with no public price list goes behind the priced
-    # ones of its own tier (harness.unpriced_companies: names, empty for every other ICP).
-    no_price = {company_name_key(name) for name in (unpriced or ())}
-    ranked.sort(key=lambda item: (item[0] == 3, company_name_key(item[3].get("company_name")) in demoted,
-                                  item[0], company_name_key(item[3].get("company_name")) in no_price,
-                                  -(BONUS_FIRST and has_bonus(item[3])), item[1], item[2]))
+    # ones of its own tier (harness.unpriced_companies: names, empty for every other ICP). Under s94 it is one point.
+    # s88: the judge's own stage investigation (harness.stage_mirror_verdicts): verified first, unknown next, unproven
+    # last, inside each re-check tier. Offline on our published rows a company it does not verify almost never passed
+    # the judge's stage gate (10-22: 0-8% vs 87%; 10-21: 0-28% vs 65%), but live single runs misread some (10-22 #5
+    # live: Netacea unproven, judge passed its stage 6 of 9), so it orders companies inside a tier and never lifts one
+    # over a re-check tier.
+    stage_rank = {company_name_key(name): {"verified": 0, "unproven": 2}.get(str(verdict), 1)
+                  for name, verdict in (stage_seen or {}).items()}
+    if SIGNAL_POINTS:
+        ranked.sort(key=lambda item: (item[0] == 3, company_name_key(item[3].get("company_name")) in demoted,
+                                      -points.get(item[2], 0), item[0],
+                                      -(BONUS_FIRST and has_bonus(item[3])), item[1], item[2]))
+        notes["signal_points"] = {str(c.get("company_name")): points.get(i, 0) for _, _, i, c in ranked}
+    else:
+        ranked.sort(key=lambda item: (item[0] == 3, company_name_key(item[3].get("company_name")) in demoted,
+                                      item[0], stage_rank.get(company_name_key(item[3].get("company_name")), 1),
+                                      company_name_key(item[3].get("company_name")) in no_price,
+                                      -(BONUS_FIRST and has_bonus(item[3])), item[1], item[2]))
+    if stage_rank:
+        notes["stage_mirror"] = {str(c.get("company_name")): stage_rank.get(company_name_key(c.get("company_name")), 1)
+                                 for _, _, _, c in ranked}
     if no_price:
         notes["unpriced_behind"] = sorted(str(c.get("company_name")) for _, _, _, c in ranked
                                           if company_name_key(c.get("company_name")) in no_price)

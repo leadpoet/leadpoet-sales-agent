@@ -26,6 +26,25 @@ from urllib.parse import urlsplit
 INDEX_PATHS = ("/changelog", "/whats-new", "/release-notes", "/releases", "/product/updates", "/product-updates",
                "/updates", "/news", "/newsroom", "/press", "/press-releases", "/media", "/blog")
 
+# s100 (2026-10-26, 27 live runs on the first open bank): a path that answers 404 did not count against
+# MAX_INDEX_READS, so a company with none of these pages cost all 13 probes -- 9 of 27 runs hit the direct lane's
+# 300-hop ceiling (launch ICPs: 111-140 of ~165 fetches were 404s) and then skipped 155-385 later reads; those runs
+# dropped 0.78 candidates each as "event not on the fetched page" against 0.28 in the others. Now a domain stops
+# after INDEX_MISSES missing paths, and the common newsroom paths come right after /changelog so they are still tried.
+try:
+    from .arena_tools import STRATEGY as _STRATEGY
+except Exception:  # noqa: BLE001 - the standalone loader
+    _STRATEGY = {}
+PROBE_CAP = bool(_STRATEGY.get("own_site_probe_cap", 1))
+INDEX_MISSES = 7
+COPY_INDEX_MISSES = 6
+CAPPED_INDEX_PATHS = ("/changelog", "/news", "/newsroom", "/whats-new", "/press", "/release-notes", "/press-releases",
+                      "/blog", "/releases", "/updates", "/media", "/product/updates", "/product-updates")
+
+
+def index_paths() -> tuple:
+    return CAPPED_INDEX_PATHS if PROBE_CAP else INDEX_PATHS
+
 # Which categories this lane is worth running for, measured over the 6,550 published rows of
 # 2026-10-01..10-14 by whether a QUALIFIED row's primary intent URL sat on the company's own domain:
 #
@@ -183,12 +202,16 @@ def own_rows(icp: Mapping[str, Any], tools: Any, companies: list, *, find_date, 
         if not domain or not name:
             continue
         indexes = 0
+        misses = 0
         found = False
-        for path in INDEX_PATHS:
+        for path in index_paths():
             if found or indexes >= MAX_INDEX_READS or clock() >= deadline:
                 break
             index = reader("https://%s%s" % (domain, path))
             if index is None:
+                misses += 1
+                if PROBE_CAP and misses >= INDEX_MISSES:
+                    break
                 continue
             indexes += 1
             tried.append(domain + path)
@@ -478,11 +501,15 @@ def own_copy(company: str, domain: str, signal: Mapping[str, Any], category: str
             hits = []
         links.extend(str((h or {}).get("url") or "") for h in hits if same_site((h or {}).get("url"), domain))
     indexes = 0
+    misses = 0
     for path in COPY_INDEX_PATHS:
         if indexes >= MAX_COPY_INDEXES or clock() >= deadline:
             break
         index = reader("https://%s%s" % (domain, path))
         if index is None:
+            misses += 1
+            if PROBE_CAP and misses >= COPY_INDEX_MISSES:
+                break
             continue
         indexes += 1
         for link in list(getattr(index, "links", None) or []):

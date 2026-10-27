@@ -1,5 +1,5 @@
 {
-  "label": "s74-roster-on",
+  "label": "s98-A-sonnet55",
   "brand_name": 1,
   "model": "openai/gpt-5.6-sol",
   "cost_limit_usd": 3.0,
@@ -111,7 +111,7 @@
   "roster_event_thin_reserve_usd": 0.12,
   "reverify_free_mismatch_keeps": 0,
   "confident_only": 0,
-  "roster_skip_categories": "",
+  "roster_skip_categories": "FUNDING,HIRING",
   "scout_queries_blind": 14,
   "stage_first_broad": 1,
   "linkedin_search": 1,

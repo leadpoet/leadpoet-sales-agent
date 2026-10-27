@@ -391,8 +391,34 @@ def plan_prompt(icp: Mapping[str, Any]) -> str:
         "When the required attribute or the product description offers alternatives joined by \"or\", give each "
         "alternative its own query rather than one query that fuses them: proving a single alternative is enough, "
         "and the fused phrase names no real company. "
+        "%s"
         "Return {\"queries\": [...]}.\n\nICP: %s"
-        % (query_count(icp), json.dumps(_icp_brief(icp), default=str)[:3000]))
+        % (query_count(icp), size_focus(icp), json.dumps(_icp_brief(icp), default=str)[:3000]))
+
+
+def size_focus(icp: Mapping[str, Any]) -> str:
+    """s99 (the first open bank, 2026-10-26: every open ICP asks 201+ employees): after s97 the event-first lane still
+    brought 58 companies of 200 or fewer to 201+ ICPs -- the operators small news outlets write about. When every
+    allowed bucket starts above 200 the planner is told to word half the queries for established companies. '' else."""
+
+    if not SIZE_FOCUS:
+        return ""
+    try:
+        from .roster import size_phrase
+    except Exception:  # noqa: BLE001
+        return ""
+    phrase = size_phrase(icp)
+    if not phrase:
+        return ""
+    return ("Every company must be an %s, so word at least half of the queries to surface such companies -- with words "
+            "like national, leading, largest or publicly traded, or the large company type of this sub-industry (a "
+            "REIT, a national operator, a global firm) -- and never aim a query at startups or small local firms. "
+            % phrase.replace("large enterprise", "established large enterprise"))
+
+
+# Live on 2026-10-26 (#0 #2 #4 #5 #8, s99 vs s97): small drops 59 vs 57, field-rate expected points 91.7 vs 91.6 -- the
+# search wording did not change the mix of companies the news returns. Off by default; 1 = planner size focus.
+SIZE_FOCUS = bool(STRATEGY.get("planner_size_focus", 0))
 
 
 SECOND_PASS = bool(STRATEGY.get("second_pass", 0))
@@ -2128,11 +2154,50 @@ def recover_capability(tools: Any, cand: Mapping[str, Any], prof: Mapping[str, A
     return "", ""
 
 
-def stage_contradiction(name: str) -> bool:
-    """Loop s29c: absent proof is distinct from the existing grounded conflict receipts."""
+# s92 (2026-10-23): a recorded round EARLIER than the requested stage and older than this is no contradiction -- the
+# judge reads the latest completed dated round, and an old earlier round says nothing about what came after it. The
+# grounded-conflict drop removed 281 candidates over the local runs; the 13 of them the field also sent qualified 71%
+# of the time (Flare Therapeutics 6 of 6 on 10-21 #5, dropped in 9 of 11 runs on a 2023-03-22 Series B article for a
+# Series C+ ICP). A later round than requested, a recent earlier round, an acquisition, an ownership change or an
+# unreadable receipt still counts. 0 = every receipt counts, as before.
+STAGE_CONFLICT_RECENT_ONLY = bool(STRATEGY.get("stage_conflict_recent_only", 1))
+STAGE_CONFLICT_DAYS = 548
+_RECEIPT_RE = re.compile(r"^(?P<label>[a-z][a-z +\-]*?)\s*(?:\((?P<date>\d{4}-\d{2}-\d{2})?,\s*news\))?$")
 
-    return any(str(row).startswith(f"{name}: ") for key in ("stage_mismatch", "stage_page_later")
-               for row in LAST.get(key, []))
+
+def conflict_receipt_counts(receipt: str, want: str, today: Optional[_dt.date] = None) -> bool:
+    """Does one stage receipt ('series b (2023-03-22, news)', 'seed', 'acquired after ...') contradict ``want``?"""
+
+    if not STAGE_CONFLICT_RECENT_ONLY:
+        return True
+    match = _RECEIPT_RE.match(str(receipt or "").strip().lower())
+    label = round_label(match.group("label")) if match else ""
+    wanted = "series c" if want == "series c+" else str(want or "")
+    if not match or label not in _ORDER or wanted not in _ORDER:
+        return True
+    if _ORDER.index(label) > _ORDER.index(wanted):
+        return True                      # beyond the requested stage
+    when = match.group("date")
+    if not when:
+        return False                     # an undated earlier round
+    try:
+        age = ((today or sm.evaluation_date()) - _dt.date.fromisoformat(when)).days
+    except (TypeError, ValueError):
+        return True
+    return age <= STAGE_CONFLICT_DAYS
+
+
+def stage_contradiction(name: str, want: str = "") -> bool:
+    """Loop s29c: absent proof is distinct from the existing grounded conflict receipts. s92: only a receipt that
+    still contradicts ``want`` (conflict_receipt_counts) counts; with no ``want`` every receipt does."""
+
+    prefix = f"{name}: "
+    for key in ("stage_mismatch", "stage_page_later"):
+        for row in LAST.get(key, []):
+            row = str(row)
+            if row.startswith(prefix) and (not want or conflict_receipt_counts(row[len(prefix):], want)):
+                return True
+    return False
 
 
 def draft_rank(draft: Mapping[str, Any]) -> tuple[bool, bool, bool]:
@@ -3163,6 +3228,43 @@ def _state_ok(icp: Mapping[str, Any]):
 PUBLIC_EDGAR = bool(STRATEGY.get("public_edgar", 0))
 PUBLIC_EDGAR_WANT = int(STRATEGY.get("public_edgar_want", 12) or 12)
 PUBLIC_EDGAR_GATE = bool(STRATEGY.get("public_edgar_gate", 0))
+# s95: on an ICP with no stage requirement (seven of ten in the banks generated from 2026-10-24) a listed company is as
+# eligible as any other, and where the ICP allows 1,001+ employees the filers are the large companies the open web
+# buries under startups; the listing gate stays Public-only. On the stage-blanked 10-24 #9 the lane's filers led the
+# merge (Conduent, EXL -- 0% in the field) and pushed out CACI, Unisys and Cognizant (expected qualified 0.88 against
+# 2.03 without it). s96 (2026-10-26, the first open bank: all seven open ICPs ask 201+ employees -- a multifamily
+# REIT, management consulting, industrial engines, programmatic adtech -- where funding news finds little): the lane
+# runs again on open ICPs, but its filers are appended behind every other lane (append_lane) instead of alternating
+# in front, so they only fill drafts the open web could not. 0 = Public ICPs only.
+OPEN_EDGAR = bool(STRATEGY.get("open_edgar", 1))
+
+
+def append_lane(first: list[dict[str, Any]], extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``first`` unchanged, then the candidates of ``extra`` it does not already hold (company name key / domain)."""
+
+    seen = {k for c in first for k in (sm.company_name_key(c.get("company_name")), c.get("domain") or "") if k}
+    out = list(first)
+    for cand in extra:
+        keys = {k for k in (sm.company_name_key(cand.get("company_name")), cand.get("domain") or "") if k}
+        if keys & seen:
+            continue
+        seen.update(keys)
+        out.append(cand)
+    return out
+OPEN_EDGAR_MIN_HIGH = 1001           # some allowed bucket must start at or above this headcount
+
+
+def edgar_lane_wanted(icp: Mapping[str, Any]) -> bool:
+    """Public ICPs, and (s95) ICPs without a stage requirement that allow companies of 1,001 or more employees."""
+
+    want = sm.normalize_stage(icp.get("company_stage"))
+    if want == "public":
+        return True
+    if want or not OPEN_EDGAR:
+        return False
+    from .stagefirst import _bucket_low
+    lows = [low for low in (_bucket_low(b) for b in sm.icp_buckets(icp)) if low is not None]
+    return bool(lows) and max(lows) >= OPEN_EDGAR_MIN_HIGH
 
 
 def _today() -> str:
@@ -3515,8 +3617,7 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
     # so it takes nothing from the verification budget, and it leads because its
     # candidates arrive with their ticker, SIC industry and head office already
     # settled.
-    if PUBLIC_EDGAR and sm.normalize_stage(icp.get("company_stage")) == "public" \
-            and time.monotonic() < deadline:
+    if PUBLIC_EDGAR and edgar_lane_wanted(icp) and time.monotonic() < deadline:
         from . import edgar as _edgar
         from .vendored_industry_fit import industry_fit as _industry_fit
         try:
@@ -3543,7 +3644,9 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
         if unpaged:
             LAST["edgar_unpaged"] = unpaged[:30]
         filed = [c for c in filed if c.get("url")]
-        if filed:
+        if filed and sm.normalize_stage(icp.get("company_stage")) != "public":
+            cands = append_lane(cands, filed)       # s96: on an open ICP the filers fill in behind the other lanes
+        elif filed:
             cands = merge_lanes(filed, cands)
         # A Public ICP cannot take a company that does not trade. H-E-B is
         # privately held and reached the drafts on four live runs out of four
@@ -3551,7 +3654,7 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
         # about 3 points of per_icp_score when few others qualify. EDGAR is
         # free and answers in two reads, and only a definite "not listed"
         # removes a candidate -- an unreachable bridge condemns nobody.
-        if PUBLIC_EDGAR_GATE:
+        if PUBLIC_EDGAR_GATE and sm.normalize_stage(icp.get("company_stage")) == "public":
             confirmed, unknown, removed, asked = [], [], [], 0
             bridge = _edgar._bridge(tools)
             for cand in cands:
@@ -3725,7 +3828,7 @@ def run_scout(icp: dict[str, Any], tools: Any, *, limit: int, run_timeout: float
                 break
             unproven = bool(want and not stage[0])
             if unproven:
-                if stage_contradiction(cand["company_name"]):
+                if stage_contradiction(cand["company_name"], want):
                     drops[cand["company_name"]] = "stage unproven (grounded conflict)"
                     continue
                 stage = (str(icp.get("company_stage") or ""), "", "")

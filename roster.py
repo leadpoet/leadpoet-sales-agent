@@ -132,9 +132,36 @@ def company_search_queries(icp: Mapping[str, Any]) -> list[str]:
     stage = _STAGE_WORDS.get(sm.normalize_stage(icp.get("company_stage")), "company")
     geography = " ".join(str(icp.get("geography") or icp.get("country") or "").split())
     places = region_places(icp) or [geography]
+    size = size_phrase(icp)
     first = f"{sub} {stage} headquartered in {places[0]}".strip()
     second = f"{product or sub} company headquartered in {places[1] if len(places) > 1 else places[0]}".strip()
+    if size:
+        lead = "" if stage == "company" else stage + ","
+        first = " ".join(f"{sub} {lead} {size} headquartered in {places[0]}".split())
+        second = " ".join(f"{product or sub} {size} headquartered in {places[1] if len(places) > 1 else places[0]}".split())
     return [q for q in (first, second) if q]
+
+
+# s97: the company-category search returns "in-region company homepages, recent startups included" -- on the first open
+# bank (2026-10-26, every open ICP 201+ employees) 68 of 83 size drops were companies of 200 or fewer. When the smallest
+# allowed bucket starts above 200, the query says how large the company is.
+SIZE_AWARE = bool(STRATEGY.get("size_aware_discovery", 1))
+
+
+def size_phrase(icp: Mapping[str, Any]) -> str:
+    """'' unless every allowed employee bucket starts above 200; then a size cue for the company search."""
+
+    if not SIZE_AWARE:
+        return ""
+    lows = []
+    for bucket in sm.icp_buckets(icp):
+        digits = re.match(r"\s*([\d,]+)", str(bucket or ""))
+        if digits:
+            lows.append(int(digits.group(1).replace(",", "")))
+    if not lows or min(lows) <= 200:
+        return ""
+    return ("large enterprise with over 1,000 employees" if min(lows) >= 1001
+            else "established mid-size company with over 200 employees")
 
 
 def company_search(tools: Any, icp: Mapping[str, Any]) -> list[dict[str, Any]]:

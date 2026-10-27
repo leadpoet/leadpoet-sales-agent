@@ -855,6 +855,21 @@ def industry_page_demotions(companies: list, icp: Mapping[str, Any], tools: Any)
 PRICING_RANK = _strategy_number("pricing_rank", 1, 0, 1) >= 1
 PRICING_SECONDS = _strategy_number("pricing_seconds", 45.0, 10.0, 180.0)
 _RECURRING_ATTRIBUTE_RE = re.compile(r"\bsubscription|\brecurring|\bSaaS\b|\bsoftware-as-a-service", re.I)
+# s98 (2026-10-26 #4, managed IT "under recurring contracts"): service firms publish no price list, so 18 of 19
+# re-checked companies took the unpriced point, all tied, and the one MSP with a pricing page led while Netrix Global
+# (qualified in the baseline) sat seventh. A bare "recurring" now needs a software product beside it; "subscription" and
+# SaaS keep the rule, which is where it was measured (10-22 #6). 0 = any recurring term.
+_PRICED_PRODUCT_RE = re.compile(r"\bsubscription|\bSaaS\b|\bsoftware|\bplatform|\bapps?\b", re.I)
+PRICING_SOFTWARE_ONLY = _strategy_number("pricing_software_only", 1, 0, 1) >= 1
+
+
+def asks_price_list(attribute: str) -> bool:
+    """Does this required attribute ask for recurring terms of a product a price page would show?"""
+
+    text = str(attribute or "")
+    if not _RECURRING_ATTRIBUTE_RE.search(text):
+        return False
+    return not PRICING_SOFTWARE_ONLY or bool(_PRICED_PRODUCT_RE.search(text))
 _PRICE_LIST_RE = re.compile(
     r"(?:\$|€|£|USD\s?)\s?\d[\d,.]*\s*(?:/|per)\s*(?:mo\b|month|yr\b|year|user|seat|annum)|per\s+(?:month|year|user|seat)|"
     r"\b(?:billed|paid)\s+(?:monthly|annually|yearly)\b|/\s?(?:mo|month)\b|\bmonthly\s+plan|\bannual\s+plan", re.I)
@@ -889,7 +904,7 @@ def unpriced_companies(companies: list, icp: Mapping[str, Any], tools: Any) -> s
     """Names of companies that publish no price list, for an ICP whose required attribute asks for recurring terms
     (s84); empty for any other ICP, when the free direct lane is off, or when no company could be read. Never raises."""
 
-    if not PRICING_RANK or not companies or not _RECURRING_ATTRIBUTE_RE.search(str(icp.get("required_attribute") or "")):
+    if not PRICING_RANK or not companies or not asks_price_list(str(icp.get("required_attribute") or "")):
         return set()
     direct = getattr(tools, "_direct", None)
     try:
@@ -913,6 +928,97 @@ def unpriced_companies(companies: list, icp: Mapping[str, Any], tools: Any) -> s
     if not any(v == "priced" for v in verdicts.values()):
         return set()   # nothing to rank by: an unreadable lane must not reorder the tier
     return {name for name, verdict in verdicts.items() if verdict != "priced"}
+
+
+def stage_mirror_verdicts(companies: list, icp: Mapping[str, Any], tools: Any, *, deadline: float) -> dict:
+    """{name: verified | unknown | unproven} from the judge's own stage investigation (s88, stagemirror.py), or {}
+    when it is off, cannot run or the money is short. Never raises."""
+
+    try:
+        mirror = _sibling_module("stagemirror")
+        if not mirror.STAGE_MIRROR or not companies:
+            return {}
+        n = min(len(companies), mirror.STAGE_MIRROR_COMPANIES)
+        if not _paid_allowed(tools, mirror.STAGE_MIRROR_EST_USD * n):
+            LAST_REPORT["stage_mirror"] = {"skipped": "spend cap"}
+            return {}
+        found = mirror.verdicts(companies, icp, tools, http_client_factory=_http_client_factory(), deadline=deadline)
+        _note_spend(tools, mirror.STAGE_MIRROR_EST_USD * len(found))
+        LAST_REPORT["stage_mirror"] = dict(mirror.LAST)
+        return found
+    except Exception as exc:  # noqa: BLE001 - a ranking aid must never cost the rows
+        LAST_REPORT["stage_mirror"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        return {}
+
+
+# s91: the investigator's live verdict moves between runs (10-23 live, 10-22 #6: Dreambase and Golden Analytics each
+# verified in some runs only). The judge's deterministic stage rule on our own stage evidence never moves: on published
+# rows 10-20..10-22 an item it accepts went with a passed stage 80% of the time in the field and 72% in ours, no item
+# at all 2%. It stands in when the investigator gave no verdict or "unknown", never over an "unproven".
+STAGE_RULE_FALLBACK = _strategy_number("stage_rule_fallback", 1, 0, 1) >= 1
+
+
+def stage_rule_fallback(companies: list, seen: Any) -> dict:
+    """``seen`` with "verified" for each company whose own stage evidence the judge's deterministic rule accepts, where
+    the investigator left no verdict or "unknown". Never raises."""
+
+    out = dict(seen or {}) if isinstance(seen, Mapping) else {}
+    if not STAGE_RULE_FALLBACK:
+        return out
+    added = []
+    try:
+        for company in companies:
+            name = str(company.get("company_name") or "") if isinstance(company, Mapping) else ""
+            if not name or out.get(name) not in (None, "unknown"):
+                continue
+            if any(verdict is True for verdict in judge_stage_verdicts(company)):
+                out[name] = "verified"
+                added.append(name)
+    except Exception as exc:  # noqa: BLE001 - a ranking aid must never cost the rows
+        LAST_REPORT["stage_rule_fallback_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    if added:
+        LAST_REPORT["stage_rule_fallback"] = added
+    return out
+
+
+# s89: when the judge's own investigator verified a company's stage (s88), the page and sentence it accepted go first
+# in that row's company_stage_evidence -- the judge prefetches submitted sources before it searches -- displacing our
+# last item when all STAGE_EVIDENCE_MAX are taken. 10-22 #5 live: Netacea carried a 2022 round article and a launch
+# release as its stage evidence. 0 = off.
+STAGE_MIRROR_EVIDENCE = _strategy_number("stage_mirror_evidence", 1, 0, 1) >= 1
+
+
+def add_mirror_stage_evidence(companies: list, proof: Any, stage: Any = "") -> list:
+    """``companies`` with the investigator-verified stage source in front of each verified row's stage evidence. Only
+    a source the judge's deterministic stage rule also accepts goes in (10-22 #6 live: one did not, and it would have
+    pushed out an item that passed)."""
+
+    if not STAGE_MIRROR_EVIDENCE or not isinstance(proof, Mapping) or not proof:
+        return companies
+    gates = judge_gates()
+    if gates is None:
+        return companies
+    added = []
+    try:
+        keyed = {sm.company_name_key(name): item for name, item in proof.items() if isinstance(item, Mapping)}
+        for company in companies:
+            item = keyed.get(sm.company_name_key(company.get("company_name"))) if isinstance(company, dict) else None
+            url, quote = str((item or {}).get("url") or ""), str((item or {}).get("quote") or "")
+            if not url.startswith("https://") or not quote:
+                continue
+            current = [e for e in company.get("company_stage_evidence") or [] if isinstance(e, Mapping)]
+            if any(str(e.get("url") or "").rstrip("/") == url.rstrip("/") for e in current):
+                continue
+            if gates.stage_verdict(stage, quote, url=url, name=company.get("company_name"),
+                                   website=company.get("company_website")) is not True:
+                continue
+            company["company_stage_evidence"] = ([{"url": url, "quote": quote[:2000]}] + current)[:sm.STAGE_EVIDENCE_MAX]
+            added.append(str(company.get("company_name") or ""))
+    except Exception as exc:  # noqa: BLE001 - evidence help must never cost the rows
+        LAST_REPORT["stage_mirror_evidence_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        return companies
+    LAST_REPORT["stage_mirror_evidence"] = added
+    return companies
 
 
 ATTRIBUTE_GATE_TRUSTS_RECHECK = _strategy_number("attribute_gate_trusts_recheck", 1, 0, 1) >= 1
@@ -2045,17 +2151,23 @@ def run_icp(icp: dict) -> list[dict]:
                 tail = companies[reverify_n:]
                 demote = industry_page_demotions(head, icp, tools) if remaining > 240.0 else set()
                 unpriced = unpriced_companies(head, icp, tools) if remaining > 240.0 else set()
+                stage_seen = stage_mirror_verdicts(head, icp, tools, deadline=phase_deadline - 150.0) \
+                    if remaining > 420.0 else {}
+                stage_seen = stage_rule_fallback(head, stage_seen)
                 remaining = phase_deadline - time.monotonic()
                 checked, notes = reverify_module.rerank(head, icp, http_client_factory=_http_client_factory(),
                                                         timeout=min(reverify_module.TIMEOUT_S, remaining - 12.0),
-                                                        asks=REVERIFY_ASKS, demote=demote, unpriced=unpriced)
+                                                        asks=REVERIFY_ASKS, demote=demote, unpriced=unpriced,
+                                                        stage_seen=stage_seen)
                 _note_spend(tools, REVERIFY_EST_USD * len(head) * REVERIFY_ASKS)
                 survivors = {id(c) for c in checked}
                 for evicted in (c for c in head if id(c) not in survivors):
                     rejected |= identity_keys(evicted)
                 if rejected:
                     notes["rejected_identities"] = sorted(rejected)
-                companies = (checked + tail)[:limit]
+                companies = add_mirror_stage_evidence((checked + tail)[:limit],
+                                                      (LAST_REPORT.get("stage_mirror") or {}).get("evidence"),
+                                                      icp.get("company_stage"))
                 try:
                     companies = sm.validate_output(companies, max_companies=limit, schema_version=schema)
                 except Exception as exc:

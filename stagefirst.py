@@ -105,6 +105,42 @@ def stage_key(icp: Mapping[str, Any]) -> str:
     return str(sm.normalize_stage(icp.get("company_stage")) or "")
 
 
+# s95 (organizer 7075deece, 2026-10-24): newly generated banks pin a company stage on three ICPs of ten; the other
+# seven carry company_stage "" and no stage words, and a FUNDING intent there asks for any recent round. On such an
+# ICP this lane -- the one that drafted most of our qualifiers -- returned nothing. An open ICP whose sizes reach
+# startups now searches funding news of any round, and every named round (or a plain "raises") is accepted, so the
+# lane still collects the sub-industry's active companies and their events. 0 = no lane on an open ICP.
+OPEN_STAGE = paced("open_stage_lane", 1, 0, 1) >= 1
+# s97 (the first open bank, 2026-10-26: all seven open ICPs ask 201+ employees): on those runs 68 of 83 size drops were
+# companies of 200 or fewer, 16 of them from this lane's funding news. The lane now needs a bucket starting at or below
+# 200 -- unless the intent itself is a funding round, which is what the lane searches for.
+OPEN_STAGE_MAX_LOW = 200 if paced("size_aware_discovery", 1, 0, 1) >= 1 else 1000
+_OPEN_PHRASES = ("funding round", "Series A")
+_RAISE_RE = re.compile(r"\b(?:rais(?:es|ed|ing)|funding round|secur(?:es|ed) \$|closes? (?:a |its )?\$)", re.I)
+
+
+def _bucket_low(bucket: str) -> Optional[int]:
+    digits = re.match(r"\s*([\d,]+)", str(bucket or ""))
+    try:
+        return int(digits.group(1).replace(",", "")) if digits else None
+    except ValueError:
+        return None
+
+
+def open_stage(icp: Mapping[str, Any]) -> bool:
+    """An ICP without a stage requirement whose employee sizes reach startups (no sizes listed counts as yes)."""
+
+    if not OPEN_STAGE or stage_key(icp):
+        return False
+    lows = [low for low in (_bucket_low(b) for b in sm.icp_buckets(icp)) if low is not None]
+    funding = str(icp.get("intent_category") or "").strip().upper() == "FUNDING"
+    return not lows or funding or min(lows) <= OPEN_STAGE_MAX_LOW
+
+
+def _phrases(icp: Mapping[str, Any]) -> tuple:
+    return _STAGE_PHRASES.get(stage_key(icp)) or (_OPEN_PHRASES if open_stage(icp) else ())
+
+
 def venture_stage(icp: Mapping[str, Any]) -> bool:
     """True for Seed / Series A / Series B / Series C+ (the stages a funding announcement proves)."""
 
@@ -120,6 +156,8 @@ def latest_round(text: str) -> str:
 
 
 def round_accepted(label: str, icp: Mapping[str, Any]) -> bool:
+    if open_stage(icp):
+        return bool(label)
     return bool(label) and label in _ACCEPT.get(stage_key(icp), set())
 
 
@@ -141,13 +179,13 @@ def lane_caps(icp: Mapping[str, Any]) -> tuple[int, int]:
 
 def funding_queries(icp: Mapping[str, Any], late: bool = True) -> list[str]:
     """Up to MAX_QUERIES news queries for funding rounds of the ICP's own stage in its region and sub-industry;
-    [] for Public / Private Equity / no stage.  Loop s33: when the stage's window reaches into earlier calendar
+    any round on an open ICP that reaches startups (s95); [] for Public / Private Equity / other open ICPs.  Loop s33: when the stage's window reaches into earlier calendar
     years, the queries past MAX_QUERIES (lane_caps) name those years, newest first, so the wider window is searched
     and not only allowed."""
 
     from .scout import region_places
 
-    phrases = _STAGE_PHRASES.get(stage_key(icp))
+    phrases = _phrases(icp)
     if not phrases:
         return []
     sub = " ".join(str(icp.get("sub_industry") or icp.get("industry") or "").split(",")[0].split())[:80]
@@ -211,7 +249,7 @@ def wire_queries(icp: Mapping[str, Any]) -> list[str]:
     """Two queries for the wire-only sweep: "<industry> startup announces <stage> funding <place>" and
     "<sub-industry head> raises <stage>"; [] for Public / Private Equity / no stage."""
 
-    phrases = _STAGE_PHRASES.get(stage_key(icp)) or ()
+    phrases = _phrases(icp)
     if not phrases:
         return []
     from .scout import region_places
@@ -244,7 +282,10 @@ def funded_companies(cands: list[Mapping[str, Any]], icp: Mapping[str, Any]) -> 
         if key in banned or (domain and domain in banned):
             dropped[name] = "excluded company"
             continue
-        label = latest_round(f"{cand.get('event') or ''} {cand.get('snippet') or ''}")
+        text = f"{cand.get('event') or ''} {cand.get('snippet') or ''}"
+        label = latest_round(text)
+        if not label and open_stage(icp) and _RAISE_RE.search(text):
+            label = "funding"            # s95: any round counts on an open ICP, named or not
         if not label:
             dropped[name] = "no round named"
             continue
@@ -431,8 +472,8 @@ def run_stage_first(icp: Mapping[str, Any], tools: Any, kind: str, *, llm_json, 
         feed["wire_queries"], feed["wire_rows"] = wires, len(extra)
     for i, row in enumerate(rows, 1):
         row["id"] = i
-    funding_icp = dict(icp, intent_signals=[f"Announced its own {icp.get('company_stage')} funding round"],
-                       intent_max_age_days=recency)
+    funding_icp = dict(icp, intent_signals=[" ".join(f"Announced its own {icp.get('company_stage') or ''} funding round"
+                                                     .split())], intent_max_age_days=recency)
     cands = scout.extract(tools, rows, funding_icp, http_client_factory=http_client_factory,
                           max_candidates=STAGE_CANDIDATES if wide else 0)
     kept, dropped = funded_companies(cands, icp)
