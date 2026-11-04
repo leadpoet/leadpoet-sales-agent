@@ -25,7 +25,7 @@ import uuid
 
 from . import ROOT, SKILL
 from .broker import DEEPLINE_WAIT_SECONDS
-from .input import opening_plan, prepare as prepare_request
+from .input import worker_lanes, opening_plan, prepare as prepare_request
 from .output import (HELD_COMPANIES, ICP_FILE, MAX_COMPANIES, companies, held_companies, publication_gaps,
                      unconfirmed_companies)
 from . import pacing
@@ -63,7 +63,11 @@ MAX_TRANSIENT_WORKER_FAILURES = 20  # Leadpoet's shared model queue can time out
 # Research workers per Leadpoet run. On 2026-10-13 productive ICPs stopped at 2-4 companies with budget left:
 # about 7 minutes per company, so time, not money, limited them. Two workers fit the sandbox (1 CPU, 2 GB;
 # a one-worker run peaked at 547 MB and ~5% CPU) and Leadpoet's shared model gate (default 200 calls).
+# A third worker does not survive Leadpoet's runs: every three-worker entry ended most ICPs about a minute after
+# start with no companies (sub-37388c8f in round arena-2026-10-28; this entry and two others in arena-2026-10-29),
+# while two-worker entries ran the full wall clock.
 RESEARCH_WORKERS = 2
+WORKER_LANE_FILE = "worker-{}-lane.txt"  # Read by scripts/parallel_sourcing.py for that worker.
 # Leadpoet refuses a model request whose reasoning text exceeds 32,000 characters, and DeepSeek's reasoning after a
 # five-company review packet exceeded it in 5 of 8 replays (tc38/tc39 final reviews: 54 such refusals in 26 ICPs, up to
 # 10 restarts and 28 minutes in one review). A packet shows this many companies (ResearchTools.packet_companies).
@@ -644,6 +648,8 @@ def run(icp):
     run_file = run_dir / "results.json"
     request_file = prepare_request(run_dir, icp, limit, research_seconds)
     (run_dir / ICP_FILE).write_text(json.dumps(icp), encoding="utf-8")  # Tool feedback uses the publisher's exact ICP.
+    for position, lane in worker_lanes(icp, evaluation_date(), RESEARCH_WORKERS).items():
+        (run_dir / WORKER_LANE_FILE.format(position)).write_text(lane, encoding="utf-8")
     publisher = Publisher(run_dir, icp, limit, checkpoint.write)
     guard = ModelRequestGuard(run_file)
     watcher = threading.Thread(target=publisher.watch, daemon=True)

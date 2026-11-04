@@ -18,10 +18,10 @@ from urllib.parse import urlsplit
 from validate_run import (RELATIVE_DATE, criteria, excluded_company, exclusion_identity_errors,
                           qualification_evidence_error, signal_age_errors)
 
-from .input import STAGE_PREFIX, company_stage, intent_signals, stage_line
+from .input import HIRING, STAGE_PREFIX, company_stage, intent_signals, stage_line
 
 MAX_COMPANIES = 5
-HELD_COMPANIES = 3  # At most this many held companies fill slots that confirmed companies leave empty.
+HELD_COMPANIES = 5  # At most this many held companies fill slots that confirmed companies leave empty.
 ICP_FILE = "arena-icp.json"
 INTENT_DETAILS_LIMIT = 2000
 BUCKETS = ("2-10", "11-50", "51-200", "201-500", "501-1,000", "1,001-5,000", "5,001-10,000", "10,001+")
@@ -129,16 +129,21 @@ def _icp_buckets(icp):
 # unverifiable signal 0 also costs Leadpoet's 10-point false-positive penalty. Captured LinkedIn data stays
 # usable for identity and size; it is only never the URL the judge must fetch when another page says it.
 JUDGE_UNREACHABLE_HOSTS = ("linkedin.com",)
+LINKEDIN_JOB = re.compile(r"linkedin\.com/jobs/view/", re.I)  # The judge reads these through a job scrape.
+JOB_PAGE = re.compile(r"/(?:jobs?|careers?)(?:/|$|\?)|//(?:[\w-]+\.)?(?:greenhouse\.io|lever\.co|ashbyhq\.com|"
+                      r"myworkdayjobs\.com|smartrecruiters\.com)/", re.I)
 
 
 def judge_reachable(url):
     host = (urlsplit(url or "").hostname or "").lower()
-    return not any(host == blocked or host.endswith("." + blocked) for blocked in JUDGE_UNREACHABLE_HOSTS)
+    return bool(LINKEDIN_JOB.search(url or "")) or not any(
+        host == blocked or host.endswith("." + blocked) for blocked in JUDGE_UNREACHABLE_HOSTS)
 
 
 def _reachable_first(items):
-    """The same evidence, pages the judge can open first; otherwise the model's order is kept."""
-    return sorted(items, key=lambda item: not judge_reachable(item.get("url")))
+    """The same evidence, pages the judge can open first and a LinkedIn job last; otherwise the model's order is kept."""
+    return sorted(items, key=lambda item: (not judge_reachable(item.get("url")),
+                                           bool(LINKEDIN_JOB.search(item.get("url") or ""))))
 
 
 # A passage naming the company's exchange listing, in the forms Leadpoet's judge reads as Public-stage proof
@@ -218,11 +223,11 @@ def _icp_signal_index(check, signals, request_signals):
 
 _DATE = r"(?:[A-Z][a-z]+\.? \d{1,2}, \d{4}|\d{1,2} [A-Z][a-z]+ \d{4}|\d{4}-\d{2}-\d{2})"
 _REVIEW_LABEL = re.compile(r"(?:(?:[a-z-]+\s+){0,4}(?:signal|criterion)(?:\s+\d+)?(?:\s+(?:passed|present|met))?"
-                           r"|completed|confirmed|verified):\s+(?=\S)", re.IGNORECASE)
+                           r"|pass(?:ed)?|completed|confirmed|verified):\s+(?=\S)", re.IGNORECASE)
 # Only a whole closing clause: removing a window check from mid-sentence garbled real claims in review.
 _WINDOW_CLAUSE = re.compile(
     r"(?:[,;]\s*(?:(?:this|the|that|which|it)\b[^,;.]{0,40}?\b(?:is|was|falls|fell)\s+|both\s+)?"
-    r"|\s+(?:and\s+)?(?:(?:is|are|was|were|both|falling|falls|fell)\s+)?)(?:well\s+)?within\s+"
+    r"|\s+(?:and\s+)?(?:(?:is|are|was|were|both|falling|falls|fell)\s+)?)(?:well\s+)?(?:within|inside)\s+"
     r"(?:(?:the|its|this|a)\s+(?:(?:required|requested|optional|intent|signal|allowed|last|past)\s+)*"
     r"(?:(?:\d{1,4}|one|twelve)[- ](?:day|month|year)\s+)?(?:(?:required|requested|optional|intent|signal)\s+)*"
     r"(?:window|limit|lookback|look-back)|the\s+(?:last|past)\s+(?:\d{1,4}|twelve)\s+(?:days|months))"
@@ -254,28 +259,51 @@ def _sentence(name, claim):
         return ""
     first = re.sub(r"'s$", "", claim.split()[0].casefold())
     # A shortened name also opens a claim: "American Landmark completed ..." for American Landmark Apartments.
-    if claim.casefold().startswith(name.casefold()) or first in _SUBJECT_WORDS or first == name.split()[0].casefold():
+    # A claim that names the company but opens with its partner ("Lili announced it partnered with Fundbox") already has
+    # a subject; prefixing the name printed "Fundbox lili announced ..." and failed the company (round 10-31).
+    # The comma comes off too: "Stem, Inc." missed "Stem announced ..." and printed "Stem, Inc. stem announced ...".
+    lead = name.split()[0].rstrip(",.").casefold()
+    named = lead in claim.casefold() and not first.endswith("ed")
+    if claim.casefold().startswith(name.casefold()) or first in _SUBJECT_WORDS or first == lead or named:
         return claim[0].upper() + claim[1:] + "."
     return f"{name} {claim[0].lower()}{claim[1:]}."
 
 
+_MONTHS = "(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?"
+POSTED_DATE = (rf"(?:{_MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}|\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTHS}\s+\d{{4}}"
+               r"|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})")
+LATER_SIGNAL = re.compile(r"signal:[1-9]")
+_SINGULAR = r"(platform|REIT|firm|provider|bank|lender|retailer|manufacturer|insurer|developer|operator)s$"
+_ACTIVITY_NOUNS = ((r"\bhiring\b", "hiring"), (r"\blaunch", "launch"), (r"\bpartner", "partnership"),
+                   (r"\bfunding\b", "funding"), (r"\bacqui", "acquisition"), (r"\bexpan|\bopened\b", "expansion"))
+
+
+def _undated(claim):
+    """A hiring claim without its posting date: over four rounds 8 of 17 dated ones passed the paragraph, 8 of 11 others."""
+    return re.sub(r",?\s*(?:(?:with|and)\s+(?:the\s+|its\s+)?(?:posting|role|job|listing)\s+)?"
+                  r"(?:(?:first\s+)?(?:posted|published|listed|dated)\s+)?(?:on\s+|in\s+)?" + POSTED_DATE,
+                  "", claim, flags=re.I).strip()
+
+
 def intent_details(name, rows, icp):
-    """One plain paragraph: the company's verified activity and a hedged link to the request.
+    """One plain paragraph: the company's verified activity and a hedged link to its own business.
 
     No company summary: Leadpoet checks every clause against the few pages it admits, and saved descriptions
     (customers, licence counts, feature lists) were the clauses it could not find there (round 10-23 replay)."""
-    parts = [_sentence(name, row["description"]) for row in rows]
-    # Built from structured ICP fields: Leadpoet's free-text prompts are informal ("need ...", "yo can you pull ...").
+    # A saved source passage skips public_claim in company_row, and a v8 test printed "inside the 365-day window" here.
+    parts = [_sentence(name, public_claim(row["description"])) for row in rows]
+    signal = (intent_signals(icp) or [""])[0]
+    if HIRING.search(signal):
+        parts = [_sentence(name, _undated(public_claim(row["description"]))) for row in rows]
+    # The wording of Leadpoet's paragraph rubric: "This funding may help the company expand its workflow platform". It
+    # names no search: the current rubric fails any sentence on why a company matches the request.
     what = _one_line(icp.get("sub_industry")) or _one_line(icp.get("industry"))
-    activity = re.split(r",\s*(?:per|according to|as shown|backed by)\b|;", _one_line(intent_signals(icp)[0]))[0].rstrip(". ")
-    if what and activity:
-        words = activity.casefold().split()
-        progressive = words[0].endswith("ing") or (len(words) > 1 and words[0].endswith("ly") and words[1].endswith("ing"))
-        activity = ("are " if progressive else "") + activity[0].lower() + activity[1:]
+    if what:
         if len(what) > 1 and what[0].isupper() and what[1].islower():
             what = what[0].lower() + what[1:]  # "Management consulting", but keep "IT", "AI", "B2B".
-        parts.append(f"Because this request looks for {what} companies that {activity}, this activity "
-                     f"may make {name} a timely match.")
+        what = re.sub(r"(agenc|compan)ies$", r"\1y", re.sub(_SINGULAR, r"\1", what))  # "... agency offering".
+        noun = next((word for pattern, word in _ACTIVITY_NOUNS if re.search(pattern, signal, re.I)), "activity")
+        parts.append(f"This {noun} may help {name} expand its {what} offering.")
     text = " ".join(part for part in parts if part)
     capped = _cap(text, INTENT_DETAILS_LIMIT)
     return capped if capped == text else capped.rsplit(" ", 1)[0]
@@ -284,7 +312,7 @@ def intent_details(name, rows, icp):
 def company_row(lead, icp, request_signals, *, gaps=None):
     """One v6 company, or None when the saved review cannot fill a scored field."""
     company = lead.get("company") or {}
-    name = _one_line(company.get("canonical_name"))
+    name = _one_line(company.get("canonical_name")).split(" | ")[0]  # "Hyperfine | AI-Powered Portable MRI": a page title.
     website = public_url(company.get("website") or ("https://" + company["domain"] if company.get("domain") else None))
     bucket = employee_bucket(company.get("employee_range"))
     country = _one_line(company.get("hq_country"))
@@ -309,9 +337,15 @@ def company_row(lead, icp, request_signals, *, gaps=None):
             [item for item in check.get("evidence") or [] if public_url(item.get("url"))])), None)
         if index is None or evidence is None or any(row["matched_icp_signal"] == index for row in rows):
             continue
+        # Signal 0 only: on 11-02 the paragraph check passed 0 of 6 two-signal companies against 54 of 63 with one.
+        if index != 0:
+            continue
         claim = check.get("claim") if check.get("source_passage") else public_claim(check.get("claim"))
+        # The day a posting was read is not its date. Leadpoet takes a null date, and an open posting needs none.
+        read_only = (HIRING.search(signals[index]) and evidence.get("date_basis") == "observed_current"
+                     and evidence.get("event_date") in (None, evidence.get("date")))
         rows.append({"matched_icp_signal": index, "description": _cap(claim),
-                     "date": signal_date(evidence), "url": evidence["url"].strip()})
+                     "date": None if read_only else signal_date(evidence), "url": evidence["url"].strip()})
     rows.sort(key=lambda row: row["matched_icp_signal"])
     if not rows or rows[0]["matched_icp_signal"] != 0 or not all(row["description"] for row in rows):
         if gaps is not None:
@@ -427,9 +461,11 @@ def _held_as_passing(check):
     """
     if check.get("status") != "unknown" or check.get("criterion_id") != "signal:0":
         return check
+    hiring = HIRING.search(str(check.get("criterion") or check.get("label") or ""))
     dated = _reachable_first([item for item in check.get("evidence") or []
                               if public_url(item.get("url")) and _one_line(item.get("text"))
-                              and signal_date({"event_date": item.get("event_date")})])
+                              and (signal_date({"event_date": item.get("event_date")})
+                                   or (hiring and JOB_PAGE.search(item["url"]) and not RELATIVE_DATE.search(item["text"])))])
     return dict(check, status="pass", claim=dated[0]["text"] if dated else "", evidence=dated, source_passage=True)
 
 
@@ -452,33 +488,20 @@ def unconfirmed_companies(document, icp, limit, *, run_file, published=()):
     Research accepts a company through the accept gate; the final review then confirms it. A final review that
     ends without approval leaves the rest unconfirmed (round arena-2026-10-26, 2 of 20 local runs: one lost all
     five accepted companies after 31 minutes of provider restarts), and Leadpoet would score none of them. Each is
-    re-checked against the accept gate's evidence checks and the exclusions, best-evidenced first.
+    re-checked against the accept gate's evidence checks and the exclusions, in accepted order.
     """
     request = document["request"]
-    signals = request.get("buying_signals") or []
     seen = {row["company_website"].lower().rstrip("/") for row in published}
-    # Rank by publishable evidence rather than accepted order. company_row reports, through gaps, the fields the
-    # Arena mapper cannot fill (the same list publication_gaps explains); a row missing one is published with that
-    # field empty, so Leadpoet records the fit dimension unavailable, never evaluates intent, and scores the row
-    # zero. On round arena-2026-10-28 this host published 17 rows whose intent was never evaluated while slots
-    # stayed empty. Fewest gaps first, accepted order breaking ties, so no company accepted order would have
-    # published is dropped -- only the order in which they claim the empty slots changes.
-    ranked = []
-    for position, lead in enumerate(document.get("accepted") or []):
+    found = []
+    for lead in document.get("accepted") or []:
+        if len(found) >= min(limit, MAX_COMPANIES):
+            break
         if (not isinstance(lead, dict) or not isinstance(lead.get("company"), dict)
                 or not isinstance(lead.get("qualification_checks"), list) or excluded_company(request, lead)):
             continue
-        gaps = []
-        row = company_row(lead, icp, signals, gaps=gaps)
-        if row is not None:
-            ranked.append((len(gaps), position, row, lead))
-    ranked.sort(key=lambda item: item[:2])
-    found = []
-    for _, _, row, lead in ranked:
-        if len(found) >= min(limit, MAX_COMPANIES):
-            break
-        key = row.get("company_website", "").lower().rstrip("/")
-        if key not in seen and not _accept_gate_errors(document, lead, run_file):
+        row = company_row(lead, icp, request.get("buying_signals") or [])
+        key = (row or {}).get("company_website", "").lower().rstrip("/")
+        if row and key not in seen and not _accept_gate_errors(document, lead, run_file):
             seen.add(key)
             found.append(row)
     return found
@@ -508,7 +531,8 @@ def held_companies(document, icp, limit=HELD_COMPANIES, *, run_file, published=(
             continue
         checks = [c for c in checks if isinstance(c, dict)]
         passed = {c.get("criterion_id") for c in checks if c.get("status") == "pass"}
-        if (any(c.get("status") == "fail" for c in checks) or not reviewed <= {c.get("criterion_id") for c in checks}
+        if (any(c.get("status") == "fail" and not LATER_SIGNAL.match(str(c.get("criterion_id"))) for c in checks)
+                or not reviewed <= {c.get("criterion_id") for c in checks}
                 or not fields <= passed or any(str(c.get("criterion_id")).startswith("exclusion:")
                                                and c.get("status") != "pass" for c in checks)):
             continue

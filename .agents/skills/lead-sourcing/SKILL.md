@@ -26,11 +26,8 @@ Use [native tools](references/adapter-io.md#native-tools), not shell bookkeeping
 
 ## Research loop
 
-Claim the company domain with `tyche_claim`; skip other owners. Build a candidate pool before
-researching any one company: discover a shortlist of at least ten plausible companies and claim them,
-then work each to identity → fit and signal → accept, evidenced rejection or specifically justified
-hold. Never discover one company at a time: an unfilled slot scores nothing, and finishing one
-company before looking for the next holds a lane to about six companies a run.
+Claim the company domain with `tyche_claim`; skip other owners. Finish one company before
+discovery: identity → fit and signal → accept, evidenced rejection or specifically justified hold.
 Resume `parallel.current_company` first. On `worker_yield`, end immediately. Code manages shared
 budget/deadline/target; read [parallel rules](references/workflow-rules.md#parallel-company-workers).
 Batch up to three independent, known-input checks for one company with
@@ -41,14 +38,6 @@ Batch up to three independent, known-input checks for one company with
    `tyche_inspect(query=...)`; shortlist by price/input hints, inspect the chosen tool's
    full schema/pricing, then try a bounded call before alternatives. Change route
    when blocked or when evidence stays empty.
-   Fill the pool with searches that return many companies for one call, never one company at a
-   time: `free_simple_company_search` first (bounded SQL over the company corpus, and free), then
-   indexed firmographic search on the profile's own industry, size and country
-   (`crustdata_v3_company_search`, `prospeo_search_company`, `forager_organization_search`,
-   `harvestapi_search_companies`), and `exa_company_search` on the required attribute's own
-   wording. From a company already accepted, `aviato_generate_map` names its peers. These lanes
-   return candidates, never evidence: size, country and the attribute are each still checked per
-   company. Abandon a lane that returns nothing for this profile instead of retrying it.
    Establish canonical name, domain and website from sources; right after claiming, fetch the
    [LinkedIn company record](references/output-contract.md#linkedin-company-record) first (the claim returns the
    check) and hold a company whose own band lies wholly outside the requested size. A namesake, subsidiary, customer or group entity is not the target

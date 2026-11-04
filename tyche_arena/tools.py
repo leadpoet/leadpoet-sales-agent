@@ -17,7 +17,7 @@ import sys
 from . import pacing  # noqa: F401  (sets sys.path for the skill scripts)
 from .broker import Broker
 from . import native_counts
-from .input import STAGE_PREFIX, company_stage, intent_signal_ages, intent_signals, stage_line
+from .input import (COMPANY_LIST_RESULTS, OPENING_TOOL, STAGE_PREFIX, company_stage, intent_signal_ages, intent_signals, stage_line)
 from .output import ICP_FILE, companies, company_row, judge_unreachable_fields, listing_passage, publication_gaps
 import budget_guard
 import confirmed_leads
@@ -116,12 +116,56 @@ def evidence_urls(row):
                               and len(u) <= DECISION_TEXT_LIMIT))[:5]
 
 
+COMPANY_LOOKUP_LIMIT = 16  # One company took 32 lookups on 11-01 (local) while accepted companies usually took 6 to 15.
+
+
+def company_digest(row):
+    """An Exa company row as short facts, about a fifth of its full size; None for any other row."""
+    entities = row.get("entities") if isinstance(row, dict) else None
+    entity = next((item for item in entities or [] if isinstance(item, dict) and item.get("type") == "company"), None)
+    if entity is None or not isinstance(entity.get("properties"), dict):
+        return None
+    facts = entity["properties"]
+    section = lambda value, key: value.get(key) if isinstance(value.get(key), dict) else {}
+    head, funding = section(facts, "headquarters"), section(facts, "financials")
+    latest = section(funding, "fundingLatestRound")
+    return {"name": facts.get("name") or row.get("title"), "website": row.get("url"),
+            "employees": section(facts, "workforce").get("total"),
+            "headquarters": head.get("address") or ", ".join(str(v) for v in (head.get("city"), head.get("country")) if v),
+            "founded": facts.get("foundedYear"),
+            "latest_round": " ".join(str(v) for v in (latest.get("name"), latest.get("date")) if v) or None,
+            "about": " ".join(str(facts.get("description") or "").split())[:240]}
+
+
 class ArenaResearchTools(ResearchTools):
     """Return publisher field gaps with review responses; shared confirmation stays unchanged.
 
     Leadpoet charges model tokens to the ICP's allowance, so a tool description omits the JSON schema that repeats
     its field list.
     """
+
+    def lookup(self, checks):
+        self._company_lookup_limit(checks)
+        return super().lookup(checks)
+
+    def _company_lookup_limit(self, checks):
+        """Refuse more lookups on a company past the limit, so one hard company cannot take a worker's research time.
+
+        Held with signal 0 proven, it can still fill an empty slot.
+        """
+        try:
+            routes = self._document().get("routes") or []
+        except (OSError, ValueError):
+            return
+        for check in checks:
+            if not isinstance(check, dict) or check.get("phase") != "account_verification":
+                continue
+            target = str(check.get("target", "")).strip().lower()
+            if sum(str(route.get("scope", "")).lower() == target and route.get("phase") == "account_verification"
+                   for route in routes) >= COMPANY_LOOKUP_LIMIT:
+                raise ValueError(f"{target} has used its {COMPANY_LOOKUP_LIMIT} lookups. No paid call was made. Review it "
+                                 "now from what is saved: accept it if its checks pass, otherwise hold it with the named "
+                                 "gap, then move to the next candidate.")
 
     def _description_view(self, contract):
         view = super()._description_view(contract)
@@ -330,8 +374,10 @@ class ArenaResearchTools(ResearchTools):
 
     def _lookup_view(self, attempt, offset=0, limit=10):
         """Expand captured source text within one bounded lookup response."""
-        view = super()._lookup_view(attempt, offset=offset, limit=limit)
         body = attempt.get("result") if isinstance(attempt, dict) else None
+        if isinstance(body, dict) and body.get("tool") == OPENING_TOOL:
+            limit = max(limit, COMPANY_LIST_RESULTS)  # Asking for 25 rows and showing 10 would hide the rest.
+        view = super()._lookup_view(attempt, offset=offset, limit=limit)
         route = view.get("route")
         if (not isinstance(body, dict) or not isinstance(route, str) or not view.get("recorded")
                 or view.get("status") != "ok" or attempt.get("exit_code") != 0
@@ -344,6 +390,14 @@ class ArenaResearchTools(ResearchTools):
             if not isinstance(reference, str) or not reference.startswith(route + ":"):
                 continue
             facts = item.get("facts")
+            if isinstance(facts, dict) and facts.get("entities"):
+                try:
+                    digest = company_digest(self._resolve(reference)[0])
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    digest = None
+                if digest:
+                    item["facts"] = digest
+                    continue
             if not isinstance(facts, dict) or not isinstance(facts.get("evidence_text"), str):
                 continue
             try:

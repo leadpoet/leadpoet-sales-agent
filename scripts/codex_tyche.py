@@ -94,12 +94,11 @@ CODE_MODE = SETUP.get('code_mode', True)
 WEB_SEARCH = 'live'
 # A refused accept is saved as a hold, and a company refused this many reviews in a row is held so its worker moves on
 # (ResearchTools.refusal_limit). In tc35, 281 of 414 refused company reviews came after six in a row for that company;
-# 2 of 76 companies were accepted after so many, and one company was refused 220 times in 22 minutes
-# (_held_after_refusals). A refused review is a full reasoning call at effort high, the most expensive call in the run,
-# so five of them on one stuck company is the tail that makes a lane cost 155 provider calls per published company
-# against the field's 70 on round arena-2026-10-28. Hold sooner: the company is not lost, it moves to held_companies
-# and can still take an empty slot, and the worker goes on to a company that may still be accepted.
-REVIEW_REFUSAL_LIMIT = 3
+# 2 of 76 companies were accepted after so many. A hold is not a loss: a held company can still take an empty slot,
+# while each refused review is a costly call that delays the next candidate. Time, not budget, ends most runs.
+# A refused review is one model turn and a new company about seven minutes. At 3 a local run on 11-02 held McCANN Canada,
+# fully proved and qualified for two entries, over quote formatting.
+REVIEW_REFUSAL_LIMIT = 6
 
 
 def codex_settings():
@@ -866,13 +865,6 @@ def isolation_overrides():
     for feature in ('plugins', 'apps', 'memories', 'hooks', 'shell_snapshot'):
         overrides.extend(['--disable', feature])
     overrides.extend(['-c', 'developer_instructions=' + json.dumps(standing_instructions())])
-    # Leadpoet commit 2bd327e2f (2026-10-27) stopped forcing the route's tested output allowance: a request that
-    # omits max_output_tokens is normalized to 4,096 instead of 32,768 (lab_arena/broker.py
-    # openrouter_normalized), while reasoning stays at effort high. A truncated answer loses the evidence quote a
-    # fit criterion needs, and an unevidenced fit dimension leaves intent unevaluated, so the row scores zero.
-    # Ask for the full envelope. Codex ignores a config key it does not define, so this is inert where it does
-    # not apply.
-    overrides.extend(['-c', 'model_max_output_tokens=32768'])
     # Last, so the runtime check, the smoke test and every worker use the same provider as the run.
     overrides.extend(provider_overrides())
     overrides.extend(host_sandbox_overrides())

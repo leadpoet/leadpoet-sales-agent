@@ -94,10 +94,13 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
         position = int(worker.rsplit("-", 1)[1])
         task = ("Continue the saved request and current evidence in this run. Historical review feedback is not a verdict: check whether newer evidence has resolved it."
                 if attempts.get(worker) else command[-1])
+        lane_file = Path(run_file).parent / f"worker-{position}-lane.txt"
+        lane = lane_file.read_text(encoding="utf-8") if lane_file.exists() else ""
         prompt = (task + "\n\nParallel run instructions: You are " + worker + " of " + str(count) + ". "
-            "All workers run the same discovery and company qualification loop. "
-            "Interpret the ICP's distinct search approaches in the order given; start with approach " + str(position) +
-            ", or a different query/source if fewer approaches exist. Vary approaches when needed, without changing criteria. "
+            + ("All workers use the same qualification loop and criteria. " + lane + "\n" if lane else
+               "All workers run the same discovery and company qualification loop. "
+               "Interpret the ICP's distinct search approaches in the order given; start with approach " + str(position) +
+               ", or a different query/source if fewer approaches exist. Vary approaches when needed, without changing criteria. ")
             + ("The request is initialized; use tyche_inspect and its saved interpretation. " if run_file.exists() else
                "Worker-1 initializes the request once with tyche_start; other workers use tyche_inspect and the saved interpretation. ") +
             "Use tyche_claim with a real website domain BEFORE company-specific research; include its verified LinkedIn company_url when known. "
