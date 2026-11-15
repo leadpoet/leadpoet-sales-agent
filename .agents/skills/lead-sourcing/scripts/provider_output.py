@@ -1,4 +1,3 @@
-"""Preserve a provider response before normalization, without repeating a call."""
 
 import json
 from decimal import Decimal
@@ -16,9 +15,6 @@ def _finite_float(value):
 
 
 def load_json(text, *, billing_feed=False):
-    # Preserve monetary decimals that cannot round-trip through a JSON float.
-    # Company data keeps its existing numeric types; canonical ledger amounts
-    # and exceptional-precision billing fields use decimal strings.
     money = {"credits_charged", "cost_usd", "credits", "delta", "charge_credits", "postedCredits"}
     def values(value, key=None, in_billing=False):
         if isinstance(value, Decimal):
@@ -33,7 +29,6 @@ def load_json(text, *, billing_feed=False):
 
 
 def response_body(parsed, text):
-    """Keep diagnostic text when the provider response could not be parsed."""
     return text if parsed is None else parsed
 
 
@@ -43,7 +38,6 @@ class ResponseFile:
         self.redact = redact
         self.response = None
         self.metadata = dict(metadata or {})
-        # Reserve a unique destination and prove it is writable before dispatch.
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(fd)
         self.identity = self._identity()
@@ -75,7 +69,6 @@ class ResponseFile:
         try:
             self._write({"receipt_status": "response_received", "provider_response": self.response})
         except (OSError, TypeError, ValueError):
-            # Keep the response in memory for the final save; never retry the provider.
             pass
 
     def finish(self, body):

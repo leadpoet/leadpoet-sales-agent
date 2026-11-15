@@ -1,12 +1,5 @@
-"""Run the main TYCHE supervisor inside a Leadpoet execute sandbox.
 
-Research behavior lives only in the shared skill, native tools and supervisor. This
-host supplies what differs in Leadpoet: model calls through lab_arena_codex, provider
-calls through the broker (tyche_arena.tools), spend pacing, and output as Leadpoet's
-atomic checkpoint, published after every confirmed company and corrected after final review.
-"""
-
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from collections import Counter
 import contextlib
 import importlib
@@ -21,104 +14,94 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 import uuid
 
 from . import ROOT, SKILL
 from .broker import DEEPLINE_WAIT_SECONDS
-from .input import worker_lanes, opening_plan, prepare as prepare_request
-from .output import (HELD_COMPANIES, ICP_FILE, MAX_COMPANIES, companies, held_companies, publication_gaps,
+from .input import HIRING, _signal_core, intent_signal_ages, intent_signals, worker_lanes, opening_plan, prepare as prepare_request
+from .output import (BONUS_UNREADABLE_HOSTS, HELD_COMPANIES, ICP_FILE, LATER_SIGNAL, MAX_COMPANIES, _LEADERSHIP,
+                     company_row, companies, held_companies, publication_gaps,
                      unconfirmed_companies)
 from . import pacing
+from . import relay
 from .pacing import ModelRequestGuard
 from .strategy import COVERAGE_STRATEGY
 from .native_counts import summary as native_call_summary
 from .tools import final_review_status
 from scripts import codex_tyche as runner
-from validate_run import _company_key
+from validate_run import BONUS_PASS_APPROACH, _company_key
 import confirmed_leads
 
-# The model setup is shared with the product launcher (runner.MODEL_SETUPS, runner.codex_settings), so TYCHE runs a
-# model alike in and out of the Arena; scripts/test_model_parity.py lists the Arena-only differences and their reasons.
-# Leadpoet's runtime names models as OpenRouter does.
 MODEL = runner.SETUP["route_id"]
 CODE_MODE = runner.CODE_MODE
 REASONING_EFFORT = runner.REASONING_EFFORT
 WEB_SEARCH = runner.WEB_SEARCH
-# Shared settings given to Leadpoet's session instead of the command line (model, effort), or not sent at all: Leadpoet's
-# closed request schema refuses a service tier.
 SESSION_SETTINGS = ("model", "model_reasoning_effort", "service_tier")
 CODEX_VERSION = runner.CODEX_VERSION
 DEFAULT_WALL_CLOCK_SECONDS = 45 * 60
-EXIT_MARGIN_SECONDS = 150    # Last in-flight provider call, final checkpoint and process exit.
-# Allocate the shared finalization allowance inside Arena's existing hard wall cap.
+EXIT_MARGIN_SECONDS = 150
 FINAL_REVIEW_RESERVE_SECONDS = runner.FINALIZATION_SECONDS
 PUBLISH_INTERVAL_SECONDS = 2
 MODEL_GUARD_DENIALS = {"budget_exhausted", "budget_paced", "quota_exceeded_openrouter_reserve"}
-# Leadpoet's Codex config disables Codex's own request retries (an unknown bill must not be
-# replayed), so one transient provider failure ends a Codex turn. The host restarts that turn
-# itself, after a growing pause, at most this many times per run; the supervisor never sees the
-# failed turn, so a short network outage does not count toward its failure or no-progress limits.
-# A turn whose model request got no reply (MODEL_UNAVAILABLE_TURN) is restarted without counting toward this cap.
-MAX_TRANSIENT_WORKER_FAILURES = 20  # Leadpoet's shared model queue can time out under load.
-# Research workers per Leadpoet run. On 2026-10-13 productive ICPs stopped at 2-4 companies with budget left:
-# about 7 minutes per company, so time, not money, limited them. Two workers fit the sandbox (1 CPU, 2 GB;
-# a one-worker run peaked at 547 MB and ~5% CPU) and Leadpoet's shared model gate (default 200 calls).
-# A third worker does not survive Leadpoet's runs: every three-worker entry ended most ICPs about a minute after
-# start with no companies (sub-37388c8f in round arena-2026-10-28; this entry and two others in arena-2026-10-29),
-# while two-worker entries ran the full wall clock.
+MAX_TRANSIENT_WORKER_FAILURES = 20
 RESEARCH_WORKERS = 2
-WORKER_LANE_FILE = "worker-{}-lane.txt"  # Read by scripts/parallel_sourcing.py for that worker.
-# Leadpoet refuses a model request whose reasoning text exceeds 32,000 characters, and DeepSeek's reasoning after a
-# five-company review packet exceeded it in 5 of 8 replays (tc38/tc39 final reviews: 54 such refusals in 26 ICPs, up to
-# 10 restarts and 28 minutes in one review). A packet shows this many companies (ResearchTools.packet_companies).
+WORKER_LANE_FILE = "worker-{}-lane.txt"
 REVIEW_PACKET_COMPANIES = 1
-# Two researchers roughly double how far admitted calls can overshoot the pacing line on one 20 s quota reading, so
-# they run only when the run's allowance has room for it: the flat $4 per-ICP budget (research stops at $3.60), not
-# the legacy one-company $0.80 (research stops at $0.72, leaving $0.08 for final review) or a small request.
 PARALLEL_MIN_ALLOWANCE_MICROUSD = 2_000_000
+# Bonus pass: when research ends with the company target met, one Codex session may add an optional later intent
+# signal to the published companies (ArenaHost.bonus_pass). False leaves the run exactly as without the pass.
+BONUS_PASS = True
+BONUS_PASS_MIN_SECONDS = 900           # start only with this much research time left
+BONUS_PASS_END_MARGIN_SECONDS = 480    # end this long before the research deadline; final review keeps the rest
+BONUS_PASS_MAX_SECONDS = 900
+BONUS_PASS_RESTART_SECONDS = 240
+BONUS_PASS_WIRES = ("prnewswire.com", "globenewswire.com", "accessnewswire.com")
+CAPTURE_TOOLS = ("contextdev_get_web_scrape_markdown", "firecrawl_scrape")
+# Words to search the saved pages for, by Leadpoet bonus_intents intent_category.
+BONUS_TERMS = {"FUNDING": ["raised", "funding", "Series"], "PRODUCT_LAUNCH": ["launch", "introduc", "unveil"],
+               "PARTNERSHIP": ["partner", "agreement"], "MARKET_EXPANSION": ["expan", "enter", "new market"],
+               "FACILITY_OPENING": ["open", "facility", "terminal"], "ACQUISITION": ["acqui"],
+               "REGULATORY_CLEARANCE": ["approv", "clearance"], "CERTIFICATION": ["certif", "ISO", "SOC 2"]}
+BONUS_PASS_PROMPT = (
+    "Bonus pass for the saved Leadpoet run. The company target is met and sourcing is closed: do not claim, discover, "
+    "hold, reject or call tyche_finish; the tools refuse those calls. For each company below, in order: first search its "
+    "saved pages for free with tyche_inspect(ref=<saved_pages ref>, field='markdown', term=<term>); if no saved page "
+    "states the later signal, run search_check with tyche_lookup, then capture its best result with capture_check "
+    "(set inputs.url to that result's URL). These are the only two paid lookups for that company. When a captured "
+    "passage names the company and states the later signal's event and the day it happened, dated on or after "
+    "window_start, call tyche_review(companies=[{target, decision: 'accept', reason, qualification_checks: [{criterion_id, "
+    "status: 'pass', claim, evidence: [{ref, text, event_date}]}]}]): claim is one plain sentence that opens with the "
+    "company's name and prints the day as the page does, text is copied exactly from the captured page (at most 1,000 "
+    "characters), event_date is that day as YYYY-MM-DD. Then approve the confirmation packet it returns (tyche_review "
+    "with review_ref and review_findings) and check that arena_submission_preview.intent_signals lists the later "
+    "signal. Close every bonus-pass lookup with tyche_review(sources=[{ref, state: 'exhausted', reason}]). When no "
+    "passage proves the later signal, save nothing for that company. Stop when the list is done.\n\n")
 
 
 def research_environment(workers):
-    """The shared research settings (runner.research_environment) plus the Arena's worker count and packet size."""
     return dict(runner.research_environment(), TYCHE_PARALLEL_WORKERS=str(workers),
                 TYCHE_REVIEW_PACKET_COMPANIES=str(REVIEW_PACKET_COMPANIES))
 
 
 def research_workers(run_file):
-    """RESEARCH_WORKERS when the current quota snapshot's allowance reaches PARALLEL_MIN_ALLOWANCE, else one."""
     snapshot = pacing._snapshot()
     try:
         allowance = pacing.research_stop.allowance(snapshot["sourcing_cost"],
                                                    pacing.research_stop.request_budget(run_file))
     except (KeyError, TypeError, ValueError, ArithmeticError):
-        return 1  # No readable allowance: keep the serial path.
+        return 1
     return RESEARCH_WORKERS if allowance >= PARALLEL_MIN_ALLOWANCE_MICROUSD else 1
 CODEX_LOG_BYTES = 256 * 1024
-_CODEX_LOG_LOCK = threading.Lock()  # Parallel researchers share codex.log.
-TRANSIENT_RETRY_PAUSE_SECONDS = (15, 30, 60)
-# How Codex 0.154.0 (Leadpoet's pin) ends a turn whose model request got no reply: "exceeded retry limit, last status:
-# 429 ..." when Leadpoet's bridge refuses the request (one already in progress, or unavailable; local tests also pass a
-# provider's 429 through), and "unexpected status 502 Bad Gateway: ..." when Leadpoet's broker reports the provider
-# unavailable (a provider 429 after the broker's own two retries at 20 and 40 s, a provider 5xx or an account failure)
-# or is unavailable itself. On 2026-10-25 OpenRouter moved DeepSeek from Fireworks to DeepInfra, the cheapest ZDR
-# endpoint, which rate-limits often: in local tests (tc37) at least 248 turns ended on a 429, against 9 in all earlier
-# Fireworks runs, and ICPs lost both researchers once the shared restarts ran out. Such a turn is restarted on the usual
-# pauses, with jitter so researchers do not retry together, outside MAX_TRANSIENT_WORKER_FAILURES; the research and
-# response deadlines still bound it, and a guard refusal still stops it first. Longer pauses would not help: a worker
-# needs one turn without a refusal to start the run within the launcher's STARTUP_SECONDS (600 s), and on one ICP 9 of
-# 13 requests there were refused.
+_CODEX_LOG_LOCK = threading.Lock()
+TRANSIENT_RETRY_PAUSE_SECONDS = (5, 10, 20)
+PRODUCTIVE_TURN_SECONDS = 90
 MODEL_UNAVAILABLE_TURN = (b"last status: 429", b"status 502 Bad Gateway")
-TOOL_TIMEOUT_SECONDS = 3 * DEEPLINE_WAIT_SECONDS + 15  # Conservatively covers a three-check batch plus broker overhead.
-# Leadpoet's runtime compacts Codex history at 64,000 tokens. TYCHE starts near 20,000 and adds about 4,000 a turn, so
-# local runs on round arena-2026-10-14 compacted about 16 times per ICP: each compaction call re-sent about 61,000
-# mostly uncached tokens, and the turns after it re-read the run. Together that was about half of the model spend that
-# counts against the $0.80-per-company allowance. Large requests measured 5.15 characters per token, so 128,000
-# tokens is about 660 KB, plus one tool output (at most ~45 KB), inside the bridge's 1 MB request cap.
+TOOL_TIMEOUT_SECONDS = 3 * DEEPLINE_WAIT_SECONDS + 15
 AUTO_COMPACT_TOKEN_LIMIT = 128_000
 
 
 def require_lab():
-    """Refuse to start outside the Leadpoet execute sandbox, before any call."""
     if ROOT != Path("/agent/source"):
         raise RuntimeError("This harness runs only in the Leadpoet execute sandbox")
     for name in ("LAB_ARENA_WORKER_SOCKET", "LAB_ARENA_WEB_EGRESS_SOCKET"):
@@ -134,7 +117,6 @@ def require_lab():
 
 
 def instructions():
-    """The local worker instructions and skill, plus the Leadpoet output contract."""
     skill = (SKILL / "SKILL.md").read_text().replace("(references/", "(" + str(SKILL / "references") + "/")
     standing = runner.worker_instructions() if CODE_MODE else runner.ISOLATION_INSTRUCTIONS
     return standing + "\n\n" + skill + "\n\n" + (
@@ -146,10 +128,27 @@ def instructions():
         "tyche_finish can return review_handoff; the host then starts a fresh context to review the saved evidence. "
         "Correct or hold unsupported companies before final approval; the Arena host emits company output "
         "without a workbook. "
-        "Final prose is not company output. " + turn_efficiency() + " " + COVERAGE_STRATEGY)
+        "Final prose is not company output. " + PROVIDER_ROUTES + " " + turn_efficiency() + " " + COVERAGE_STRATEGY)
 
 
-# Each model turn uses available execution time; this changes pacing, not what TYCHE checks.
+PROVIDER_ROUTES = (
+    "Provider routes in this run: both Deepline and ScrapingDog are available. ScrapingDog is not a Deepline catalog "
+    "tool and tyche_inspect(query=...) will not list it: call it as a tyche_lookup check with provider scrapingdog and the "
+    "operation inside inputs, for example "
+    "{\"target\": \"discovery\", \"phase\": \"account_discovery\", \"provider\": \"scrapingdog\", \"purpose\": \"...\", "
+    "\"inputs\": {\"operation\": \"google_search\", \"query\": \"Acme launches card issuing 2026\", \"results\": 10}} "
+    "for an exact Google query, {\"inputs\": {\"operation\": \"google_jobs\", \"query\": \"Acme data engineer\", "
+    "\"country\": \"us\"}} to find one open posting for a hiring signal, and {\"target\": \"acme.com\", \"phase\": "
+    "\"account_verification\", \"provider\": \"scrapingdog\", \"inputs\": {\"operation\": \"scrape\", \"url\": "
+    "\"https://acme.com/news/x\", \"dynamic\": true, \"limit\": 1}} to capture a page the Deepline reader failed on or "
+    "returned little text for (it renders JavaScript pages such as Workday, Lever and Greenhouse postings). Use Deepline "
+    "first for everything else: discover with exa_search or contextdev_post_web_search, capture a page with "
+    "contextdev_get_web_scrape_markdown or firecrawl_scrape, take the LinkedIn company record with harvestapi_get_company, "
+    "and read one LinkedIn job posting with harvestapi_get_job. When a page reader fails on one URL, try the other reader "
+    "once, then cite a different page that states the same fact. Never cite a search result as evidence: capture the page "
+    "it points to.")
+
+
 TURN_EFFICIENCY = (
     "Each model turn uses available execution time, so do more in each turn. The "
     "lead-sourcing skill above is already loaded: do not read SKILL.md again, and read a reference file only for a rule not stated above, opening just the section you need. "
@@ -171,12 +170,10 @@ PARALLEL_CALLS = ("In one response, call every TYCHE tool whose inputs you alrea
 
 
 def turn_efficiency():
-    """TURN_EFFICIENCY in the call form this model gets: exec cells in code mode, else parallel function calls."""
     return TURN_EFFICIENCY if CODE_MODE else TURN_EFFICIENCY.replace(CHAINED_CALLS, PARALLEL_CALLS)
 
 
 def evaluation_date():
-    """Leadpoet's evaluation date (LAB_ARENA_EVALUATION_DATE), else today in UTC."""
     reference = os.environ.get("LAB_ARENA_EVALUATION_DATE")
     try:
         return datetime.strptime(reference, "%Y-%m-%d").date() if reference else datetime.now(timezone.utc).date()
@@ -185,7 +182,6 @@ def evaluation_date():
 
 
 def compaction_limit(config):
-    """The runtime's Codex config with TYCHE's compaction limit; a config without the runtime's line is unchanged."""
     lines = config.split("\n")
     found = [i for i, line in enumerate(lines) if line.strip().startswith("model_auto_compact_token_limit")]
     if len(found) != 1:
@@ -194,10 +190,25 @@ def compaction_limit(config):
     return "\n".join(lines)
 
 
+def model_route(config, session, relays):
+    """Point Codex's model requests at a loopback relay that selects the faster approved route (see relay.py).
+
+    Any setup problem keeps the bridge's own address, so the run proceeds on the default route.
+    """
+    bridge = session.get("LAB_ARENA_CODEX_BASE_URL") or ""
+    line = "base_url = " + json.dumps(bridge)
+    # The broker accepts a route selector only in full-thinking rounds (lab_arena/shim.py uses the same test).
+    full_thinking = os.environ.get("LAB_ARENA_REASONING_CAPTURE_POLICY") == "full_generated_thinking_v1"
+    if not full_thinking or not bridge or config.count(line) != 1:
+        return config
+    try:
+        local = relays.enter_context(relay.Relay(bridge))
+    except (OSError, ValueError):
+        return config
+    return config.replace(line, "base_url = " + json.dumps(local.base_url))
+
+
 def codex_settings(environment):
-    """The `-c` settings each Arena Codex command carries: the shared settings outside SESSION_SETTINGS, and the final
-    review's tool-output limit. Each command repeats web search, because a project .codex/config.toml above the run
-    directory overrides the session's config (2026-10-25: a mismatch made Leadpoet's bridge refuse every request)."""
     settings = {key: value for key, value in runner.codex_settings().items() if key not in SESSION_SETTINGS}
     if environment.get("TYCHE_FINALIZATION_ONLY") == "1":
         settings["tool_output_token_limit"] = runner.FINAL_REVIEW_TOOL_OUTPUT_TOKENS
@@ -212,7 +223,7 @@ def tool_configuration(run_file, deadline, response_deadline):
                  "SCRAPINGDOG_API_KEY", "TYCHE_ISOLATED_RUN", "TYCHE_REQUEST_FILE", "TYCHE_RUN_STARTED_AT",
                  "TYCHE_FINALIZATION_ONLY", "TYCHE_WIND_DOWN_SECONDS", "TYCHE_UNPRICED_CALLS", "TYCHE_WORKER_ID",
                  "TYCHE_WORKER_GENERATION", "TYCHE_REVIEW_REFUSAL_LIMIT",
-                 "TYCHE_REVIEW_PACKET_COMPANIES"]
+                 "TYCHE_REVIEW_PACKET_COMPANIES"] + (["TYCHE_BONUS_PASS", "TYCHE_BONUS_UNTIL"] if BONUS_PASS else [])
     return ("\n[mcp_servers.tyche]\ncommand = " + json.dumps(sys.executable) + "\nargs = " + json.dumps(args)
             + "\ncwd = " + json.dumps(str(ROOT)) + "\nenv_vars = " + json.dumps(forwarded)
             + f"\nrequired = true\nstartup_timeout_sec = 40\ntool_timeout_sec = {TOOL_TIMEOUT_SECONDS}\n"
@@ -228,7 +239,6 @@ def _checkpoint_review_status(review, rows, checkpoint_ok):
 
 
 def _saved_state_summary(run_file, icp):
-    """Only numeric saved progress and fixed mapper gap names reach the exit log."""
     try:
         document = json.loads(run_file.read_text(encoding="utf-8"))
         accepted, unresolved, rejected = (document[key] for key in ("accepted", "unresolved", "rejected"))
@@ -248,25 +258,16 @@ def _saved_state_summary(run_file, icp):
 
 
 class Publisher:
-    """Publish confirmed companies from leads.json to Leadpoet's atomic checkpoint.
-
-    Once research has ended (held=True), slots the confirmed companies leave empty take accepted companies the
-    final review left unconfirmed (output.unconfirmed_companies), then held companies (output.held_companies); they
-    never count toward pacing.
-    """
 
     def __init__(self, run_dir, icp, limit, write):
         self.run_dir, self.icp, self.limit, self.write = run_dir, icp, limit, write
         self.rows = []
-        self.latest_rows = None  # Last readable projection; separate from the acknowledged checkpoint.
-        # latest_held counts every published row the final review did not confirm; latest_unconfirmed, the
-        # accepted ones among them.
+        self.latest_rows = None
         self.held, self.latest_held, self.latest_unconfirmed = False, 0, 0
         self.lock = threading.Lock()
         self.stopped = threading.Event()
 
     def _current_rows(self):
-        """Project only still-accepted saved confirmations; None means unreadable."""
         try:
             document = json.loads((self.run_dir / "results.json").read_text())
             saved = json.loads((self.run_dir / "leads.json").read_text())
@@ -304,9 +305,8 @@ class Publisher:
             if rows is None:
                 return self.rows
             if rows != self.rows:
-                self.write(rows)  # Atomic: Leadpoet keeps the last complete file at its deadline.
+                self.write(rows)
                 self.rows = rows
-                # Pacing counts confirmed companies Leadpoet can score, not every confirmed row or held company.
                 pacing.save_published_count(self.run_dir, len(rows) - self.latest_held)
             return self.rows
 
@@ -314,19 +314,11 @@ class Publisher:
         while not self.stopped.wait(PUBLISH_INTERVAL_SECONDS):
             try:
                 self.publish()
-            except Exception as exc:  # Keep publishing; the final publish reports a persistent error.
+            except Exception as exc:
                 print(json.dumps({"tyche_arena_publish_error": type(exc).__name__}), file=sys.stderr, flush=True)
 
 
 def _codex_once(runtime, environment, run_dir, prompt, remaining, receipt):
-    """One Codex worker, stopped when remaining() reaches zero; its process group is always stopped.
-
-    remaining() is re-read while Codex runs: the supervisor's deadline moves from the
-    startup limit to the research deadline once tyche_start saves the run. Codex's own
-    output is kept, bounded, in codex.log beside the run for diagnosis, one whole turn at a
-    time so parallel researchers do not interleave; receipt["model_unavailable"] says whether
-    a failed turn ended on a model request that got no reply (MODEL_UNAVAILABLE_TURN).
-    """
     log = Path(run_dir) / "codex.log"
     with tempfile.TemporaryFile() as incoming, tempfile.TemporaryFile(dir=run_dir) as output:
         incoming.write(prompt.encode())
@@ -350,7 +342,7 @@ def _codex_once(runtime, environment, run_dir, prompt, remaining, receipt):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                pass  # Already gone, or only exited (zombie) members remain: nothing left to stop.
+                pass
             process.wait()
             output.seek(max(0, output.seek(0, os.SEEK_END) - 4096))
             ending = output.read()
@@ -363,17 +355,15 @@ def _codex_once(runtime, environment, run_dir, prompt, remaining, receipt):
                         shutil.copyfileobj(output, kept)
                     _trim(log, CODEX_LOG_BYTES)
             except OSError:
-                pass  # Diagnostics only: never replaces the turn's result.
+                pass
 
 
 def _restart_pause(attempt, unavailable):
-    """Seconds before restarting a failed turn; one whose model request got no reply gets jitter."""
     pause = TRANSIENT_RETRY_PAUSE_SECONDS[min(attempt, len(TRANSIENT_RETRY_PAUSE_SECONDS) - 1)]
     return pause * random.uniform(0.75, 1.25) if unavailable else pause
 
 
 def _trim(path, limit):
-    """Keep only the last `limit` bytes of a log."""
     try:
         if path.stat().st_size > limit:
             with path.open("rb") as handle:
@@ -385,24 +375,19 @@ def _trim(path, limit):
 
 
 class ArenaHost:
-    """The supervisor's host hooks; every continuation decision stays in codex_tyche."""
 
     receipts_directory = "worker-executions"
 
     def __init__(self, runtime, run_dir, session, research_deadline, response_deadline, publisher, guard,
                  session_factory=None):
         self.runtime, self.run_dir, self.session = runtime, run_dir, session
-        # Leadpoet's Responses bridge admits one in-flight model request per Codex session and answers a second
-        # with 429 "request already in progress" (2026-10-13: two workers on one session exhausted Codex's
-        # retries). Each research worker therefore opens its own isolated session; the spend guard is shared.
         self.session_factory = session_factory
         self.research_deadline, self.response_deadline = research_deadline, response_deadline
         self.publisher, self.guard = publisher, guard
-        self.transient_failures = 0  # run_once (serial research and final review).
-        # Parallel researchers have their own restart allowance, so research cannot use up final review's, and the
-        # pacing closure is written only when no researcher can still reserve a provider call.
+        self.transient_failures = 0
         self.research_transient_failures, self.active_researchers = 0, 0
         self._research_lock = threading.Lock()
+        self._bonus_pass_done = False
 
     def export_partial(self, run_file, env):
         return {"partial": True, "companies": len(self.publisher.publish())}
@@ -412,8 +397,6 @@ class ArenaHost:
             return {"status": "blocked", "delivery_allowed": False, "reason": "host_deadline"}
         return None
 
-    # Hooks for scripts/parallel_sourcing.run_research. Each researcher is the same Codex call run_once makes,
-    # under the research deadline and the shared spend guard; final review still runs once through run_once.
     def research_receipt(self, request_file):
         return _WorkerReceipt(self.run_dir / self.receipts_directory)
 
@@ -429,9 +412,6 @@ class ArenaHost:
             with self._research_lock:
                 self.active_researchers -= 1
                 last = self.active_researchers == 0
-        # arena_research_stop records the ledger's provider calls and later requires that exact set, so close research
-        # only when no researcher remains to reserve another call (the shared guard denies every session's next
-        # model request, so the others end promptly).
         if last and isinstance(self.guard, pacing.ModelRequestGuard):
             try:
                 self.guard.close_research()
@@ -450,20 +430,20 @@ class ArenaHost:
             left = left if limit is None else min(left, limit - time.time())
             return 0 if cost_stop is not None and cost_stop() else left
 
-        code, retries, waits = None, 0, 0
+        code, retries, waits, step = None, 0, 0, 0
         try:
             if remaining() <= 0:
                 receipt.data["failure_kind"] = "deadline_reached"
-            # Like run_once: a transient provider failure ends a Codex turn (requests are never replayed), so restart
-            # it after a growing pause within the run's shared allowance. On 2026-10-19 two researchers without this
-            # ended every ICP after 326-720 s on a few dropped connections (invalid_or_unavailable_runtime_state).
             while remaining() > 0:
+                turn_started = time.monotonic()
                 code = _codex_once(self.runtime, environment, self.run_dir, command[-1], remaining,
                                    _Receipt(receipt.data, receipt.save))
                 if not code or self.guard.denial:
                     break
                 unavailable = bool(receipt.data.get("model_unavailable"))
-                pause = _restart_pause(waits if unavailable else retries, unavailable)
+                if unavailable and time.monotonic() - turn_started >= PRODUCTIVE_TURN_SECONDS:
+                    step = 0
+                pause = _restart_pause(step if unavailable else retries, unavailable)
                 with self._research_lock:
                     if remaining() <= pause + 60 or (
                             not unavailable and self.research_transient_failures >= MAX_TRANSIENT_WORKER_FAILURES):
@@ -472,6 +452,7 @@ class ArenaHost:
                         self.research_transient_failures += 1
                 if unavailable:
                     waits += 1
+                    step += 1
                 else:
                     retries += 1
                 time.sleep(pause)
@@ -482,9 +463,7 @@ class ArenaHost:
         except subprocess.TimeoutExpired:
             receipt.data["failure_kind"] = "deadline_reached"
         if self.guard.denial and receipt.data.get("failure_kind") is None:
-            receipt.data["failure_kind"] = "deadline_reached"  # Paced out: close research, keep output.
-        # parallel_sourcing counts an invocation whose status is not "complete" as a failure, and two in a row disable
-        # the worker; run_once sets the same status from the exit code.
+            receipt.data["failure_kind"] = "deadline_reached"
         receipt.data["status"] = "complete" if code == 0 else "failed"
         receipt.finish(1 if code is None else code)
         print(json.dumps({"tyche_arena_worker_exit": {
@@ -497,10 +476,70 @@ class ArenaHost:
 
     @staticmethod
     def reconcile_research(run_file):
-        return None  # Leadpoet's broker settles provider billing; there is no local feed to read.
+        return None
 
     def research_report(self, run_dir):
-        self.publisher.publish()  # Keep the checkpoint current when the research pool ends.
+        self.publisher.publish()
+
+    def bonus_pass(self, request_file, env):
+        """Once per run, after research ends with the company target met: one Codex session in which the model may add
+        an optional later intent signal to the published companies through the ordinary lookup and review tools
+        (tools.ArenaResearchTools._bonus_pass_guard, validate_run.bonus_pass_refusal). It ends
+        BONUS_PASS_END_MARGIN_SECONDS before the research deadline, so final review then runs as usual."""
+        if not BONUS_PASS or self._bonus_pass_done:
+            return None
+        self._bonus_pass_done = True
+        run_file = self.run_dir / "results.json"
+        started = time.monotonic()
+        until = min(self.research_deadline - BONUS_PASS_END_MARGIN_SECONDS, started + BONUS_PASS_MAX_SECONDS)
+        report = {"status": "skipped"}
+        try:
+            if self.research_deadline - started < BONUS_PASS_MIN_SECONDS:
+                report["reason"] = "too_little_research_time"
+            elif pacing.closure(run_file) is not None or self.guard.denial in pacing.research_stop.CAUSES:
+                report["reason"] = "research_paced"
+            elif not (candidates := bonus_candidates(self.run_dir)):
+                report["reason"] = "no_candidates"
+            else:
+                before = later_signal_count(run_file)
+                environment = dict(self.session, **{key: value for key, value in env.items() if key.startswith("TYCHE_")
+                                                    and key not in ("TYCHE_WORKER_ID", "TYCHE_WORKER_GENERATION")})
+                environment.update(TYCHE_FINALIZATION_ONLY="0", TYCHE_BONUS_PASS="active",
+                                   TYCHE_BONUS_UNTIL=str(round(time.time() + until - time.monotonic(), 3)))
+                prompt = BONUS_PASS_PROMPT + json.dumps(candidates, ensure_ascii=True)
+                receipt = _WorkerReceipt(self.run_dir / self.receipts_directory)
+                receipt.data["phase"] = "bonus_pass"
+                code, restarts = None, 0
+                try:
+                    while True:
+                        code = _codex_once(self.runtime, environment, self.run_dir, prompt,
+                                           lambda: until - time.monotonic(), _Receipt(receipt.data, receipt.save))
+                        if (not code or restarts or self.guard.denial or not receipt.data.get("model_unavailable")
+                                or until - time.monotonic() < BONUS_PASS_RESTART_SECONDS):
+                            break
+                        restarts += 1
+                        time.sleep(_restart_pause(0, True))
+                except subprocess.TimeoutExpired:
+                    receipt.data["failure_kind"] = "deadline_reached"
+                receipt.finish(1 if code is None else code)
+                report = {"status": "ran", "companies": [item["target"] for item in candidates], "exit_code": code,
+                          "restarts": restarts, "later_signals_before": before,
+                          "later_signals_after": later_signal_count(run_file)}
+        except Exception as exc:
+            report = {"status": "error", "error_kind": type(exc).__name__, "detail": str(exc)[:300]}
+        finally:
+            if report.get("status") == "ran" and isinstance(self.guard, pacing.ModelRequestGuard):
+                try:
+                    self.guard.close_research()
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+            try:
+                self.publisher.publish()
+            except Exception:
+                pass
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        print(json.dumps({"tyche_arena_bonus_pass": report}), file=sys.stderr, flush=True)
+        return None
 
     def run_once(self, command, request_file, worker_env, profile, *, deadline, terminal, attempt):
         started = time.monotonic()
@@ -514,12 +553,12 @@ class ArenaHost:
 
         def remaining():
             left = (self.response_deadline if terminal else self.research_deadline) - time.monotonic()
-            limit = deadline()  # Re-read: startup limit first, then the saved research deadline.
+            limit = deadline()
             return left if limit is None else min(left, limit - time.time())
 
         def research_retry_has_time(backoff=0):
             if terminal:
-                return True  # Final review keeps its existing response-window retry policy.
+                return True
             closes = runner.research_close(request_file)
             return closes is None or closes - time.time() - backoff >= runner.MIN_RESEARCH_SECONDS
 
@@ -543,12 +582,12 @@ class ArenaHost:
                         break
                     pause = _restart_pause(waits if unavailable else retries, unavailable)
                     if remaining() <= pause + 60:
-                        break  # Too little worker time left for another turn.
+                        break
                     if not research_retry_has_time(pause):
-                        break  # Let the supervisor hand off the settled research failure.
+                        break
                     time.sleep(pause)
                     if not research_retry_has_time():
-                        break  # Sleep may outlast the available replacement window.
+                        break
                     if unavailable:
                         waits += 1
                     else:
@@ -562,7 +601,7 @@ class ArenaHost:
             receipt.update(finished_at=time.time(), process_group_id=None)
             save()
             if self.guard.denial and execution.get("failure_kind") is None:
-                execution["failure_kind"] = "deadline_reached"  # Paced out: close research, keep output.
+                execution["failure_kind"] = "deadline_reached"
             if not terminal and isinstance(self.guard, pacing.ModelRequestGuard):
                 try:
                     self.guard.close_research()
@@ -606,8 +645,94 @@ class ArenaHost:
         return status, execution
 
 
+def later_signal_count(run_file):
+    try:
+        accepted = json.loads(Path(run_file).read_text(encoding="utf-8"))["accepted"]
+        return sum(any(LATER_SIGNAL.match(str(c.get("criterion_id") or "")) and c.get("status") == "pass"
+                       for c in row.get("qualification_checks") or []) for row in accepted)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def bonus_candidates(run_dir):
+    """The published companies without a passing later intent signal, with the inputs of their bonus-pass lookups.
+
+    Read-only: saved run, confirmed leads and the ICP. Hiring and leadership later signals are skipped (judgedb Oct 28 -
+    Nov 9: no qualified two-signal company with a hiring bonus; leadership bonuses verified 0 of 3)."""
+    run_dir = Path(run_dir)
+    document = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
+    leads = json.loads((run_dir / "leads.json").read_text(encoding="utf-8"))["leads"]
+    icp = json.loads((run_dir / ICP_FILE).read_text(encoding="utf-8"))
+    request = document["request"]
+    current = {_company_key(row): row for row in document["accepted"]}
+    published, seen = [], set()
+    for lead in leads:
+        if current.get(_company_key(lead)) != lead:
+            continue
+        row = company_row(lead, icp, request.get("buying_signals") or [])
+        website = (row or {}).get("company_website", "").lower().rstrip("/")
+        if row and website not in seen:
+            seen.add(website)
+            published.append(lead)
+        if len(published) >= MAX_COMPANIES:
+            break
+    signals, ages = intent_signals(icp), intent_signal_ages(icp)
+    kinds = {" ".join(str(item.get("intent_signal") or "").split()): str(item.get("intent_category") or "").upper()
+             for item in icp.get("bonus_intents") or [] if isinstance(item, dict)}
+    criteria_ids = {c.get("id") for c in document.get("criteria") or [] if isinstance(c, dict)}
+    as_of = date.fromisoformat(request["as_of_date"])
+    routes = [r for r in document.get("routes") or [] if isinstance(r, dict)]
+    entries = []
+    for index in range(1, len(signals)):
+        signal, cid = signals[index], f"signal:{index}"
+        kind = kinds.get(" ".join(signal.split()), "")
+        if cid not in criteria_ids or HIRING.search(signal) or _LEADERSHIP.search(signal) or "HIRING" in kind \
+                or "LEADERSHIP" in kind:
+            continue
+        start = (as_of - timedelta(days=ages[index] or 365)).isoformat()
+        # The whole event list ('a new office, terminal, or distribution facility'), not the text up to its first comma.
+        event = _signal_core(signal).rstrip(" ,.;")
+        for lead in published:
+            checks = {c.get("criterion_id"): c for c in lead.get("qualification_checks") or [] if isinstance(c, dict)}
+            if any(LATER_SIGNAL.match(str(key or "")) and c.get("status") == "pass" for key, c in checks.items()):
+                continue
+            company = lead.get("company") or {}
+            target, name = _company_key(lead), " ".join(str(company.get("canonical_name") or "").split())
+            if any(item["target"] == target for item in entries):
+                continue  # Leadpoet scores the strongest later signal; one per company is enough
+            domain = str(company.get("domain") or target).lower()
+            first = [e for e in (checks.get("signal:0") or {}).get("evidence") or [] if isinstance(e, dict)]
+            first_routes = {(e.get("source") or {}).get("route_id") for e in first}
+            hosts = []
+            for item in first:
+                host = (urlsplit(str(item.get("url") or "")).hostname or "").lower().removeprefix("www.")
+                if (host and host != domain and not host.endswith("." + domain) and host not in hosts
+                        and not any(host == bad or host.endswith("." + bad) for bad in BONUS_UNREADABLE_HOSTS)):
+                    hosts.append(host)
+            saved = [{"ref": r["route_id"] + ":0", **({"signal_0_page": True} if r["route_id"] in first_routes else {})}
+                     for r in routes if r.get("scope") == target and r.get("tool") in CAPTURE_TOOLS
+                     and r.get("provider_status") == "ok" and r.get("rows_returned") == 1]
+            saved.sort(key=lambda item: not item.get("signal_0_page"))
+            base = {"target": target, "phase": "account_verification", "provider": "deepline"}
+            entries.append({
+                "target": target, "name": name, "criterion_id": cid, "criterion": signal, "window_start": start,
+                "earlier_check": (checks.get(cid) or {}).get("status"), "saved_pages": saved[:6],
+                "terms": BONUS_TERMS.get(kind) or [word for word in event.split() if len(word) > 4][:2],
+                "search_check": {**base, "tool": "exa_search", "approach": BONUS_PASS_APPROACH + ": search",
+                                 "purpose": f"{cid} for {name}: own site or press wire",
+                                 "inputs": {"query": " ".join(f"{name} {event}".split()), "type": "auto",
+                                            "numResults": 8,
+                                            "includeDomains": [domain, *hosts, *BONUS_PASS_WIRES],
+                                            "startPublishedDate": start + "T00:00:00Z"}},
+                "capture_check": {**base, "tool": CAPTURE_TOOLS[0], "approach": BONUS_PASS_APPROACH + ": capture",
+                                  "purpose": f"{cid} for {name}: capture the search result", "inputs": {"url": ""}},
+            })
+    # Companies never checked for the later signal first, then those whose earlier check stayed unknown or failed.
+    entries.sort(key=lambda item: item["earlier_check"] is not None)
+    return entries
+
+
 class _WorkerReceipt:
-    """A parallel researcher's execution receipt, in run_once's format (Leadpoet bills model use itself)."""
 
     def __init__(self, directory):
         directory.mkdir(exist_ok=True)
@@ -640,14 +765,12 @@ def run(icp):
     wall_clock = int(os.environ.get("LAB_ARENA_WALL_CLOCK_SECONDS") or DEFAULT_WALL_CLOCK_SECONDS)
     started = time.monotonic()
     response_deadline = started + wall_clock - EXIT_MARGIN_SECONDS
-    # Bind the saved request and every research worker/tool to this same deadline.
-    # The existing saved wind-down closes new research before this hard cutoff.
     research_seconds = max(60, int(response_deadline - started - FINAL_REVIEW_RESERVE_SECONDS))
     research_deadline = started + research_seconds
     run_dir = Path(tempfile.mkdtemp(prefix="tyche-arena-", dir="/tmp"))
     run_file = run_dir / "results.json"
     request_file = prepare_request(run_dir, icp, limit, research_seconds)
-    (run_dir / ICP_FILE).write_text(json.dumps(icp), encoding="utf-8")  # Tool feedback uses the publisher's exact ICP.
+    (run_dir / ICP_FILE).write_text(json.dumps(icp), encoding="utf-8")
     for position, lane in worker_lanes(icp, evaluation_date(), RESEARCH_WORKERS).items():
         (run_dir / WORKER_LANE_FILE.format(position)).write_text(lane, encoding="utf-8")
     publisher = Publisher(run_dir, icp, limit, checkpoint.write)
@@ -657,25 +780,23 @@ def run(icp):
     try:
         _research(runtime, run_dir, run_file, request_file, publisher, guard, research_deadline, response_deadline)
     except Exception as exc:
-        # Confirmed companies are already published; a late failure must not discard them.
         print(json.dumps({"tyche_arena_error": type(exc).__name__, "detail": str(exc)[:500]}),
               file=sys.stderr, flush=True)
     finally:
         publisher.stopped.set()
         watcher.join(timeout=5)
-    publisher.held = True  # Research is over: empty slots may take unconfirmed, then held companies.
+    publisher.held = True
     try:
         rows = publisher.publish()
         checkpoint_ok = True
         latest = publisher.current_rows()
         if latest is not None and latest != rows:
             rows, checkpoint_ok = latest, False
-    except Exception:  # The host returns the current saved projection even if checkpoint.write failed.
+    except Exception:
         rows = publisher.current_rows()
         if rows is None:
             rows = publisher.rows
         checkpoint_ok = False
-    # The sandbox keeps stderr privately; report only fixed guard state and a count.
     denial = guard.denial if guard.denial in MODEL_GUARD_DENIALS or guard.denial is None else "unknown_guard_denial"
     review = final_review_status(run_file, limit=limit)
     held, unconfirmed = (publisher.latest_held, publisher.latest_unconfirmed) if rows else (0, 0)
@@ -696,16 +817,16 @@ def _research(runtime, run_dir, run_file, request_file, publisher, guard, resear
     @contextlib.contextmanager
     def configured_session():
         with runtime.session(model=MODEL, reasoning_effort=REASONING_EFFORT, web_search=WEB_SEARCH,
-                             request_guard=guard, response_deadline=response_deadline) as session:
-            # Keep the session's PYTHONPATH: it already names /agent, the source and the
-            # installed requirements (/agent/deps) for every process Codex starts.
+                             request_guard=guard, response_deadline=response_deadline) as session, \
+                contextlib.ExitStack() as relays:
             session.update(
                 TYCHE_ISOLATED_RUN="1", TYCHE_REQUEST_FILE=str(request_file), TYCHE_RUN_STARTED_AT=started_at,
                 TYCHE_WIND_DOWN_SECONDS=str(runner.WIND_DOWN_SECONDS),
-                TYCHE_UNPRICED_CALLS=runner.UNPRICED_CALLS, **research_environment(workers))
+                TYCHE_UNPRICED_CALLS=runner.UNPRICED_CALLS, **research_environment(workers),
+                **({"TYCHE_BONUS_PASS": "enabled"} if BONUS_PASS else {}))
             config = Path(session["CODEX_HOME"]) / "config.toml"
             config.write_text("developer_instructions = " + json.dumps(instructions()) + "\n"
-                              + compaction_limit(config.read_text())
+                              + model_route(compaction_limit(config.read_text()), session, relays)
                               + tool_configuration(run_file, research_deadline, response_deadline))
             yield session
 

@@ -22,12 +22,6 @@ import budget_guard
 
 
 class SandboxedTools:
-    """Relay to one child using the caller's actual Codex sandbox metadata.
-
-    The relay performs no research, file writes or provider dispatch itself. On a Linux host in readonly-shell mode
-    (TYCHE_HOST_SANDBOX), whose session sandbox is read-only with no network, the child runs outside Codex's sandbox.
-    A persistent child retains the existing thread locks and three-call limit.
-    """
     def __init__(self, run_file, readonly=False):
         if Path(run_file).is_symlink():
             raise ValueError("Bound run file must not be a symlink")
@@ -41,13 +35,9 @@ class SandboxedTools:
         self.restarts = 0
 
     def _start(self, state, root):
-        # The same pinned Codex the launcher verified; a different `codex` on PATH is not used.
         command = [os.environ.get("TYCHE_CODEX_BINARY") or "codex", "sandbox", "--sandbox-state-json", json.dumps(state),
                    sys.executable, str(Path(__file__).resolve()), "--worker", "--run-file", str(self.path)]
         if os.environ.get("TYCHE_HOST_SANDBOX") == "readonly-shell" and sys.platform.startswith("linux"):
-            # The host's session sandbox is read-only with no network (codex_tyche.host_sandbox_overrides, Linux only),
-            # so this worker, TYCHE's own code and the only caller of the providers, runs outside it, bound to the same
-            # run. Any other host keeps it inside `codex sandbox`.
             command = command[4:]
         if self.readonly:
             command.append("--read-only")
@@ -104,8 +94,6 @@ class SandboxedTools:
         try:
             response = future.result(timeout=900)
         except (ConnectionError, FutureTimeoutError) as exc:
-            # A lost response never authorizes replay of research or a write.
-            # Only pure saved-state inspection can transparently reconnect.
             try:
                 child.wait(timeout=1)
             except subprocess.TimeoutExpired:
@@ -154,7 +142,6 @@ class SandboxedTools:
         finally:
             error_reader.join(timeout=1)
             with self.lock:
-                # A retiring reader must not fail calls owned by its replacement.
                 for ident, (owner, future) in list(self.pending.items()):
                     if owner is child:
                         future.set_exception(ConnectionError("Sandboxed tool connection closed. " + " ".join(errors)))
@@ -184,8 +171,6 @@ REPEATED_REFUSAL_NOTE = (" This identical call was refused {count} times with th
 def serve(session, incoming=sys.stdin, outgoing=sys.stdout, *, tools=TOOLS):
     lock = threading.Lock()
     futures = {}
-    # How many times each identical call was refused since its tool last succeeded. On 2026-10-24 a DeepSeek worker
-    # resent one refused tyche_finish 43 times, each costing a model turn; a model copies a pattern its history repeats.
     refused = {}
 
     def send(message):
@@ -195,7 +180,6 @@ def serve(session, incoming=sys.stdin, outgoing=sys.stdout, *, tools=TOOLS):
 
     def call(ident, params):
         if getattr(session, "path", None) and budget_guard.stop_requested(session.path):
-            # The supervisor asked this worker to end its turn (a spent budget): nothing more runs or is saved.
             send({"jsonrpc": "2.0", "id": ident,
                   "result": {"content": [{"type": "text", "text": budget_guard.STOP_MESSAGE}], "isError": True}})
             return
@@ -209,24 +193,19 @@ def serve(session, incoming=sys.stdin, outgoing=sys.stdout, *, tools=TOOLS):
                 for key in [key for key in refused if key[0] == params.get("name")]:
                     del refused[key]
         except Exception as exc:
-            # Always answer the MCP request, including unexpected adapter/export
-            # failures. Receipts preserve whether any dispatch occurred.
             text, count = str(exc), 0
             try:
                 key = (params.get("name"), json.dumps(params.get("arguments", {}), sort_keys=True, default=str), text)
                 with lock:
-                    if len(refused) >= 1000:  # Distinct refused calls, kept only to count repeats.
+                    if len(refused) >= 1000:
                         refused.clear()
                     count = refused[key] = refused.get(key, 0) + 1
-            except Exception:  # An argument that cannot be serialized is answered without the count.
+            except Exception:
                 pass
             response = {"content": [{"type": "text", "text": text + (REPEATED_REFUSAL_NOTE.format(count=count)
                                                                    if count >= 3 else "")}], "isError": True}
         send({"jsonrpc": "2.0", "id": ident, "result": response})
 
-    # Concurrent calls use the same state locks and the session's three-call
-    # provider semaphore. Closing stdin lets already dispatched calls preserve
-    # their receipts; queued calls are cancelled, never silently redispatched.
     pool = ThreadPoolExecutor(max_workers=3)
     try:
         for line in incoming:
@@ -248,7 +227,7 @@ def serve(session, incoming=sys.stdin, outgoing=sys.stdout, *, tools=TOOLS):
                 if method == "notifications/cancelled":
                     future = futures.get(params.get("requestId"))
                     if future:
-                        future.cancel()  # Dispatched work retains its receipt.
+                        future.cancel()
                 continue
             if method == "initialize":
                 result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "experimental": {"codex/sandbox-state-meta": {}}},
@@ -282,8 +261,6 @@ def main():
     session = ResearchTools(args.run_file, readonly=args.read_only) if args.worker else SandboxedTools(args.run_file, args.read_only)
     serve(session)
     if args.worker:
-        # A clean exit can still interrupt the relay; retain its cause without
-        # logging requests, credentials, or research data.
         print(f"TYCHE worker input ended; stdin_blocking={os.get_blocking(sys.stdin.fileno())}", file=sys.stderr)
 
 

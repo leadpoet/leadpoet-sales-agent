@@ -1,16 +1,9 @@
-"""Whole-call price bounds from the live catalog description; never a guessed or observed price.
-
-Reservations are estimates, not provider guarantees or bills. Actual returned
-billing settles the existing ledger; a higher charge blocks further spending.
-"""
 
 from decimal import ROUND_CEILING, Decimal
 
 import budget_guard as budget
 
 
-# Deepline publishes exa_search's rate only as text (live catalog, checked 2026-10-19). Only this exact text
-# is priced, so a changed tariff is refused rather than guessed. Options it does not price are refused too.
 EXA_SEARCH_TARIFF = (
     "Per request including 10 returned results: auto/fast/neural 0.098 Deepline credits; deep 0.168 Deepline "
     "credits; instant 0.056 Deepline credits. 0.014 Deepline credits per additional returned result. 0.014 Deepline "
@@ -29,13 +22,12 @@ def _exa_search_tariff(contract):
 
 
 def _exa_search_credits(inputs):
-    """exa_search's whole-call bound from its published tariff, or None for options the tariff does not price."""
     contents = inputs.get("contents", {})
     kind, count = inputs.get("type", "auto"), inputs.get("numResults", 10)
     if (set(inputs) - _EXA_SEARCH_INPUTS or not isinstance(contents, dict) or set(contents) - {"text", "highlights", "summary"}
             or kind not in _EXA_SEARCH_BASE or type(count) is not int or not 1 <= count <= 100):
         return None
-    summaries = count if "summary" in contents else 0  # The schema takes an options object; {} still bills summaries.
+    summaries = count if "summary" in contents else 0
     total = Decimal(_EXA_SEARCH_BASE[kind]) + Decimal("0.014") * (max(0, count - 10) + summaries)
     return total.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
 
@@ -50,12 +42,6 @@ def _may_be_a_number(spec):
 
 
 def chooses_quantity(contract):
-    """True when the caller chooses how many units are billed, through a quantity input that may be a number.
-
-    Only an input that may be a number counts, so a filter that happens to be called `size` does not. An
-    untyped input, a union such as ["integer", "null"], or two declarations that disagree all count, so an
-    unclear catalog entry is refused rather than billed unbounded.
-    """
     schema = contract.get("inputSchema", {})
     declared = [(f["name"], f) for f in schema.get("fields", [])]
     declared += list(((schema.get("jsonSchema") or {}).get("properties") or {}).items())
@@ -63,23 +49,11 @@ def chooses_quantity(contract):
 
 
 def inputs_can_bound(contract):
-    """True when the catalog publishes a rate and the caller chooses how many units are billed.
-
-    Such a call is never billed unbounded under actual cost: the model picks the inputs, so
-    a quantity this module cannot price must not become a way around the cap. Every
-    other call stays billed as before because this module has no rule that can bound it:
-    no catalog rate, or a published rate whose quantity is fixed by the provider or carried
-    by an array input.
-    """
     pricing = contract.get("pricing") or {}
     return chooses_quantity(contract) and (pricing.get("creditsPerUnit") is not None or _exa_search_tariff(contract))
 
 
 def unpriced(contract):
-    """True when Deepline bills this tool from usage after the call and publishes no rate: it has no whole-call price.
-
-    Under unpriced_calls: hold such a call can be admitted at a provisional hold (budget_guard.unpriced_hold).
-    """
     pricing = contract.get("pricing")
     return (isinstance(pricing, dict) and pricing.get("unit") == "usage" and pricing.get("creditsPerUnit") is None
             and not _exa_search_tariff(contract))
@@ -100,10 +74,8 @@ def call_credits(contract, inputs, override=None):
         elif "page_size" in fields:
             quantity = inputs.get("page_size", fields["page_size"].get("default"))
         elif contract.get("toolId", contract.get("id")) == "serper_google_search" and "num" in fields:
-            # This endpoint's catalog defines num as the exact result count.
             quantity = inputs.get("num", fields["num"].get("default"))
     bound = None
-    # A published but unsupported pricing unit is not replaced by a guess.
     if rate is not None and type(quantity) is int and quantity > 0:
         bound = budget.amount(rate, "catalog price") * quantity
     elif _exa_search_tariff(contract):

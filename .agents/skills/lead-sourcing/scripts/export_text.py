@@ -1,4 +1,3 @@
-"""Readable workbook excerpts; saved evidence and receipts remain untouched."""
 
 import json
 import re
@@ -9,15 +8,12 @@ from scrapingdog import _VisibleTextParser
 
 MAX_EXCERPT_CHARACTERS = 2000
 EXCERPT_SUFFIX = "\n[Excerpt; full text in saved receipt.]"
-# Sources uses width 88 and a 409-point Excel row maximum. Match the
-# exporter's conservative wrapping estimate, reserving room for disclosure.
 EXCERPT_LINE_WIDTH = 74
 MAX_EXCERPT_LINES = 24
 MARKDOWN_URL = r"https?://[^\s<>()]+(?:\([^\s<>()]*\)[^\s<>()]*)*"
 
 
 def _readable_markdown(text):
-    # Only presentation syntax: keep literal code and URLs byte-for-byte.
     parts = re.split(r"(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]+`)", text)
     for index in range(0, len(parts), 2):
         part = re.sub(r"(?m)^ {0,3}#{1,6}(?:[ \t]+|(?=\n|$))", "", parts[index])
@@ -32,7 +28,6 @@ def _readable_markdown(text):
 
 
 def readable_text(value):
-    """A cited passage without markup syntax, every word kept: the client columns quote this."""
     text = str(value or "").strip()
     if re.search(r"<(?:!DOCTYPE\b|/?[a-zA-Z][\w:-]*(?:\s[^>]*|\s*/?)>)", text):
         parser = _VisibleTextParser()

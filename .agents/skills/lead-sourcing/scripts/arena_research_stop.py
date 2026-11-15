@@ -1,4 +1,3 @@
-"""One host-authored Arena research closure; never approval or cost settlement."""
 
 from datetime import datetime
 from decimal import Decimal
@@ -15,11 +14,7 @@ FILE = "arena-research-stop.json"
 SCHEMA = "tyche.arena.research_stop.v1"
 POLICY = "request_budget_allowance_final_review_reserve_v4"
 DECISION = "arena_research_limit_reached"
-# Final review costs $0.04-0.16 (2026-10-12) and may use the allowance down to FINAL_REVIEW_MARGIN. With 0.05,
-# round arena-2026-10-14 ended ICPs at $0.80-0.82, over one company's $0.80; 0.1 can miss a second company
-# found after $0.72, while an ICP over its allowance scores nothing.
 RESERVE_COMPANIES = Decimal("0.1")
-# The last admitted model call can settle after the final-review check (up to $0.02 on 2026-10-14).
 FINAL_REVIEW_MARGIN = Decimal("0.04")
 MODEL_RESERVE = 4
 MAX_SNAPSHOT_AGE_SECONDS = 20
@@ -32,7 +27,6 @@ OPTIONS_FILE = "request-options.json"
 
 
 def request_budget(run_file):
-    """The request's bound budget in micro-USD ($0.80 per requested company, tyche_arena.input), or None."""
     try:
         value = json.loads((Path(run_file).parent / OPTIONS_FILE).read_text(encoding="utf-8"))["max_usd"]
     except (OSError, ValueError, KeyError, TypeError):
@@ -42,12 +36,6 @@ def request_budget(run_file):
     return Decimal(str(value)) * 1_000_000
 
 
-# The request's budget drives spend everywhere; Leadpoet's reported limit caps it. Under Leadpoet's legacy rule an ICP
-# scores nothing when spend exceeds $0.80 x judge-qualified companies, and its quota reports a $0.80 per-pair cap: in
-# the official round arena-2026-10-17, 12 of TYCHE's 28 published companies qualified, and on 2026-10-17 a two-company
-# allowance let research spend to $0.78, final review unpublished one company, and the ICP ended at $0.812 with one.
-# Under its flat policy (successful_calls_flat_per_icp_v1) both quota fields report $4, so a five-company request's $4
-# budget applies.
 def allowance(cost, budget):
     leadpoet = min(Decimal(cost["admission_cap_microusd"]), Decimal(cost["per_qualified_pair_cap_microusd"]))
     return leadpoet if budget is None else min(budget, leadpoet)
@@ -114,9 +102,6 @@ def _check(proof, document, ledger, now):
     elif spent >= ceiling or remaining > MODEL_RESERVE:
         raise ValueError("Arena closure model reserve threshold was not reached")
     ids = proof["provider_call_ids"]
-    # Ledger reservations identify admitted/uncertain calls, not proof of a
-    # remote dispatch or charge. Settlement may change their state and amounts.
-    # Unsent plans have no reservation and do not invalidate review.
     if (not isinstance(ids, list) or any(not isinstance(value, str) for value in ids)
             or ids != sorted(ledger["calls"])):
         raise ValueError("Arena closure provider reservations changed; review dispatch accounting")
@@ -124,7 +109,6 @@ def _check(proof, document, ledger, now):
 
 
 def read(document, ledger, *, now=None):
-    """None means no Arena policy; malformed explicit evidence fails closed."""
     if ledger is None:
         return None
     path = Path(ledger["run_file"]).parent / FILE
@@ -147,7 +131,6 @@ def read(document, ledger, *, now=None):
 
 
 def write(run_file, event):
-    """Persist the actual guard event after its research worker has exited."""
     import budget_guard
     run_file = Path(run_file)
     document = budget_guard.read_object(run_file)

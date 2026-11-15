@@ -1,4 +1,3 @@
-"""Read run-bound receipts and verify structured company-fact provenance."""
 
 from pathlib import Path
 import hashlib
@@ -13,9 +12,8 @@ from linkedin_receipts import _domain_key, _entity, identity_page
 
 
 FUNDING_TOOL = "aviato_get_company_funding_rounds"
-INVISIBLE = re.compile("[\u00ad\u200b\u200c\u200d\u2060\ufeff]")  # Soft hyphens and zero-width characters.
+INVISIBLE = re.compile("[\u00ad\u200b\u200c\u200d\u2060\ufeff]")
 TYPOGRAPHY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-"})
-# Fields of a structured record that describe other companies or members, never this company.
 EMBEDDED = frozenset({"similarOrganizations", "affiliatedPages", "employeeCount", "logo", "logos", "photo",
                       "profilePicture", "coverPicture", "backgroundCover", "backgroundCovers"})
 
@@ -25,36 +23,31 @@ def quote_form(text):
 
 
 def record_text(row):
-    """A structured record's quotable text: its own fields, never the profiles of other companies it embeds."""
     return json.dumps({k: v for k, v in row.items() if k not in EMBEDDED}, sort_keys=True, ensure_ascii=False)
 
 
 def content_kind(row, receipt):
-    """Use adapter classification; an agent-recorded web observation is never a captured page."""
     if receipt.get("provider") == "public_web":
         return "unverified"
     if "content_kind" in row:
         return row["content_kind"]
     if (receipt.get("provider") == "scrapingdog" and receipt.get("operation") == "scrape"
             and row.get("signal") == "web_page"):
-        return "captured_page"  # Legacy adapter receipts saved only the scrape body.
+        return "captured_page"
     return "search_excerpt" if row.get("snippet") else "unverified"
 
 
 def source_date(row):
-    """Read dates without guessing locale; undated pages stay observations."""
     date = next((row.get(k) for k in ("evidence_date", "date", "published_date", "publishedDate", "publication_date") if row.get(k)), None)
     if not date and isinstance(row.get("metadata"), dict):
         date = next((row["metadata"].get(k) for k in ("publishedTime", "article:published_time", "datePublished") if row["metadata"].get(k)), None)
     if isinstance(date, str) and "T" in date:
         try:
-            # Python 3.9 only accepts 3/6 fractional digits. Subsecond
-            # precision cannot change the publication's local calendar date.
             timestamp = re.sub(r"(T\d{2}:\d{2}:\d{2}\.)(\d+)(?=Z?$|[+-]\d{2}:\d{2}$)",
                                lambda match: match[1] + match[2].ljust(6, "0")[:6], date)
             date = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).date().isoformat()
         except ValueError:
-            pass  # Validation reports malformed metadata; never invent a date.
+            pass
     if isinstance(date, str) and re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", date):
         candidates = set()
         for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
@@ -63,7 +56,7 @@ def source_date(row):
             except ValueError:
                 pass
         if len(candidates) == 1:
-            date = candidates.pop()  # Ambiguous or invalid dates remain untrusted.
+            date = candidates.pop()
     basis = row.get("evidence_date_basis") or row.get("date_basis") or ("published" if date else "observed_current")
     return date, basis
 
@@ -78,7 +71,6 @@ def request_fingerprint(provider, request):
 
 
 def read_receipt(run_file, route_id):
-    """Read a saved response without dispatching or changing accounting."""
     if not isinstance(route_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", route_id):
         raise ValueError("invalid route ID")
     run_file = Path(run_file).resolve(strict=True)
@@ -98,7 +90,6 @@ def read_receipt(run_file, route_id):
 
 
 def web_passage(run_file, document, evidence, *, require_excerpt=False):
-    """Verify captured web provenance, not whether its meaning satisfies the ICP."""
     source = evidence.get("source", {})
     saved = read_receipt(run_file, source.get("route_id"))["result"]
     normalized = saved
@@ -112,7 +103,7 @@ def web_passage(run_file, document, evidence, *, require_excerpt=False):
         raise ValueError("required web evidence needs a tool-captured page, not an agent-recorded passage. Use tyche_lookup with ScrapingDog scrape or a Deepline page reader, then reuse its ref. Keep this observation for discovery; do not rewrite it.")
     structured = bool(rows) and all(r.get("content_kind") == "structured_record" for r in rows)
     if structured and not require_excerpt:
-        return  # Company/profile/funding qualifications retain their specialized checks.
+        return
     pages = rows if structured else [r for r in rows if content_kind(r, saved) == "captured_page"]
     if not pages:
         raise ValueError("selected source has no captured source body; search excerpts and unverified records cannot qualify. Capture the page with tyche_lookup or keep the requirement unknown")
@@ -140,7 +131,6 @@ def web_passage(run_file, document, evidence, *, require_excerpt=False):
 
 
 def funding_record(run_file, document, company, evidence):
-    """Verify one captured funding row; the LLM still judges the requested stage."""
     if run_file is None:
         raise ValueError("structured funding evidence requires the saved run and receipts")
     source = evidence.get("source", {})

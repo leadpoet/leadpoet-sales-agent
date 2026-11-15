@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Validate a TYCHE company-sourcing run: reviewed company rows, evidence, accounting and stopping."""
 
 from __future__ import annotations
 
@@ -29,20 +28,18 @@ from run_coordination import company_key, host_key
 ACTIONABLE_FRONTIER_STATES = {"untried", "continuable"}
 FINAL_FRONTIER_STATES = {"exhausted", "blocked"}
 PAID_PROVIDERS = {"deepline", "scrapingdog"}
-# 2.1: every qualification check names its requested criterion by a stable criterion_id. Results written
-# by an earlier revision, including contact-flow runs (1.x), are kept as saved but not read by this code.
+# Arena bonus pass (tyche_arena/host.py ArenaHost.bonus_pass): after the company target is met, a lookup with this
+# approach prefix for an accepted company may still run (bonus_pass_refusal); evaluate_stop itself is unchanged.
+BONUS_PASS_APPROACH = "bonus pass"
+BONUS_PASS_LOOKUPS = 2
 RESULT_SCHEMA_VERSION = "2.1"
 CONTACT_HANDOFF = ("Buyer roles, contacts per company, email, phone and person location belong to the "
                    "contact stage (DEMOS); the caller keeps them for the end-to-end target.")
-# Contact-stage inputs a request may carry by mistake; named so the refusal says where they belong.
 CONTACT_FIELDS = {"requested_roles", "contact_role_groups", "contact_fields", "contacts_per_company",
                   "min_contacts_per_company", "target_contacts_per_company"}
-# The saved company record ($defs.company in the output contract); a held or rejected candidate may also keep its
-# discovered name as "company". Anything else, such as people or contact data, is refused.
 COMPANY_FIELDS = {"canonical_name", "domain", "website", "linkedin_url", "linkedin_url_evidence", "industry",
                   "sub_industry", "classification_note", "description", "hq_state", "hq_country", "employee_range",
                   "employee_range_evidence", "owner_group", "aliases", "discovery_source"}
-# The other closed objects of a saved company row, as documented in the output contract.
 LINKEDIN_EVIDENCE_FIELDS = {"evidence_url", "evidence_date", "evidence_date_basis", "evidence_text", "source"}
 ACCOUNT_FIT_FIELDS = LINKEDIN_EVIDENCE_FIELDS | {"fit_claim", "event_date"}
 DISCOVERY_SOURCE_FIELDS = {"source", "url"}
@@ -50,7 +47,7 @@ TEXT_COMPANY_FIELDS = (COMPANY_FIELDS - {"aliases", "employee_range_evidence", "
                        | {"company"})
 SIGNAL_EVIDENCE_FIELDS = LINKEDIN_EVIDENCE_FIELDS | {"criterion_id", "criterion", "signal", "event_date"}
 CHECK_FIELDS = {"criterion_id", "criterion", "importance", "signal", "status", "claim", "evidence", "support",
-                "support_reason"}  # support and support_reason: a likely trait signal (criterion_errors).
+                "support_reason"}
 EVIDENCE_FIELDS = {"url", "date", "date_basis", "text", "event_date", "source"}
 SOURCE_FIELDS = {"provider", "operation", "tool", "route_id", "result_index"}
 DETERMINATE_PROVIDER_STATUSES = {"ok", "partial", "no_results"}
@@ -76,7 +73,6 @@ NEXT_LEAD_REVIEW_CREDITS = Decimal("5")
 
 
 def sourcing_target_met(document: dict) -> bool:
-    """The target counts unique reviewed qualified companies."""
     return len(document.get("accepted", [])) >= document["request"]["target_count"]
 
 
@@ -104,19 +100,16 @@ def _exclusion_identities(request, row):
 
 
 def excluded_company(request: dict, row: dict) -> bool:
-    """Match known company/owner aliases; discovering ownership still needs evidence."""
     names, exclusions = _exclusion_identities(request, row)
-    # A listed domain, URL or section host excludes the company it keys (de.example.com excludes example.com).
     keys = {company_domain(e) for e in exclusions if isinstance(e, str) and "." in e and " " not in e.strip()}
     return bool({_identity(n) for n in names} & ({_identity(n) for n in exclusions} - {""})) or _company_key(row) in keys
 
 
 def exclusion_identity_errors(request, row, path):
-    """Hold plausible name extensions for review; never fuzzy-reject a company."""
     names, exclusions = _exclusion_identities(request, row)
     def words(value):
         if not isinstance(value, str) or "://" in value or re.fullmatch(r"[\w.-]+\.[a-zA-Z]{2,}", value):
-            return []  # Domains still match exactly through excluded_company.
+            return []
         parts = re.findall(r"[^\W_]+", unicodedata.normalize("NFKD", value).casefold())
         while parts and parts[-1] in {"ltd", "limited", "llp", "plc", "inc", "incorporated", "llc", "corp", "corporation"}:
             parts.pop()
@@ -142,7 +135,6 @@ def exclusion_identity_errors(request, row, path):
 
 
 def signal_window_start(as_of, signal, window):
-    """Resolve the requested unit against the saved date, including month ends."""
     policy = signal if any(k in signal for k in ("max_age_days", "max_age_months")) else window
     if "max_age_days" in policy:
         return as_of - timedelta(days=policy["max_age_days"])
@@ -154,7 +146,6 @@ def signal_window_start(as_of, signal, window):
 
 
 def signal_request_errors(request: dict) -> list[str]:
-    """Reject malformed saved policy before using it for coverage or arithmetic."""
     if not isinstance(request, dict):
         return ["request must be an object"]
     if request.get("signal_match_mode", "any") not in ("any", "all"):
@@ -181,12 +172,11 @@ def signal_request_errors(request: dict) -> list[str]:
         if key in seen:
             errors.append(f"{path}.kind duplicates another requested signal")
         seen.add(key)
-        if signal.get("importance", "required") not in ("required", "preferred"):  # Omitted means required.
+        if signal.get("importance", "required") not in ("required", "preferred"):
             errors.append(f"{path}.importance must be required or preferred")
         age_errors(signal, path)
         minimum = signal.get("min_age_days", 0)
         maximum = signal.get("max_age_days", window.get("max_age_days") if "max_age_months" not in signal else None)
-        # Absence preserves an unspecified window; explicit malformed bounds fail.
         if (type(minimum) is not int or minimum < 0 or
                 maximum is None and "max_age_days" in signal or
                 maximum is not None and (type(maximum) is not int or maximum <= 0 or minimum > maximum)):
@@ -195,11 +185,6 @@ def signal_request_errors(request: dict) -> list[str]:
 
 
 def criteria(request: dict) -> list[dict]:
-    """Every requested criterion with its stable id: a field or position in the immutable saved request.
-
-    Filters and required attributes must each pass for acceptance; signals follow signal_match_mode; an
-    exclusion criterion is checked only when a candidate's name resembles that excluded company.
-    """
     problems = signal_request_errors(request)
     icp = request.get("icp", {}) if isinstance(request, dict) else None
     attributes = icp.get("required_attributes", []) if isinstance(icp, dict) else None
@@ -222,7 +207,6 @@ def criteria(request: dict) -> list[dict]:
              if isinstance(band, dict) and band else []) +
             [{"id": f"signal:{index}", "kind": "signal", "label": signal["kind"], "importance": signal.get("importance", "required"),
               **{k: signal[k] for k in ("query", "min_age_days", "max_age_days", "max_age_months") if k in signal},
-              # A time-bound event still needs a confirming, dated source: a signal with an age window is never a trait.
               **({"trait": True} if _identity(signal["kind"]) in traits and not AGE_WINDOW & signal.keys() else {})}
              for index, signal in enumerate(request.get("buying_signals", []))] +
             [{"id": f"exclusion:{index}", "kind": "exclusion", "label": "Distinct from excluded company: " + name,
@@ -241,26 +225,18 @@ def _size_check(check: Any) -> bool:
 
 
 def _cited_company_records(check: dict) -> list[Optional[str]]:
-    """Route ids of LinkedIn company records cited by a check's evidence."""
     return [e["source"].get("route_id") for e in check.get("evidence", [])
             if isinstance(e, dict) and isinstance(e.get("source"), dict)
             and _identity(e["source"].get("tool")).endswith("getcompany")]
 
 
 def _linkedin_evidence(item: dict) -> bool:
-    """Evidence from a LinkedIn company page or the LinkedIn company record."""
     source = item.get("source") if isinstance(item.get("source"), dict) else {}
     host = host_key(urlsplit(str(item.get("url") or item.get("evidence_url") or "")).hostname or "")
     return host == "linkedin.com" or host.endswith(".linkedin.com") or _identity(source.get("tool")).endswith("getcompany")
 
 
 def company_size_scope_errors(row: dict, band: dict, bounds, path: str) -> list[str]:
-    """A saved LinkedIn range never decides size by itself.
-
-    Whose workforce a figure counts is the reviewer's judgment. Code checks that
-    a size check citing a LinkedIn company record cites this company's selected
-    record (whose range is saved and receipt-verified) and agrees with that range.
-    """
     lower, upper = band.get("min_employees", 0), band.get("max_employees")
     if type(lower) is not int or not (upper is None or type(upper) is int):
         return []
@@ -274,7 +250,6 @@ def company_size_scope_errors(row: dict, band: dict, bounds, path: str) -> list[
             continue
         items = [e for e in check.get("evidence", []) if isinstance(e, dict)]
         if check["status"] == "fail" and items and all(_linkedin_evidence(e) for e in items):
-            # A brand page's band often counts a whole network; unknown is not a rejection.
             errors.append(f"{path}: LinkedIn evidence alone (a page, posts or the company record) never fails company "
                           "size; keep size unknown or cite the correct entity's own current figure from another source")
             continue
@@ -298,8 +273,6 @@ def company_size_scope_errors(row: dict, band: dict, bounds, path: str) -> list[
 
 
 def saved_field_errors(row: dict, path: str, company_fields: set) -> list[str]:
-    """Each object in a saved company row keeps only its documented fields, so people, contact data or a
-    narrative cannot ride along into leads.json and the later stages."""
     name = "company" if "company" in row else "candidate"
     company = row.get(name) if isinstance(row.get(name), dict) else {}
     shapes = [(company, company_fields, name),
@@ -329,7 +302,6 @@ def saved_field_errors(row: dict, path: str, company_fields: set) -> list[str]:
         if extra := sorted(set(value) - fields):
             errors.append(f"{path}.{where}: {', '.join(extra)} is not a {'company' if where == name else 'saved'} "
                           f"field; keep only {', '.join(sorted(fields))}. {CONTACT_HANDOFF}")
-        # A missing value may be null; an object, list or number could hide a person.
         if index and fields is not CHECK_FIELDS and (untyped := sorted(key for key, item in value.items() if not (
                 item is None or isinstance(item, str) or key == "result_index" and type(item) is int
                 or key == "source" and isinstance(item, dict)))):
@@ -339,7 +311,6 @@ def saved_field_errors(row: dict, path: str, company_fields: set) -> list[str]:
 
 
 def discovery_source_error(company: Any, document: dict, path: str, run_file=None) -> Optional[str]:
-    """A saved discovery_source names an account-discovery result this run saved, and its URL comes from it."""
     value = company.get("discovery_source") if isinstance(company, dict) else None
     if value is None:
         return None
@@ -362,7 +333,6 @@ def discovery_source_error(company: Any, document: dict, path: str, run_file=Non
 
 
 def company_record_error(run_file, document: dict, company: Any, item: Any) -> Optional[str]:
-    """A cited LinkedIn company record must be this company's own receipt-verified record."""
     source = item.get("source") if isinstance(item, dict) else None
     if run_file is None or not isinstance(source, dict) or not _identity(source.get("tool")).endswith("getcompany"):
         return None
@@ -382,7 +352,6 @@ def company_record_error(run_file, document: dict, company: Any, item: Any) -> O
 
 
 def required_attribute_errors(request: dict, row: dict, path: str) -> list[str]:
-    """Require reviewed evidence for every filter, company size and required attribute, without interpreting it."""
     errors = []
     for criterion in criteria(request):
         if criterion["kind"] in {"signal", "exclusion"}:
@@ -396,7 +365,6 @@ def required_attribute_errors(request: dict, row: dict, path: str) -> list[str]:
 
 
 def requested_signal(request: dict, label: str) -> dict:
-    """Resolve a saved kind, never a guessed synonym or a broader date window."""
     if errors := signal_request_errors(request):
         raise ValueError("; ".join(errors))
     signals = request.get("buying_signals", [])
@@ -418,7 +386,6 @@ def signal_checks(row: dict) -> list[dict]:
 
 
 def signal_coverage_errors(request: dict, row: dict, path: str) -> list[str]:
-    """Check saved requirement coverage, not whether source prose proves a claim."""
     if errors := signal_request_errors(request):
         return errors
     signals = request.get("buying_signals", [])
@@ -447,7 +414,6 @@ def signal_coverage_errors(request: dict, row: dict, path: str) -> list[str]:
 
 
 def event_date_bounds(value):
-    """Preserve source precision; a month/year is an interval, never a guessed day."""
     if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}(?:-[0-9]{2}){0,2}", value):
         raise ValueError("event_date requires YYYY, YYYY-MM or YYYY-MM-DD")
     parts = [int(part) for part in value.split("-")]
@@ -459,7 +425,6 @@ def event_date_bounds(value):
 
 
 def company_website(company):
-    """Normalize a known LinkedIn wrapper locally; never follow or guess a domain."""
     if not isinstance(company, dict):
         raise ValueError("company must be an object")
     def parse(value):
@@ -486,7 +451,6 @@ def company_website(company):
 
 
 def signal_age_errors(request: dict, row: dict, path: str) -> list[str]:
-    """Check date arithmetic for reviewed signals; interpreting the event stays with the LLM."""
     if errors := signal_request_errors(request):
         return errors
     window = request.get("time_window", {})
@@ -494,7 +458,7 @@ def signal_age_errors(request: dict, row: dict, path: str) -> list[str]:
     try:
         as_of = datetime.strptime(window.get("as_of_date", request.get("as_of_date", "")), "%Y-%m-%d")
     except (ValueError, TypeError):
-        return []  # The request contract handles an absent/malformed clock.
+        return []
     evidence = [(row.get("signal_evidence", {}), path + ".signal_evidence")]
     for check_index, check in enumerate(row.get("qualification_checks", [])):
         if isinstance(check, dict) and check.get("signal") and check.get("status") == "pass":
@@ -543,7 +507,6 @@ def signal_age_errors(request: dict, row: dict, path: str) -> list[str]:
 
 
 def _folded(value: Any) -> str:
-    """Text compared as a reader would: compatibility forms, case, curly quotes, dashes and spacing folded."""
     text = unicodedata.normalize("NFKC", value if isinstance(value, str) else "").casefold()
     text = text.translate(str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
                                          "\u2013": "-", "\u2014": "-"}))
@@ -551,9 +514,6 @@ def _folded(value: Any) -> str:
 
 
 def single_passage_attribute(request: dict, criterion: dict) -> bool:
-    """Whether the host publishes this required attribute as one quote (request-options.json single_source_attributes,
-    the attribute texts it names; Leadpoet's required_attribute), so a passing check on it cites only that passage.
-    A stage line or other attribute it publishes differently keeps the ordinary rules."""
     named = request.get("single_source_attributes")
     label = _folded(criterion.get("label"))
     if not isinstance(named, list) or not label or criterion.get("kind") != "attribute" or criterion.get("importance") != "required":
@@ -561,15 +521,12 @@ def single_passage_attribute(request: dict, criterion: dict) -> bool:
     return any(text and (text in label or label in text) for text in map(_folded, named))
 
 
-# A relative date on a page ("Posted 2 Days Ago") changes before a scorer re-reads the quote: on 2026-10-10 the only
-# published attribute quote that failed a judge-rule review no longer occurred on its page for that reason.
 RELATIVE_DATE = re.compile(r"\b(?:\d+\+?|an?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
                            r"(?:second|minute|hour|day|week)s?\s+ago\b"
                            r"|\b(?:posted|updated|added)\s+(?:today|yesterday)\b", re.IGNORECASE)
 
 
 def criterion_errors(request: dict, row: dict, path: str) -> list[str]:
-    """Each check names one requested criterion; code-owned fields must match it."""
     known = {c["id"]: c for c in criteria(request)}
     errors, seen = [], set()
     for index, check in enumerate(row.get("qualification_checks", [])):
@@ -633,7 +590,7 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
                 errors.append(f"{path}.qualification_checks must be an array")
                 continue
             if row.get("stage") == "route":
-                continue  # A provider outcome, not a company.
+                continue
             if state != "accepted" and row.get("stage") != "account":
                 errors.append(f"{path}: a held or rejected company has stage account; {CONTACT_HANDOFF}")
             errors.extend(criterion_errors(request, row, path))
@@ -655,10 +612,9 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
             if employee_range is not None and bounds is None:
                 errors.append(f"{path}: employee_range must be a LinkedIn range")
             elif band:
-                # Size is a reviewed check; a captured passage can decide it without a LinkedIn range.
                 errors.extend(company_size_scope_errors(row, band, bounds, path))
             required = [c for c in checks if isinstance(c, dict) and c.get("importance") == "required"]
-            ordinary = [c for c in required if not c.get("signal")]  # Includes a present exclusion check.
+            ordinary = [c for c in required if not c.get("signal")]
             failed = [c for c in required if not c.get("signal") and c.get("status") == "fail" and c.get("evidence")]
             if state == "accepted":
                 errors.extend(required_attribute_errors(request, row, path))
@@ -682,9 +638,6 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
                              and by_kind[_identity(s["kind"])].get("evidence")]
                 if negatives and (request.get("signal_match_mode", "any") == "all" or len(negatives) == len(requested)):
                     failed = [by_kind[_identity(s["kind"])] for s in negatives]
-                # A run that exports signal candidates offers a company that fits everything else downstream when its
-                # required signals are not found, an event dated outside the window included; rejecting it would drop it.
-                # An excluded company is never a candidate, so its rejection stands.
                 fit_ids = [c["id"] for c in criteria(request) if c["kind"] in ("filter", "size", "attribute")]
                 if failed and request.get("signal_candidates_max") and fit_ids and not excluded_company(request, row) and all(
                         {c.get("status") for c in checks if isinstance(c, dict) and c.get("criterion_id") == cid} == {"pass"}
@@ -694,7 +647,7 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
                                   "signal candidate. Reject it only for another evidenced mismatch: save that filter, size, "
                                   "attribute or exclusion check as failed with its evidence")
             if state == "rejected":
-                for check in failed:  # A rejection's evidence is quote-checked like an acceptance's.
+                for check in failed:
                     for item in (check.get("evidence") if isinstance(check.get("evidence"), list) else []):
                         if error := qualification_evidence_error(item, path + ".qualification_checks." + str(check.get("criterion_id")),
                                                                  document, company, check, run_file, quote_failure=True):
@@ -711,7 +664,6 @@ def qualification_errors(document: dict, *, run_file=None) -> list[str]:
 
 
 def progress_snapshot(document: dict) -> list[str]:
-    """Stable verified milestones, not returned rows or model-written progress totals."""
     facts = set()
     for state in ("accepted", "unresolved", "rejected"):
         for row in document.get(state, []):
@@ -734,7 +686,6 @@ def _research_key(value: dict) -> Optional[tuple]:
 
 
 def stalled_approaches(document: dict, action: Optional[dict] = None) -> set[str]:
-    """Compare research in the same scope/phase, not independent verification work."""
     groups = {}
     for route in [r for r in document.get("routes", []) if isinstance(r, dict)
                 and r.get("entity_type") != "tool_catalog" and isinstance(r.get("approach"), str)
@@ -765,13 +716,11 @@ def _route_scope(route: dict) -> Optional[str]:
 
 
 def _approach_key(value: str) -> str:
-    """A new version label does not make a new research strategy."""
     value = re.sub(r"(^|[-_\s])v\d+(?=$|[-_\s])", r"\1", value.casefold())
     return re.sub(r"[-_\s]+", "-", value).strip("-")
 
 
 def _reviewed_company_scopes(document: dict) -> set[str]:
-    """Park reviewed gaps using existing receipts and frontier, without a new state."""
     frontier = document.get("stop_audit", {}).get("route_frontier", [])
     completed = {r.get("route_id") for r in frontier if isinstance(r, dict)
                  and _nonempty_text(r.get("route_id")) and r.get("state") == "exhausted"
@@ -798,8 +747,6 @@ def _reviewed_company_scopes(document: dict) -> set[str]:
 
 
 def _company_scopes(document: dict, scope: Any) -> set:
-    """scope and the earlier claim keys its company row lists (former_scopes): a worker's claim that moved to the
-    website the company's own LinkedIn record names keeps the lookups saved under those keys."""
     keys = {scope}
     for state in ("accepted", "unresolved", "rejected"):
         for row in document.get(state, []):
@@ -828,8 +775,6 @@ def _blocker_error(action: dict, document: dict) -> Optional[str]:
         for route in frontier:
             if route.get("route_id") in descendants:
                 descendants.update(route.get("continuation_route_ids", []))
-    # Pre-dispatch failures can exist only as route outcomes. Their position in
-    # the append-only frontier still establishes whether a recovery came later.
     positions = {r.get("route_id"): i for i, r in enumerate(frontier)}
     outcome_only = not any(r.get("route_id") == evidence["route_id"] for r in document.get("routes", []))
     evidence_position = positions.get(evidence["route_id"])
@@ -849,7 +794,6 @@ def _blocker_error(action: dict, document: dict) -> Optional[str]:
 
 
 def _missing_catalog_review(document: dict, scopes: set[str]) -> list[str]:
-    """Reuse this run's capability review; ordinary research does not expire it."""
     routes = [r for r in document.get("routes", []) if isinstance(r, dict)]
     refs = document.get("stop_check", {}).get("catalog_review_route_ids", [])
     if not isinstance(refs, list):
@@ -859,13 +803,10 @@ def _missing_catalog_review(document: dict, scopes: set[str]) -> list[str]:
                 and r.get("provider") == "deepline" and r.get("entity_type") == "tool_catalog"
                 and r.get("operation") == "search"
                 and r.get("provider_status") in {"ok", "no_results"} | BLOCKING_PROVIDER_STATUSES}
-    # Capabilities are run-wide; do not repeat an identical catalog query for
-    # every company. Recovery actions and blocker evidence remain scope-specific.
     return [] if "discovery" in reviewed else sorted(scopes - reviewed)
 
 
 def company_domain(value: str) -> str:
-    """The saved company key: the claim key (run_coordination.company_key); a name, or a name: key, stays itself."""
     try:
         return company_key(value)
     except ValueError:
@@ -907,7 +848,6 @@ def _account_outcomes(document: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def calculate_review_counts(document: dict[str, Any]) -> dict[str, int]:
-    """Derive review counts from outcomes, without inferring qualification."""
     accepted = document.get("accepted", [])
     account_rows = _account_outcomes(document)
     accepted_keys = {key for key in map(_company_key, accepted) if key is not None}
@@ -947,7 +887,6 @@ def _decimal(value: Any) -> Optional[Decimal]:
 
 
 def _json_decimal(value: Decimal, quantum: Optional[Decimal] = None) -> int | float:
-    """Return a stable JSON number, with optional deterministic rounding."""
 
     if quantum is not None:
         value = value.quantize(quantum, rounding=ROUND_HALF_UP)
@@ -957,7 +896,6 @@ def _json_decimal(value: Decimal, quantum: Optional[Decimal] = None) -> int | fl
 
 
 def calculate_cost_summary(document: dict[str, Any]) -> dict[str, Any]:
-    """Calculate provider cost bounds from route receipts; a route without a known cost stays unknown."""
 
     if document.get("budget", {}).get("policy") == "actual_cost":
         providers = {}
@@ -1086,7 +1024,6 @@ def calculate_cost_summary(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_cost_accounting(document: dict[str, Any], errors: list[str]) -> None:
-    """Every route carries its cost fields, and cost_summary is derived from them."""
 
     summary = document.get("summary", {})
     counted = summary.get("accepted_companies") if isinstance(summary, dict) else None
@@ -1189,7 +1126,6 @@ def _validate_cost_accounting(document: dict[str, Any], errors: list[str]) -> No
 
 
 def _validate_budget_accounting(document: dict[str, Any], errors: list[str]) -> None:
-    """Validate exact route accounting when the output budget is present."""
 
     budget = document.get("budget")
     if budget is None:
@@ -1277,7 +1213,6 @@ def _validate_budget_accounting(document: dict[str, Any], errors: list[str]) -> 
     for provider in sorted(PAID_PROVIDERS):
         limit = _decimal(limits.get(f"{provider}_credits"))
         actual = _decimal(spent.get(f"{provider}_credits"))
-        # An unknown total cannot erase charges that are already confirmed.
         if budget.get("policy") != "actual_cost" and limit is not None and max(known_costs[provider], actual or Decimal("0")) > limit:
             errors.append(
                 f"budget.spent.{provider}_credits exceeds limit {limit}"
@@ -1285,16 +1220,9 @@ def _validate_budget_accounting(document: dict[str, Any], errors: list[str]) -> 
 
 
 def _validate_next_lead_budget(document: dict[str, Any], errors: list[str]) -> None:
-    """Enforce the optional Deepline allowance for finding the next lead.
-
-    The allowance is grouped by the number of accepted leads before a call.
-    This makes route changes and rejected candidates part of the same budget
-    window. This is an explicitly requested hard limit, never a default.
-    The default strategy-review warning is reported separately in progress.
-    """
 
     if document.get("budget", {}).get("policy") == "actual_cost":
-        return  # Dispatch checks observed spend; the last call may cross the threshold.
+        return
 
     request = document.get("request")
     request_budget = request.get("budget") if isinstance(request, dict) else None
@@ -1358,8 +1286,6 @@ def _validate_next_lead_budget(document: dict[str, Any], errors: list[str]) -> N
             continue
         grouped_costs[accepted_before] = grouped_costs.get(accepted_before, Decimal("0")) + charge
 
-        # Check each dispatch against all spend recorded so far at its count
-        # or higher. Later demotions do not invalidate previously legal calls.
         total = sum(cost for group, cost in grouped_costs.items() if group >= accepted_before)
         if total > limit:
             errors.append(
@@ -1369,7 +1295,6 @@ def _validate_next_lead_budget(document: dict[str, Any], errors: list[str]) -> N
 
 
 def calculate_progress(document: dict[str, Any]) -> dict[str, Any]:
-    """Derive a read-only work summary; warnings do not change completion rules."""
     accepted = document.get("accepted", [])
     accepted = accepted if isinstance(accepted, list) else []
     accepted_keys = {_company_key(row) for row in accepted} - {None}
@@ -1454,7 +1379,6 @@ def validate_continuations(frontier: dict[str, dict[str, Any]], errors: list[str
                 errors.append(f"route {route_id} references missing continuation {ref}")
             elif item.get("state") == "exhausted" and frontier[ref].get("state") not in FINAL_FRONTIER_STATES:
                 errors.append(f"exhausted route {route_id} has actionable continuation {ref}")
-    # Iterative traversal also catches mutually exhausted routes supporting each other.
     finished: set[str] = set()
     for start in graph:
         active: set[str] = set()
@@ -1510,13 +1434,11 @@ def _validate_client_output(accepted: list, errors: list[str]) -> None:
 
 
 def _validate_company_record(evidence: Any, linkedin: Any, path: str, routes: dict, errors: list[str]) -> None:
-    """A saved LinkedIn company fact must come from this run's successful HarvestAPI company getter."""
     evidence = evidence if isinstance(evidence, dict) else {}
     url = evidence.get("evidence_url")
     if not _linkedin_url(url, "company"):
         errors.append(f"{path}.evidence_url requires the LinkedIn /company/ source")
     elif _nonempty_text(linkedin):
-        # The saved link is what gets exported: it must be this evidence's LinkedIn company page, not another page.
         slug = lambda value: re.search(r"/company/([^/?#]+)", value, re.IGNORECASE)[1].casefold()
         if not _linkedin_url(linkedin, "company") or slug(url) != slug(linkedin):
             errors.append(f"{path}.evidence_url and the saved LinkedIn link must be the same LinkedIn /company/ URL")
@@ -1545,7 +1467,6 @@ def _validate_company_record(evidence: Any, linkedin: Any, path: str, routes: di
 
 
 def linkedin_field_errors(document: dict) -> list[str]:
-    """LinkedIn company facts are optional enrichment; when saved they must come from the company's receipt."""
     errors = []
     routes: dict[str, list[dict]] = {}
     for route in document.get("routes", []):
@@ -1570,9 +1491,9 @@ def linkedin_field_errors(document: dict) -> list[str]:
 
 
 EVIDENCE_TEXT_LIMIT = 1000
-LIKELY_REASON_LIMIT = 200  # ARETE's 'Likely' contract: support_reason is one line of at most 200 characters.
+LIKELY_REASON_LIMIT = 200
 AGE_WINDOW = {"min_age_days", "max_age_days", "max_age_months"}
-RECORD_TEXT_LIMIT = 2000  # A structured record's own text, such as a LinkedIn description (at most 2,000 characters).
+RECORD_TEXT_LIMIT = 2000
 
 
 def source_evidence_error(item, path, *, receipt_verified=False):
@@ -1615,9 +1536,6 @@ def source_evidence_error(item, path, *, receipt_verified=False):
 
 
 def candidate_fit_errors(document, row, path, run_file=None):
-    """The acceptance checks without the signal ones, for a held row exported for signal research: required
-    attributes, every required non-signal check passed with quote-checked evidence, no excluded or
-    resembling-excluded company, and everything a lead row carries, checked as a lead is."""
     request = document["request"]
     required = [c for c in row.get("qualification_checks", []) if isinstance(c, dict)
                 and c.get("importance") == "required" and not c.get("signal")]
@@ -1629,13 +1547,9 @@ def candidate_fit_errors(document, row, path, run_file=None):
     if any(c.get("status") != "pass" or not c.get("evidence") for c in required):
         errors.append(f"{path}: every required non-signal check must pass with evidence")
     if errors:
-        return errors  # No receipt reads for a row that already fails.
-    # A held row saves only the company fields known so far, so a thin one cannot be read as a lead. The lead checks
-    # require its identity, industry, description and account_fit, and quote-check that and every check's evidence.
+        return errors
     lead = {key: value for key, value in row.items() if key in ACCEPTED_FIELDS - {"signal_evidence"}}
     errors = accepted_errors(dict(document, accepted=[lead]), run_file=run_file, fill_missing=False)
-    # A failed required signal is exported with its status and event dates, so its passage is quote-checked as a
-    # rejection's is.
     for check in row.get("qualification_checks", []):
         if (run_file is not None and isinstance(check, dict) and check.get("signal")
                 and check.get("importance") == "required" and check.get("status") == "fail"):
@@ -1653,7 +1567,6 @@ def qualification_evidence_error(item, path, document, company, check, run_file,
     if run_file is not None and (check.get("status") == "pass" or check.get("support") == "likely"
                                  or quote_failure and check.get("status") == "fail"):
         try:
-            # Structured records are quoted too: the excerpt must occur in the record's field values.
             web_passage(run_file, document, item, require_excerpt=True)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             return f"{path}.evidence ({item.get('source', {}).get('route_id')}): {exc}"
@@ -1671,7 +1584,6 @@ def qualification_evidence_error(item, path, document, company, check, run_file,
 
 
 def supporting_finding_errors(findings, path, *, document=None, run_file=None):
-    """Optional client facts need real evidence, but never alter ICP eligibility."""
     if not isinstance(findings, list):
         return [f"{path} must be an array"]
     errors = []
@@ -1704,7 +1616,6 @@ def supporting_finding_errors(findings, path, *, document=None, run_file=None):
 
 
 def source_evidence_errors(document, *, run_file=None):
-    """The evidence shape consumed by the workbook, the handoff and source review."""
     errors = []
     if document.get("accepted"):
         try:
@@ -1719,8 +1630,6 @@ def source_evidence_errors(document, *, run_file=None):
             continue
         company = row.get("company") if isinstance(row.get("company"), dict) else {}
         signal = row.get("signal_evidence")
-        # Code derives signal_evidence from the passing required signal check. When that coverage is the gap,
-        # qualification_errors reports it, so it is the one message.
         required_signal = signal or not (signals_optional(request)
                                          or signal_coverage_errors(request, row, f"accepted[{index}]"))
         if required_signal and (not isinstance(signal, dict) or not _nonempty_text(signal.get("signal"))):
@@ -1747,8 +1656,6 @@ def source_evidence_errors(document, *, run_file=None):
             if error := source_evidence_error(item, f"accepted[{index}].{path}"):
                 errors.append(error)
             elif path == "account_fit" and run_file is not None:
-                # A company is qualified on its fit passage: it must quote the captured page or the receipt-verified
-                # record it cites, and a cited LinkedIn record must be this company's own.
                 try:
                     web_passage(run_file, document, item, require_excerpt=True)
                 except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -1760,7 +1667,6 @@ def source_evidence_errors(document, *, run_file=None):
 
 
 def company_identity_errors(accepted: list) -> list[str]:
-    """Every accepted row needs a canonical domain, a website on it, and no duplicate domain."""
     errors, domains = [], []
     for index, row in enumerate(accepted):
         if not isinstance(row, dict):
@@ -1772,7 +1678,7 @@ def company_identity_errors(accepted: list) -> list[str]:
         else:
             domains.append(company_domain(domain))
             try:
-                company_key(domain)  # Its own website domain: not a name, person profile or platform page.
+                company_key(domain)
             except ValueError as exc:
                 errors.append(f"accepted[{index}].company.domain: {exc}")
         try:
@@ -1789,7 +1695,6 @@ ACCEPTED_FIELDS = {"company", "account_fit", "qualification_checks", "signal_evi
 
 
 def accepted_errors(document: dict, *, run_file=None, fill_missing=False) -> list[str]:
-    """The accepted-company contract shared by review saves, confirmed companies and final delivery."""
     errors = linkedin_receipt_errors(document, run_file, fill_missing=fill_missing) if run_file is not None else []
     errors.extend(company_links.evidence_errors(document, run_file) if run_file is not None else [])
     errors.extend(linkedin_field_errors(document))
@@ -1822,7 +1727,6 @@ DELIVERY_STOPS = {"target_met", "budget_exhausted", "time_limit_reached", arena_
 
 
 def run_deadline(document: dict) -> Optional[datetime]:
-    """Preserve the original clock plus explicit, audited operator extensions."""
     duration = document.get("request", {}).get("max_duration_seconds")
     if duration is None:
         return None
@@ -1857,12 +1761,6 @@ def run_deadline(document: dict) -> Optional[datetime]:
 
 
 def research_closes(document: dict) -> Optional[datetime]:
-    """When research stops opening. The hard deadline itself never moves.
-
-    A run may save stop_check.closing_seconds at start. Research then closes that
-    long before run_deadline, so an open turn can end and report its own usage
-    before the hard stop. Runs without the field close at their deadline.
-    """
     deadline = run_deadline(document)
     seconds = document.get("stop_check", {}).get("closing_seconds", 0)
     if type(seconds) is not int or seconds < 0:
@@ -1872,7 +1770,6 @@ def research_closes(document: dict) -> Optional[datetime]:
 
 
 def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_budget=None) -> dict[str, Any]:
-    """Check next actions independently of self-declared exhausted route labels."""
     errors: list[str] = []
     result: dict[str, Any] = {"decision": "repair_state", "eligible_actions": [], "errors": errors}
     if not isinstance(document, dict):
@@ -2030,9 +1927,7 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
             continue
         if actual_cost:
             from budget_guard import BudgetError, check_allowance, refuses_unpriced
-            # ScrapingDog is bounded by its documented tariff, which only the locked dispatch knows.
             if bound is None and refuses_unpriced(execution_budget) and provider != "scrapingdog":
-                # Needs a price, as under the reserved policy. It is not a spent budget.
                 needs_pricing = True
                 result.setdefault("blocked_actions", {})[aid] = "A verified whole-call price bound is required."
                 continue
@@ -2092,14 +1987,10 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
                 not route.get("approach") or route["approach"] == a.get("approach"))))]
         if not candidates:
             missing_routes.append(route.get("route_id"))
-    # A reviewed gap can have concrete new work; it is not parked while that
-    # work is eligible. Exhaustion still requires the existing source review.
     result["parked_scopes"] = sorted(reviewed - {a["scope"] for a in actions if a["id"] in result["eligible_actions"]})
     result.update(strategy_change_required=bool(strategy_changes), stalled_approaches=sorted(stalled),
                   missing_routes=missing_routes)
     if not actions:
-        # Exhausted queries describe past attempts, never the whole market.
-        # Refill discovery instead of manufacturing an unaffordable action.
         result.update(decision="continue", missing_scopes=missing,
                       next="Choose a different source or research method within the saved budget and deadline.")
     elif result["eligible_actions"] or missing or missing_routes or needs_pricing or strategy_changes:
@@ -2113,19 +2004,80 @@ def evaluate_stop(document: Any, *, now: Optional[datetime] = None, execution_bu
     return result
 
 
+def bonus_pass_refusal(document: dict, action: dict, execution_budget, *, now: Optional[datetime] = None) -> Optional[str]:
+    """Why a planned bonus-pass lookup may not run after the company target is met, or None when it may.
+
+    Only an account-verification lookup for an already accepted company, labelled with BONUS_PASS_APPROACH, at most
+    BONUS_PASS_LOOKUPS per company, while research is open, with no Arena research closure and within the same
+    allowance checks that ordinary lookups pass. The stop decision stays target_met.
+    """
+    if not sourcing_target_met(document):
+        return "The bonus pass runs only after the company target is met."
+    if not str(action.get("approach") or "").startswith(BONUS_PASS_APPROACH):
+        return f"A bonus-pass lookup needs an approach starting with '{BONUS_PASS_APPROACH}'."
+    accepted = document.get("accepted", [])
+    scope = action.get("scope")
+    if (action.get("phase") != "account_verification" or action.get("blocker") is not None
+            or scope not in {_company_key(row) for row in accepted if isinstance(row, dict)}):
+        return "A bonus-pass lookup must verify an accepted company (phase account_verification)."
+    provider, bound, calls = action.get("provider"), action.get("cost_upper_bound_credits"), action.get("paid_calls")
+    if provider not in PAID_PROVIDERS or type(calls) is not int or calls < 0:
+        return "A bonus-pass lookup needs a paid provider and a paid call count."
+    if bound is not None and (isinstance(bound, bool) or not isinstance(bound, (int, float))
+                              or not math.isfinite(bound) or bound < 0):
+        return "A bonus-pass lookup needs a finite cost bound."
+    frontier = document.get("stop_audit", {}).get("route_frontier", [])
+    used = sum(1 for row in frontier if isinstance(row, dict) and row.get("scope") == scope
+               and str(row.get("approach") or "").startswith(BONUS_PASS_APPROACH))
+    if used >= BONUS_PASS_LOOKUPS:
+        return f"{scope} has used its {BONUS_PASS_LOOKUPS} bonus-pass lookups. No paid call was made."
+    current = now or datetime.now(timezone.utc)
+    try:
+        closes = research_closes(document)
+        if closes is not None and current >= closes:
+            return "Research has closed for this run's time limit."
+        if arena_research_stop.read(document, execution_budget, now=current.timestamp()) is not None:
+            return "Arena spend pacing has closed research."
+    except (OSError, ValueError, KeyError, TypeError):
+        return "The saved research window or closure is unreadable."
+    try:
+        if document.get("budget", {}).get("policy") == "actual_cost":
+            from budget_guard import check_allowance, refuses_unpriced
+            if execution_budget is None:
+                return "Actual-cost lookups require the saved execution ledger."
+            if bound is None and refuses_unpriced(execution_budget) and provider != "scrapingdog":
+                return "A verified whole-call price bound is required."
+            check_allowance(execution_budget, provider, bound, len(accepted),
+                            documented_tariff=provider == "scrapingdog")
+        else:
+            limits = document.get("budget", {}).get("limits", {})
+            maximum = calculate_cost_summary(document).get(provider, {}).get("maximum_credits")
+            cap = limits.get(f"{provider}_credits") if isinstance(limits, dict) else None
+            if bound is None or maximum is None or cap is None or _decimal(cap) is None:
+                return "A verified whole-call price bound and provider cap are required."
+            if Decimal(str(maximum)) + Decimal(str(bound)) > Decimal(str(cap)):
+                return f"{provider} credit cap {cap} would be exceeded."
+            if execution_budget is not None:
+                from budget_guard import check_allowance
+                check_allowance(execution_budget, provider, bound, len(accepted))
+    except ValueError as exc:
+        return str(exc)
+    except (KeyError, TypeError, ArithmeticError) as exc:
+        return f"execution budget: {exc}"
+    return None
+
+
 def refuse_earlier_results(run_file) -> None:
-    """Refuse a run saved by an earlier TYCHE before anything is written, so its files stay unchanged."""
     path = pathlib.Path(run_file)
     try:
         document = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
     except (OSError, UnicodeError, ValueError):
-        return  # Unreadable state is reported by the caller's own checks.
+        return
     if document is not None and (error := schema_error(document)):
         raise ValueError(error)
 
 
 def schema_error(document: Any) -> Optional[str]:
-    """This code reads only its own schema; an older saved run stays on disk, unread."""
     version = document.get("schema_version") if isinstance(document, dict) else None
     if version != RESULT_SCHEMA_VERSION:
         return (f"schema_version {version!r} is not {RESULT_SCHEMA_VERSION}: this run was written by an earlier TYCHE "
@@ -2248,8 +2200,6 @@ def validate_run(document: Any, *, require_stop_check: bool = False, now: Option
         )
     attempted_ids = set(receipts_by_id)
     if require_stop_check or "stop_check" in document:
-        # Unused future research is not unfinished dispatched work. Keep it in
-        # the frontier after target completion instead of inventing exhaustion.
         if stop_reason not in {"time_limit_reached", "budget_exhausted", arena_research_stop.DECISION}:
             open_reviews = sorted(rid for rid in attempted_ids if
                                   frontier_by_id.get(rid, {}).get("state") in ACTIONABLE_FRONTIER_STATES)

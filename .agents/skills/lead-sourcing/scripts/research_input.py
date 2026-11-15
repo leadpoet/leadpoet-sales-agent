@@ -1,8 +1,3 @@
-"""Translate concise research inputs into the existing run/attempt/review records.
-
-No dispatch, company qualification, strategy selection or automatic retries live
-here. The research agent supplies those judgments; existing helpers enforce them.
-"""
 
 import copy
 from datetime import datetime, timezone
@@ -41,18 +36,10 @@ def strings(value, label, *, empty=False):
 REQUEST_FIELDS = {"target_count", "icp", "buying_signals", "time_window", "budget", "signal_match_mode", "run_id",
                   "as_of_date", "max_duration_seconds", "product_service", "original_text", "signal_candidates_max",
                   "trait_signals", "seen_companies", "bound_required_attributes", "single_source_attributes", "workbook"}
-# The most held companies a run may export for signal research downstream (leads.json signal_candidates).
 SIGNAL_CANDIDATES_LIMIT = 50
 
 
 def paraphrased_criteria(request, *, bound_exclusions=False):
-    """Required criteria of a new run that are not the user's own words in original_text.
-
-    Live runs rewrote the brief before any research: a buyer-hire signal gained a source restriction the brief never
-    stated, "central purchasing" became "group-level or central", every run added an industry filter the brief never
-    named, and a signal could keep its words but drop its named sources. Criteria copied from original_text keep its
-    named sources, alternatives, dates and scope; interpretation belongs in research, not in the saved request.
-    """
     import unicodedata
     from source_receipts import quote_form
     original = request.get("original_text")
@@ -64,7 +51,6 @@ def paraphrased_criteria(request, *, bound_exclusions=False):
         text = unicodedata.normalize("NFKC", str(value)).translate(marks).replace("\u2026", "...")
         return quote_form(text).casefold()
 
-    # One folded line per source line, so a signal query must end where its sentence, bullet or line ends.
     brief, line_ends = "", set()
     for line in str(original).splitlines():
         if folded := fold(line):
@@ -74,7 +60,6 @@ def paraphrased_criteria(request, *, bound_exclusions=False):
     def quoted(value, *, whole=False):
         needle = fold(value).strip(" .;:,!?")
         for found in re.finditer(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", brief) if needle else ():
-            # French typography puts a space before ";", ":", "!" and "?".
             if not whole or found.end() in line_ends or brief[found.end():].lstrip(" ")[:1] in {".", ";", ":", "!", "?"}:
                 return True
         return False
@@ -88,7 +73,6 @@ def paraphrased_criteria(request, *, bound_exclusions=False):
         query = signal.get("query") or signal["kind"]
         if not quoted(query, whole=True):
             found.append(f"buying_signals[{index}] ({signal['kind']})")
-        # A source list may only restate the sources the signal's own words name.
         own = fold(query)
         if any(not re.search(r"(?<!\w)" + re.escape(fold(item).strip(" .;:,")) + r"(?!\w)", own)
                for item in signal.get("source_preferences", [])):
@@ -97,18 +81,15 @@ def paraphrased_criteria(request, *, bound_exclusions=False):
 
 
 DOMAIN = re.compile(r"(?<![\w@.-])(?:www\.)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})(?![\w-])", re.IGNORECASE)
-# Legal-form and group words that may stand beside a company's name.
 LEGAL_WORDS = {"inc", "incorporated", "llc", "llp", "lp", "ltd", "limited", "corp", "corporation", "co", "company",
                "group", "groupe", "holding", "holdings", "the", "sa", "sas", "sasu", "sarl", "eurl", "gmbh", "ag", "kg",
                "se", "sl", "bv", "nv", "plc", "spa", "srl", "pty", "ab", "oy"}
 
 
 def named_company(value):
-    """The domain when a criterion is only one company's name and domain ("YipitData, yipitdata.com"), else None."""
     import unicodedata
-    # NFD drops accents but keeps ™ and ℠ as marks; NFKD would spell them "TM" and "SM" into the name.
     text = "".join(c for c in unicodedata.normalize("NFD", str(value)) if not unicodedata.combining(c))
-    text = re.sub(r"https?://", " ", text, flags=re.IGNORECASE)  # A link to the site names its domain too.
+    text = re.sub(r"https?://", " ", text, flags=re.IGNORECASE)
     domains = {match.group(1).casefold() for match in DOMAIN.finditer(text)}
     if len(domains) != 1:
         return None
@@ -119,7 +100,6 @@ def named_company(value):
 
 
 def normalize_request(value, run_file, *, saved=None, started_at=None):
-    """Apply mechanical defaults to new inputs; never infer criteria or intent."""
     from validate_run import CONTACT_FIELDS, CONTACT_HANDOFF
     if isinstance(value, dict) and (contact := sorted(CONTACT_FIELDS & value.keys())):
         raise ValueError("TYCHE sources and qualifies companies; remove " + ", ".join(contact) + " from the request. "
@@ -138,7 +118,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
     target = budget_guard.count(request.get("target_count"), "target_count")
     if not target:
         raise ValueError("target_count must be positive")
-    # Bound at startup from request-options.json, never transcribed; a resume keeps the saved bound.
     if "signal_candidates_max" in prior:
         request.setdefault("signal_candidates_max", prior["signal_candidates_max"])
     if "signal_candidates_max" in request:
@@ -147,7 +126,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
             raise ValueError(f"signal_candidates_max must be a whole number from 0 to {SIGNAL_CANDIDATES_LIMIT}. Nothing was saved.")
         if "signal_candidates_max" in prior and prior["signal_candidates_max"] != bound:
             raise ValueError("signal_candidates_max differs from the saved run; preserve this run's settings. Nothing was saved.")
-    # A host that takes results.json only (ARETE) binds workbook false in request-options.json; a resume keeps it.
     if "workbook" in prior:
         request.setdefault("workbook", prior["workbook"])
     if "workbook" in request:
@@ -191,7 +169,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
         if not key or key in signal_keys:
             raise ValueError("signal kinds must be distinct, non-empty identifiers within this request")
         signal_keys.add(key)
-        # Resuming keeps the saved importance; a new signal without one is required.
         previous = [s for s in prior.get("buying_signals", []) if _identity(s.get("kind")) == key]
         signal.setdefault("importance", previous[0].get("importance", "required") if len(previous) == 1 else "required")
         if signal["importance"] not in {"required", "preferred"}:
@@ -200,8 +177,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
             text(signal["query"], "signal.query")
         if "source_preferences" in signal:
             strings(signal["source_preferences"], "source_preferences", empty=True)
-    # Bound at startup from request-options.json, never transcribed; a resume keeps the saved list. A trait signal (what
-    # the company is, uses or does) may be exported as likely; every other kind is an event and needs a confirming source.
     if "trait_signals" in prior:
         request.setdefault("trait_signals", prior["trait_signals"])
     if "trait_signals" in request:
@@ -217,8 +192,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
                              "signal's kind exactly as request.txt names it. Nothing was saved.")
         if "trait_signals" in prior and prior["trait_signals"] != traits:
             raise ValueError("trait_signals differs from the saved run; preserve this run's settings. Nothing was saved.")
-    # A continuation's companies already seen in earlier runs for this request: bound from request-options.json as written,
-    # kept on resume. An entry that is not a company key (a name) is kept and matches only the same name used as a target.
     if "seen_companies" in prior:
         request.setdefault("seen_companies", prior["seen_companies"])
     if "seen_companies" in request:
@@ -226,7 +199,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
             raise ValueError("seen_companies must be a list of company domains or LinkedIn company URLs. Nothing was saved.")
         if "seen_companies" in prior and prior["seen_companies"] != request["seen_companies"]:
             raise ValueError("seen_companies differs from the saved run; preserve this run's settings. Nothing was saved.")
-    # The attribute texts a host publishes as one quote, bound from request-options.json; kept on resume.
     if "single_source_attributes" in prior:
         request.setdefault("single_source_attributes", prior["single_source_attributes"])
     if "single_source_attributes" in request:
@@ -239,7 +211,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
                              "Nothing was saved.")
     if errors := signal_request_errors(request):
         raise ValueError("; ".join(errors))
-    # Startup binds a request-exclusions.json list beside the run as written, without model transcription.
     sidecar = Path(run_file).with_name("request-exclusions.json")
     bound = sidecar.exists() or sidecar.is_symlink()
     if not prior and (paraphrased := paraphrased_criteria(request, bound_exclusions=bound)):
@@ -249,8 +220,6 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
                          "keeping its named sources, alternatives, dates and scope; a signal's query runs to the end of its "
                          "sentence, bullet or line, and source_preferences only repeat sources that query names. Do not "
                          "paraphrase, add or drop words, and omit a filter the user did not state. Nothing was saved.")
-    # A company has one own domain, so separate required attributes that each only name a different company can
-    # never all hold: a live run saved three named accounts this way and rejected all three.
     named = {f"icp.required_attributes[{i}]": d for i, v in enumerate(icp.get("required_attributes", []))
              if (d := named_company(v))}
     if not prior and len(set(named.values())) > 1:
@@ -287,14 +256,12 @@ def normalize_request(value, run_file, *, saved=None, started_at=None):
 
 
 def closing_window(requested, duration):
-    """Seconds research closes before an explicit time limit; a short run keeps nine tenths of it."""
     if not requested or not duration:
         return 0
     return min(budget_guard.count(requested, "closing_seconds"), duration // 10)
 
 
 def start_document(run_file, setup, *, existing=None, ledger=None):
-    """Produce validated initialization inputs; budget_guard owns persistence."""
     object_fields(setup, {"request", "max_usd", "scrapingdog_usd_per_credit", "started_at", "budget_policy",
                           "closing_seconds", "unpriced_calls"}, "setup")
     existing, ledger = existing or {}, ledger or {}
@@ -324,8 +291,6 @@ def start_document(run_file, setup, *, existing=None, ledger=None):
                            "max_deepline_credits_per_next_lead"}, "request.budget")
     if budget.get("hard_stop") is not True:
         raise ValueError("request.budget.hard_stop must be true")
-    # Default each omitted allowance independently. Disabling one provider must
-    # not disable another; explicit caps (including zero) and saved limits win.
     budget = request["budget"] = {**copy.deepcopy(budget_defaults), **budget}
     for key, value in budget.items():
         if key == "max_paid_calls":
@@ -344,8 +309,6 @@ def start_document(run_file, setup, *, existing=None, ledger=None):
     policy = setup.get("budget_policy", saved_policy)
     if policy not in {"actual_cost", "reserved"} or (existing or ledger) and policy != saved_policy:
         raise ValueError("Budget policy must be supported and preserve the saved ledger")
-    # Saved once with the ledger: a resumed run keeps the contract it started with. A ledger
-    # that has to be rebuilt has nothing saved, so it takes what this host asks for.
     options["unpriced_calls"] = (ledger.get("unpriced_calls") if ledger
                                  else setup.get("unpriced_calls") or os.environ.get("TYCHE_UNPRICED_CALLS"))
     from validate_run import RESULT_SCHEMA_VERSION, criteria
@@ -356,12 +319,11 @@ def start_document(run_file, setup, *, existing=None, ledger=None):
         stop_check={"started_at": started, "next_actions": []}, stop_audit={"route_frontier": []})
     closing = closing_window(setup.get("closing_seconds"), request.get("max_duration_seconds"))
     if not existing and closing:
-        document["stop_check"]["closing_seconds"] = closing  # Saved once with the run.
+        document["stop_check"]["closing_seconds"] = closing
     return document, options
 
 
 def normalize_provider_request(provider, request, label):
-    """Use the existing adapter contract for both research and legacy inputs."""
     if provider not in ("deepline", "scrapingdog", "public_web"):
         raise ValueError(f"{label}.provider must use an existing provider wrapper: deepline, scrapingdog, public_web")
     if not isinstance(request, dict):
@@ -377,7 +339,6 @@ def normalize_provider_request(provider, request, label):
 
 
 def prepare_lookup(value, label="lookup"):
-    """The agent selects target, purpose and request; derive bookkeeping only."""
     object_fields(value, {"provider", "request", "scope", "phase", "purpose", "approach",
                           "max_cost_credits", "status_read"}, label)
     provider = value.get("provider", "deepline")
@@ -397,7 +358,6 @@ def prepare_lookup(value, label="lookup"):
 
 
 def check_tool_contract(receipt, request):
-    """Validate against the saved live contract before reservation or dispatch."""
     matches = [row for row in receipt.get("results", []) if isinstance(row, dict)
                and request["tool"] in {row.get("toolId"), row.get("id"), row.get("tool")}]
     if len(matches) != 1:
@@ -432,11 +392,6 @@ def check_tool_contract(receipt, request):
 
 
 def _catalog_schema(schema):
-    """Translate Deepline's observed `type: any` shorthand at schema nodes.
-
-    The raw descriptor stays intact. Literal data in enum/default/const is not
-    a schema; all other constraints and malformed contracts still validate.
-    """
     if not isinstance(schema, dict):
         return schema
     result = dict(schema)
@@ -454,7 +409,7 @@ def _catalog_schema(schema):
 
 
 def _check_native_schema(schema, payload):
-    if not schema:  # Some catalog tools expose only the field list above.
+    if not schema:
         return
     try:
         from jsonschema.exceptions import SchemaError, best_match
@@ -472,7 +427,6 @@ def _check_native_schema(schema, payload):
         raise ValueError("saved input schema uses an unsupported JSON Schema version; refresh its description")
     try:
         validator.check_schema(schema)
-        # Resolve embedded references, but never fetch external schemas or URLs.
         error = best_match(validator(schema, registry=Registry()).iter_errors(payload))
     except SchemaError as exc:
         raise ValueError("saved input schema is malformed; refresh its description") from exc
@@ -488,7 +442,6 @@ def _check_native_schema(schema, payload):
 
 
 def company_update(document, item):
-    """Apply explicit field and criterion updates, preserving unrelated evidence."""
     object_fields(item, {"scope", "state", "stage", "reason_text", "company",
                          "qualification_checks", "supporting_findings", "account_fit", "former_scopes"}, "company update")
     from validate_run import _company_key, _identity, company_domain, company_website, criteria, excluded_company
@@ -510,16 +463,16 @@ def company_update(document, item):
             raise ValueError("company facts must be an object")
         company.update(copy.deepcopy(item["company"]))
         for key in [key for key, value in company.items() if value is None]:
-            del company[key]  # null clears a saved field, such as a range the newly selected record lacks.
+            del company[key]
         company["website"] = company_website(company)
     if state == "accepted" and "company" in company:
-        name = company.pop("company")  # A candidate's discovered name becomes its canonical name.
+        name = company.pop("company")
         if isinstance(name, str) and not company.get("canonical_name"):
             company["canonical_name"] = name
     if _company_key({"company": company}) != scope:
         raise ValueError("company update cannot change its canonical identity")
     if company.get("domain"):
-        company["domain"] = scope  # The stable join key: lower case, without www.
+        company["domain"] = scope
     row["company" if state == "accepted" else "candidate"] = company
     checks = row.setdefault("qualification_checks", [])
     if "qualification_checks" in item:
@@ -543,7 +496,6 @@ def company_update(document, item):
             text(check.get("claim"), "claim")
             if not isinstance(check.get("evidence"), list) or check["status"] != "unknown" and not check["evidence"]:
                 raise ValueError("pass/fail requires evidence; unknown may have an empty evidence array")
-            # Code owns the label, importance and signal kind, so they always match the saved request.
             update = {"criterion_id": criterion["id"], "criterion": criterion["label"], "importance": criterion["importance"],
                       **({"signal": criterion["label"]} if criterion["kind"] == "signal" else {}),
                       "status": check["status"], "claim": check["claim"], "evidence": copy.deepcopy(check["evidence"]),
@@ -560,13 +512,12 @@ def company_update(document, item):
             raise ValueError("; ".join(errors))
     for key in ("account_fit", "supporting_findings"):
         if key in item:
-            row[key] = copy.deepcopy(item[key])  # Explicit complete replacements, never a recursive merge.
-    if "former_scopes" in item:  # Written by code when a worker's claim moved to the website its LinkedIn record names.
+            row[key] = copy.deepcopy(item[key])
+    if "former_scopes" in item:
         former = item["former_scopes"]
         if not isinstance(former, list) or not all(isinstance(key, str) and key and key != scope for key in former):
             raise ValueError("former_scopes must list this company's earlier claim keys")
         row["former_scopes"] = sorted(set(row.get("former_scopes", [])) | set(former))
-    # The initial signal is derived, never authored: the first passing check of a required signal kind.
     required = {_identity(s["kind"]) for s in document["request"].get("buying_signals", [])
                 if s.get("importance", "required") == "required"}
     passing = [c for c in checks if c.get("signal") and c["status"] == "pass" and c["evidence"]
@@ -578,12 +529,12 @@ def company_update(document, item):
             "evidence_" + key if key in {"url", "date", "date_basis", "text"} else key: value
             for key, value in evidence.items()},
             "criterion_id": passing[0]["criterion_id"], "criterion": passing[0]["criterion"], "signal": passing[0]["signal"]}
-    if state != "unresolved":  # A likely trait is a held company's backup for signal research, never a lead's claim.
-        for check in checks:  # Only a still-unknown check drops it; support on a pass or fail is refused below.
+    if state != "unresolved":
+        for check in checks:
             if check.get("status") == "unknown":
                 check.pop("support", None)
                 check.pop("support_reason", None)
-    if state == "accepted":  # Only the stop check reads former_scopes, and it parks held companies only.
+    if state == "accepted":
         for key in ("stage", "reason_code", "reason_text", "former_scopes"):
             row.pop(key, None)
     else:

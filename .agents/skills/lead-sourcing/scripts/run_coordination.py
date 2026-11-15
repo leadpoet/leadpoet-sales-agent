@@ -1,8 +1,3 @@
-"""Small, local coordination layer for workers sharing one sourcing run.
-
-OS locks serialize short state changes and limit concurrent provider calls.
-They do not replace receipt recovery or expire company ownership on a timer.
-"""
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -77,7 +72,6 @@ def _open_lock(path):
 
 @contextmanager
 def locked(run_file, name="state", *, blocking=True):
-    """Reentrant across local threads, exclusive across worker processes."""
     directory = Path(run_file).resolve().parent
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / (".tyche-" + hashlib.sha256(name.encode()).hexdigest()[:16] + ".guard")
@@ -108,7 +102,6 @@ def locked(run_file, name="state", *, blocking=True):
 
 @contextmanager
 def provider_slot(run_file, limit=3):
-    """A global limit, not three new slots for each model worker."""
     directory = Path(run_file).resolve().parent
     acquired = None
     started = time.monotonic()
@@ -201,7 +194,6 @@ def configure(run_file, count):
 def register(run_file, worker, generation):
     def assign(state):
         state["workers"].setdefault(worker, {}).update(generation=generation, status="running")
-        # Recover a crash between the saved outcome/confirmation and slot release.
         current = state["workers"][worker].get("current_company")
         if current and Path(run_file).exists():
             from budget_guard import read_object
@@ -225,18 +217,13 @@ def check_worker(state, worker, generation):
         raise ValueError("This worker no longer owns an active research invocation; no research dispatched")
 
 
-# Sites where many companies each have a page: such a page is not a company's own website.
 PLATFORM_HOSTS = ("facebook.com", "fb.com", "fb.me", "m.me", "instagram.com", "x.com", "twitter.com", "tiktok.com",
                   "youtube.com", "youtu.be", "linktr.ee", "lnkd.in", "g.page", "goo.gl", "pagesjaunes.fr",
                   "sites.google.com", "societe.com", "pappers.fr", "annuaire-entreprises.data.gouv.fr", "northdata.com",
                   "northdata.de", "kompass.com", "crunchbase.com", "yelp.com", "yelp.fr", "yelp.co.uk",
                   "find-and-update.company-information.service.gov.uk")
-# A careers or jobs section of a company's own site, or any two-letter (country, language or similar) section, keys
-# the company by the site's registrable domain, as its website and mail do (test10/04s keyed mycareer.verizon.com, 08b
-# de.erwinmueller.com).
 SITE_SECTION = re.compile(r"(?:my)?(?:careers?|jobs?)|karriere|stellen|emplois?|empleos?|recrutement|rejoins|vacatures"
                           r"|werkenbij|[^\W\d_]{2}")
-# Hosting and recruiting platforms give each customer, or each customer's job pages, a subdomain or path of their own.
 SHARED_HOSTS = ("netlify.app", "vercel.app", "github.io", "gitlab.io", "herokuapp.com", "pages.dev", "web.app",
                 "firebaseapp.com", "azurewebsites.net", "appspot.com", "wordpress.com", "blogspot.com", "wixsite.com",
                 "squarespace.com", "webflow.io", "myshopify.com", "weebly.com", "jimdosite.com", "godaddysites.com",
@@ -246,15 +233,12 @@ SHARED_HOSTS = ("netlify.app", "vercel.app", "github.io", "gitlab.io", "herokuap
                 "applytojob.com", "zohorecruit.com", "taleo.net", "successfactors.com", "successfactors.eu",
                 "ultipro.com", "dayforcehcm.com", "indeed.com", "glassdoor.com", "stepstone.de",
                 "welcometothejungle.com")
-# Second-level labels of country suffixes (example.co.uk, example.com.au): never a registrable domain alone.
 SUFFIX_SECOND = {"co", "com", "net", "org", "gov", "edu", "ac", "ne", "or", "go", "gob", "gouv", "gv", "nic", "mil",
                  "ltd", "plc", "sch", "me", "nom", "info", "biz", "asso", "nhs", "police", "govt", "asn", "ind", "adv",
                  "eng", "firm", "gen", "res"}
 
 
 def _site_domain(host):
-    """host without its leading careers, jobs or country labels, while what remains is a registrable domain that is
-    not a shared host."""
     while True:
         first, _, rest = host.partition(".")
         labels = rest.split(".")
@@ -267,7 +251,6 @@ def _site_domain(host):
 
 
 def host_key(host):
-    """One form for a host: lower case, no www. or trailing dot, internationalized labels decoded (NFC)."""
     labels = []
     for label in str(host).strip().lower().removeprefix("www.").rstrip(".").split("."):
         if label.startswith("xn--"):
@@ -280,8 +263,6 @@ def host_key(host):
 
 
 def company_key(value):
-    """The one company key for claims and saved rows: the website host in any spelling, or a LinkedIn
-    company page. A name, a person profile or a page on a social or directory site is refused."""
     value = str(value).strip()
     parsed = urlsplit(value if "://" in value else "https://" + value)
     host = host_key(parsed.hostname or "")
@@ -299,18 +280,17 @@ def company_key(value):
 
 
 class WorkerYield(ValueError):
-    """This worker finished its company after concurrency was reduced."""
+    pass
 
 
 def refresh_pacing(run_file, *, reconcile=None):
-    """Drain at 80%; restore parallel work below 70% after settlement."""
     from budget_guard import load_ledger, accounting_summary
     ledger = load_ledger(run_file)
     totals = accounting_summary(ledger)
     spent = (totals.get("budget_total_usd", totals["total_usd"]) if ledger["version"] == 2 else
              sum(v["maximum_usd"] for v in totals["providers"].values()))
     if spent >= float(ledger["usd_limit"]) * .8 and reconcile:
-        reconcile(run_file)  # Outside all state locks; only posted evidence releases a reservation.
+        reconcile(run_file)
         ledger = load_ledger(run_file)
         totals = accounting_summary(ledger)
         spent = (totals.get("budget_total_usd", totals["total_usd"]) if ledger["version"] == 2 else
@@ -339,19 +319,40 @@ def should_yield(state, worker):
                 and not state["workers"][worker].get("current_company"))
 
 
+FOCUS_RELEASE_SECONDS = 480
+
+
+def _focus_seconds(state, worker, current):
+    row = state["claims"].get(current) or {}
+    if row.get("worker") != worker or row.get("status") != "active":
+        return None
+    started = []
+    for key in ("claimed_at", "reassigned_at"):
+        try:
+            value = datetime.fromisoformat(str(row[key]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        started.append(value if value.tzinfo else value.replace(tzinfo=timezone.utc))
+    if not started:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - max(started)).total_seconds())
+
+
 def _focus(state, worker, target):
     current = state["workers"][worker].get("current_company")
     if should_yield(state, worker):
         raise WorkerYield("Near the shared budget cutoff, this worker has finished its company. End this invocation now; the remaining worker continues. Do not poll or start another company.")
     if current and current != target:
-        raise ValueError(f"Finish current company {current} before starting another company or broad discovery. "
-                         "Accept and confirm it, reject an evidenced mismatch, or save hold_account with the "
-                         "specific missing evidence and why work cannot proceed.")
+        held = _focus_seconds(state, worker, current) if FOCUS_RELEASE_SECONDS else None
+        if held is None or held < FOCUS_RELEASE_SECONDS:
+            raise ValueError(f"Finish current company {current} before starting another company or broad discovery. "
+                             "Accept and confirm it, reject an evidenced mismatch, or save hold_account with the "
+                             "specific missing evidence and why work cannot proceed.")
+        state["claims"][current]["focus_released_after_seconds"] = round(held, 1)
     state["workers"][worker]["current_company"] = target
 
 
 def resume_abandoned(run_file, worker, generation):
-    """Adopt one retired worker's company; never steal live work or an unresolved dispatch."""
     from budget_guard import read_object
     def adopt(state):
         check_worker(state, worker, generation)
@@ -364,7 +365,7 @@ def resume_abandoned(run_file, worker, generation):
         for target, claim in state["claims"].items():
             old = state["workers"][claim["worker"]]
             if (claim["status"] != "active" or not old.get("disabled") or old.get("status") != "stopped"
-                    or pending.intersection([target, *claim["aliases"]])):  # A moved claim keeps its old key's lookups.
+                    or pending.intersection([target, *claim["aliases"]])):
                 continue
             claim.setdefault("previous_owners", []).append(claim["worker"])
             claim.update(worker=worker, reassigned_at=datetime.now(timezone.utc).isoformat())
@@ -379,12 +380,10 @@ def require_discovery(run_file, worker, generation):
     resume_abandoned(run_file, worker, generation)
     state = snapshot(run_file)
     check_worker(state, worker, generation)
-    _focus(state, worker, None)  # Read-only check; discovery does not own a company.
+    _focus(state, worker, None)
 
 
 def claim(run_file, worker, generation, target, aliases=(), *, allow_owned_complete=False, rekey_from=()):
-    """rekey_from: claim keys the caller found may move to target (research_tools checks that the company's own saved
-    LinkedIn record names target as its website and that nothing is saved under the old key)."""
     if Path(run_file).exists() and not allow_owned_complete:
         resume_abandoned(run_file, worker, generation)
     keys = list(dict.fromkeys(company_key(value) for value in (target, *aliases) if value))
@@ -403,8 +402,6 @@ def claim(run_file, worker, generation, target, aliases=(), *, allow_owned_compl
                 result.update(claimed=False, target=canonical, owner=row["worker"], status=row["status"])
                 return
         canonical = sorted(matches)[0] if matches else keys[0]
-        # The explicit target becomes the key of this worker's open claim, with its aliases and focus; otherwise every
-        # review under the old key refuses the company's own record as another company's.
         current = state["workers"][worker].get("current_company")
         previous = canonical if matches else current
         if (previous in rekey_from and matches <= {previous} and current in {None, previous} and keys[0] != previous
@@ -412,7 +409,7 @@ def claim(run_file, worker, generation, target, aliases=(), *, allow_owned_compl
                 and state["claims"][previous]["worker"] == worker and state["claims"][previous]["status"] == "active"):
             moved = state["claims"][keys[0]] = state["claims"].pop(previous)
             moved["rekeyed_from"] = [key for key in dict.fromkeys([*moved.get("rekeyed_from", []), previous])
-                                     if key != keys[0]]  # A claim moved back drops its own key.
+                                     if key != keys[0]]
             if current == previous:
                 state["workers"][worker]["current_company"] = keys[0]
             result["rekeyed_from"] = previous

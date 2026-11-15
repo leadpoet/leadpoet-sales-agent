@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Minimal, bounded ScrapingDog HTTP adapter for lead-sourcing evidence."""
 
 from __future__ import annotations
 
@@ -143,7 +142,6 @@ def _text(value: Any) -> Optional[str]:
 
 
 def _date_text(value: Any) -> Optional[str]:
-    """Extract common date/freshness fields without stringifying containers."""
 
     if isinstance(value, dict):
         value = _first(
@@ -196,7 +194,6 @@ def _bounded_text(value: Any, maximum: int = _MAX_EVIDENCE_TEXT_CHARS) -> Option
 
 
 class _VisibleTextParser(HTMLParser):
-    """Collect user-visible HTML text while ignoring page chrome payloads."""
 
     _SKIP_TAGS = {"head", "script", "style", "noscript", "svg"}
     _BREAK_TAGS = {
@@ -321,7 +318,6 @@ def _param_value(value: Any) -> Any:
 
 
 def _copy_optional(params: Dict[str, Any], request: Dict[str, Any], keys: Sequence[str]) -> None:
-    """Copy provider options while retaining explicit false/zero values."""
 
     for key in keys:
         if request.get(key) not in (None, ""):
@@ -333,7 +329,6 @@ def _operation_kind(operation: str) -> str:
 
 
 def normalize_result(row: Any, operation: str, index: int = 0) -> Dict[str, Any]:
-    """Return a compact evidence row with stable fields for all operations."""
 
     source = row if isinstance(row, dict) else {"value": row}
     operation_kind = _operation_kind(operation)
@@ -394,9 +389,6 @@ def normalize_result(row: Any, operation: str, index: int = 0) -> Dict[str, Any]
             "title",
             "name",
         )
-        # A place payload normally has no source URL. A provider-supplied
-        # website is useful evidence when present; place IDs are metadata, not
-        # a fabricated URL.
         evidence_url = _link(
             _first(source, "evidence_url", "source_url", "website", "link", "url")
         )
@@ -675,8 +667,6 @@ def normalize_result(row: Any, operation: str, index: int = 0) -> Dict[str, Any]
         if operation_kind == "scrape"
         else _bounded_text(raw_text)
     )
-    # A date mentioned in a page may describe an event or a copyright notice,
-    # not publication. Keep it in the captured passage for explicit review.
     normalized_date = _date_text(evidence_date) or (None if operation_kind == "scrape" else _date_hint_from_text(raw_text))
     result: Dict[str, Any] = {
         "company": _text(company),
@@ -690,8 +680,6 @@ def normalize_result(row: Any, operation: str, index: int = 0) -> Dict[str, Any]
         "operation": operation,
         "provider_metadata": provider_metadata,
     }
-    # Keep explicit raw/artifact references without returning a full, potentially
-    # large provider response.
     for key in ("raw_artifact_refs", "artifact_ref", "artifact_refs", "raw_url"):
         if source.get(key) not in (None, "", [], {}):
             result["raw_artifact_refs"] = redact(source[key])
@@ -724,7 +712,6 @@ def _limit(value: Any, default: int = 10) -> int:
 
 
 def _bounded_limit(value: Any, wrapper_limit: int) -> int:
-    """Bound a provider result count by both provider and wrapper limits."""
 
     bound = _limit(wrapper_limit)
     return min(_limit(value, bound), bound)
@@ -835,8 +822,6 @@ def validate_request(request: Any) -> Dict[str, Any]:
         if operation_kind == "google_maps" and not isinstance(query, str):
             query = None
         if operation_kind == "google_maps" and not query and _place_identifier(result):
-            # Google Maps search is query-based. Place-specific requests use
-            # the explicit google_maps_place operation below.
             raise InputError("google_maps requires a non-empty query")
         if not isinstance(query, str) or not query.strip():
             raise InputError(f"{operation} requires a non-empty query")
@@ -1284,9 +1269,6 @@ _CONDITIONAL_DIRECT_FIELDS = {
     "google_local": ("title", "name", "address", "website", "place_id"),
     "google_ai_mode": ("answer", "answer_text", "text", "summary", "text_blocks", "references", "sources"),
     "google_news": ("title", "headline", "snippet", "link", "url", "published_at"),
-    # LinkedIn post responses are not fixed in the public documentation. These
-    # are common identity/content fields, so unknown successful objects remain
-    # schema errors instead of being silently accepted.
     "linkedin_post": ("id", "post_id", "text", "content", "post_text", "url"),
     "x_profile": ("profileId", "profile_id", "username", "name", "bio", "description", "url"),
     "x_post": ("tweetId", "tweet_id", "id", "text", "content", "post_text", "url"),
@@ -1471,7 +1453,6 @@ def _records(payload: Any, operation: str) -> List[Any]:
 
 
 def _known_schema(payload: Any, operation: str) -> bool:
-    """Recognize an empty result envelope separately from an unknown response."""
 
     operation = _operation_kind(operation)
     if operation == "scrape":
@@ -1563,7 +1544,6 @@ def _known_schema(payload: Any, operation: str) -> bool:
 
 
 def _continuation_cursor(payload: Any) -> Optional[str]:
-    """Return an opaque result cursor without treating it as an API credential."""
 
     if not isinstance(payload, dict):
         return None
@@ -1627,7 +1607,6 @@ def _run_validated(request: Dict[str, Any], capture=None) -> Tuple[Dict[str, Any
 
 
 def normalize_response(request, raw):
-    """Pure saved-response normalization; recovery never executes a request."""
     operation = request["operation"]
     operation_kind = request.get("operation_kind", _operation_kind(operation))
     base = {"provider": "scrapingdog", "operation": operation}

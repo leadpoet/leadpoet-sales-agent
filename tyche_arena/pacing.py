@@ -1,17 +1,3 @@
-"""Keep Leadpoet spend within the request's budget, capped by Leadpoet's reported limit.
-
-The request's budget ($0.80 per requested company) drives spend; Leadpoet's quota
-snapshot caps it (arena_research_stop.allowance): under its legacy per-qualified-company
-rule that is one company's $0.80, under its flat per-ICP policy $4. Published companies
-add no allowance. Research keeps 0.1 of the allowance for final review, which may use
-the allowance less a small margin for the last in-flight call, never an additional
-model margin. The read is Leadpoet's own passive quota snapshot; when
-unavailable the host's hard limits still apply.
-
-Final review gets no allowance for accepted rows that are not yet published. In
-round arena-2026-10-15 that credit let one ICP's final review spend to $1.571 for two
-accepted rows; one was published and qualified, and the ICP scored zero.
-"""
 
 import json
 import math
@@ -23,12 +9,10 @@ import tempfile
 import threading
 import time
 
-from . import SKILL  # noqa: F401  (sets sys.path for the skill scripts)
+from . import SKILL
 import arena_research_stop as research_stop
 
 OPENROUTER_RESERVE = research_stop.MODEL_RESERVE
-# Quota reads share the runtime's configured per-run limit.
-# Remote provider calls read each time; model requests reuse a read this long.
 MODEL_GUARD_READ_SECONDS = 20
 PUBLISHED_FILE = "published-count.json"
 HOST_COST_FILE = "host-cost-observation.json"
@@ -43,7 +27,7 @@ def _snapshot():
     try:
         import lab_arena_checkpoint
         return lab_arena_checkpoint.quota_usage(include_sourcing_cost=True)
-    except Exception:  # QuotaUnavailable, a host without cost snapshots, or no helper at all.
+    except Exception:
         return None
 
 
@@ -56,7 +40,6 @@ def _numeric_source_cost(snapshot):
 
 
 def save_cost_observation(run_file, snapshot):
-    """Persist only an existing quota read; never fetch or use this file for admission."""
     cost = _numeric_source_cost(snapshot)
     observation = {"observed_at": time.time(), "status": "observed" if cost is not None else "unknown"}
     if cost is not None:
@@ -75,7 +58,6 @@ def save_cost_observation(run_file, snapshot):
 
 
 def cost_observation(run_file):
-    """Bounded, passive display; absent or stale host cost is unknown, never zero."""
     unknown = lambda reason: {"status": "unknown", "reason": reason, "note": HOST_COST_NOTE}
     try:
         fd = os.open(Path(run_file).parent / HOST_COST_FILE,
@@ -128,7 +110,6 @@ def published_count(run_file):
 
 
 def closure(run_file):
-    """Read an explicit closure only; ordinary runs keep their existing policy."""
     if not os.path.lexists(Path(run_file).parent / research_stop.FILE):
         return None
     import budget_guard
@@ -139,11 +120,10 @@ def closure(run_file):
 
 
 def refusal(run_file, *, snapshot=None, reserve_model_calls=0, final_review=False):
-    """A refusal code, or None when another request fits the allowance."""
     if not final_review:
         try:
             if stopped := closure(run_file):
-                return stopped["cause"]  # Confirmation cannot reopen provider research.
+                return stopped["cause"]
         except (OSError, ValueError, KeyError, TypeError):
             return "invalid_arena_research_stop"
     snapshot = _snapshot() if snapshot is None else snapshot
@@ -160,7 +140,6 @@ def refusal(run_file, *, snapshot=None, reserve_model_calls=0, final_review=Fals
         return None
     if spent >= cap:
         return "budget_exhausted"
-    # Keep the micro-USD boundary exact.
     budget = research_stop.request_budget(run_file)
     if final_review:
         ceiling = research_stop.allowance(cost, budget) * (1 - research_stop.FINAL_REVIEW_MARGIN)
@@ -174,7 +153,6 @@ def refusal(run_file, *, snapshot=None, reserve_model_calls=0, final_review=Fals
 
 
 class ModelRequestGuard:
-    """The Codex bridge's request_guard: True admits one more model request."""
 
     def __init__(self, run_file, clock=time.monotonic):
         self.run_file, self.clock = run_file, clock
@@ -192,10 +170,9 @@ class ModelRequestGuard:
     def final_review(self, value):
         if value != self._final_review:
             self._final_review = value
-            self.read_at = None  # A new phase must observe its current spend/quota.
+            self.read_at = None
 
     def __call__(self):
-        # Parallel researchers each have a Leadpoet session whose bridge calls this guard from its own thread.
         with self._lock:
             return self._admit()
 
@@ -206,12 +183,10 @@ class ModelRequestGuard:
             try:
                 save_cost_observation(self.run_file, self.snapshot)
             except Exception:
-                # Do not leave an earlier successful observation looking current after a failed write.
                 try:
                     (Path(self.run_file).parent / HOST_COST_FILE).unlink(missing_ok=True)
                 except OSError:
-                    pass  # Optional display must never change the existing admission decision.
-        # An unavailable read ({}) is not retried before the interval either; the host's own limits still apply.
+                    pass
         count = published_count(self.run_file)
         self.denial = refusal(self.run_file, snapshot=self.snapshot if self.snapshot is not None else {},
                               reserve_model_calls=0 if self.final_review else OPENROUTER_RESERVE,

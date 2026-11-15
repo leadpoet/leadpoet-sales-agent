@@ -1,8 +1,3 @@
-"""Versioned endpoint tariffs, independent of account-wide credit deltas.
-
-Only request options actually forwarded by scrapingdog._params are priced.
-Keep old versions when tariffs change: saved receipts must remain auditable.
-"""
 from decimal import Decimal
 
 VERSION = "scrapingdog-2026-09-19"
@@ -39,7 +34,6 @@ def flag(value, default=False):
 
 
 def quote(operation, params, *, version=VERSION):
-    """Return exact credits or a documented range, never a model's price guess."""
     if version == "scrapingdog-2026-09-19":
         return _quote_20260919(operation, params)
     raise ValueError("Unknown saved ScrapingDog tariff version")
@@ -59,15 +53,13 @@ def _quote_20260919(operation, params):
         options = {"dynamic": flag(params.get("dynamic"), True), "premium": flag(params.get("premium")),
                    "country": params.get("country") or None}
         if options["country"] and (options["dynamic"] or options["premium"]):
-            # Public docs do not specify whether geo pricing replaces or adds
-            # to these options. Do not invent a maximum for the combination.
             return None
         low = high = (10 if options["country"] else
                       (25 if options["dynamic"] else 10) if options["premium"] else
                       5 if options["dynamic"] else 1)
         sources = [DOCS + "javascript-rendering/", DOCS + "premium-residential-proxies/", PRICING]
     elif operation == "linkedin_post":
-        low, high = 5, 25  # Endpoint reference and pricing page disagree.
+        low, high = 5, 25
         sources = [DOCS + "post-scraper/", PRICING]
     else:
         return None
@@ -76,7 +68,6 @@ def _quote_20260919(operation, params):
 
 
 def outcome(tariff, response):
-    """Completed success costs the tariff; a lost response retains its ceiling."""
     if not tariff:
         return {}
     status = response.get("http_status")
@@ -96,7 +87,6 @@ def outcome(tariff, response):
 
 
 def audit(receipt, call, route_id=None, run_file=None):
-    """Bind charges/holds to the saved request, raw response and dispatch tariff."""
     import scrapingdog
     from source_receipts import request_fingerprint
     from pathlib import Path

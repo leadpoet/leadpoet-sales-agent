@@ -15,9 +15,6 @@ import threading
 import time
 import uuid
 
-# Standard API-equivalent USD per million tokens, per model, from the official model pages.
-# This is a comparison estimate, never a ChatGPT subscription/credit invoice. A receipt keeps the
-# rates it was written with; a model without a verified row is refused, never priced by analogy.
 MODEL_PRICING = {
     'gpt-5.6-luna': {'input': '0.20', 'cached_input': '0.02', 'cache_write': '0.25', 'output': '1.20',
                      'source': 'https://developers.openai.com/api/docs/models/gpt-5.6-luna',
@@ -25,19 +22,12 @@ MODEL_PRICING = {
     'gpt-6-luna': {'input': '0.10', 'cached_input': '0.01', 'cache_write': '0.125', 'output': '0.50',
                    'source': 'https://developers.openai.com/api/docs/models/gpt-6-luna',
                    'checked_on': '2026-09-22', 'fast_multiplier': '2'},
-    # OpenRouter's Fireworks endpoint, the ZDR route TYCHE's hosts use; it lists no cache-write price, so a cache write
-    # is counted at the input rate.
     'deepseek/deepseek-v4.1-flash-1017': {'input': '0.30', 'cached_input': '0.006', 'cache_write': '0.30',
                                           'output': '1.20',
                                           'source': 'https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints',
                                           'checked_on': '2026-10-27', 'fast_multiplier': None},
 }
 RATE_FIELDS = ('input', 'cached_input', 'cache_write', 'output')
-# The hosted web search tool, per search action (official pricing page, checked 2026-10-14: "$10.00 / 1k calls + search
-# content tokens billed at model rates", and "Search actions incur a tool call cost"; the content tokens are already in
-# the per-response usage). Counted from the worker's own events (a completed web_search item whose action is "search";
-# its other actions, such as opening a page, are counted apart and not priced) and reported apart: an accounting
-# figure, never part of the budget total or its stopping threshold.
 WEB_SEARCH_PRICING = {'usd_per_call': '0.01', 'source': 'https://developers.openai.com/api/docs/pricing',
                       'checked_on': '2026-10-14'}
 USAGE_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
@@ -48,13 +38,11 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-# Ctrl-C, SIGTERM and SIGHUP all cancel the launcher; its cleanup then stops the worker groups it owns.
 CANCEL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _cancel = {'held': 0, 'pending': False, 'raised': False}
 
 
 def _on_cancel(signum, frame):
-    """Raise the first cancel once. While held, or once raised, a cancel only waits: it never cuts a stop short."""
     if _cancel['held'] or _cancel['raised']:
         _cancel['pending'] = True
         return
@@ -63,10 +51,6 @@ def _on_cancel(signum, frame):
 
 
 def cancel_on_signals():
-    """Make Ctrl-C, SIGTERM and SIGHUP cancel, so an owned worker is stopped before the launcher exits.
-
-    A signal the launcher inherited as ignored, as under nohup, stays ignored.
-    """
     _cancel.update(held=0, pending=False, raised=False)
     for sig in CANCEL_SIGNALS:
         if signal.getsignal(sig) is not signal.SIG_IGN:
@@ -75,11 +59,6 @@ def cancel_on_signals():
 
 @contextlib.contextmanager
 def cancellation_held():
-    """Deliver a cancel only after the enclosed start-and-record or stop sequence completes.
-
-    It relies on the handlers cancel_on_signals installs. Signals reach only the main thread;
-    parallel workers are stopped through their pool's stop event.
-    """
     if threading.current_thread() is not threading.main_thread():
         yield
         return
@@ -117,8 +96,6 @@ def estimate(usage, model, *, per_request=False):
     def price(write_count, long_context):
         prompt = (inputs - cached - write_count) * r['input'] + cached * r['cached_input'] + write_count * r['cache_write']
         return (prompt * (2 if long_context else 1) + output * r['output'] * (Decimal('1.5') if long_context else 1)) / 1_000_000
-    # Missing cache-write detail uses ordinary input pricing, explicitly an
-    # estimate. Context premiums apply to individual responses, never a run sum.
     return float(price(writes or 0, per_request and inputs > 272_000))
 
 
@@ -148,7 +125,6 @@ class UsageReceipt:
 
     @property
     def stop_path(self):
-        """Where a request that this worker end its turn is saved (budget_guard.request_stop writes it)."""
         return self.path.with_suffix('.stop')
 
     def save(self):
@@ -170,18 +146,15 @@ class UsageReceipt:
             self.save()
         elif (event.get('type') == 'item.completed' and isinstance(event.get('item'), dict)
               and event['item'].get('type') == 'web_search'):
-            # One billed call per completed search action; other actions apart. Only identities are kept, never queries.
             item = event['item']
             action = item.get('action') if isinstance(item.get('action'), dict) else {}
             field = 'hosted_web_search_calls' if action.get('type') == 'search' else 'hosted_web_search_other_actions'
             item_id = item.get('id')
             if not action.get('type'):
-                # Filed as another action, unpriced, but it may have been a search: the count is then not exact.
                 self.data['hosted_web_search_unidentified'] = self.data.get('hosted_web_search_unidentified', 0) + 1
             if not isinstance(item_id, str) or not item_id:
-                # Counted, but it cannot be told from a repeat: the count is then a bound, not exact.
                 self.data[field] = self.data.get(field, 0) + 1
-                if action.get('type'):  # one mark per item: an item with no action was marked above
+                if action.get('type'):
                     self.data['hosted_web_search_unidentified'] = self.data.get('hosted_web_search_unidentified', 0) + 1
                 self.save()
             elif item_id not in self._web_searches:
@@ -190,7 +163,6 @@ class UsageReceipt:
                 self.save()
         elif event.get('type') in {'error', 'turn.failed'}:
             message = str(event.get('message', event.get('error', ''))).casefold()
-            # Keep the failure category, not a second copy of private tool data.
             self.data['failure_kind'] = ('model_usage_limit' if any(term in message for term in
                 ('usage limit', 'quota', 'rate limit', 'limit reached')) else
                 'model_connection_error' if any(term in message for term in ('connection', 'stream disconnected', 'network'))
@@ -230,7 +202,6 @@ class UsageReceipt:
         self.save()
 
     def observe_compaction(self, response_id):
-        # This is the runtime's explicit linkage, never a guessed token difference.
         if not isinstance(response_id, str) or not response_id:
             raise ValueError('Compaction event lacks response identity')
         if response_id not in self.data['compaction_response_ids']:
@@ -274,7 +245,6 @@ class UsageReceipt:
 
 
 class UsageJournal:
-    """Read only this worker's temporary journal; retain no prompts or tool data."""
 
     def __init__(self, profile, receipt):
         self.profile, self.receipt = Path(profile), receipt
@@ -285,7 +255,7 @@ class UsageJournal:
         thread_id = self.receipt.data['thread_id']
         if not thread_id:
             return
-        uuid.UUID(thread_id)  # Never interpolate arbitrary event data into a path glob.
+        uuid.UUID(thread_id)
         if self.path is None:
             paths = list((self.profile / 'sessions').glob('*/*/*/*' + thread_id + '.jsonl'))
             if not paths:
@@ -302,10 +272,8 @@ class UsageJournal:
                 if not line:
                     break
                 if not line.endswith(b'\n') and len(line) < 65537:
-                    break  # The journal writer has not finished this record yet.
+                    break
                 self.offset = stream.tell()
-                # Compaction records contain large private replacement histories.
-                # Parse only a bounded record, retain just its response identity.
                 if not self.discarding and b'"type":"compacted"' in line[:200].replace(b' ', b''):
                     if not line.endswith(b'\n'):
                         line += stream.readline(16 * 1024 * 1024)
@@ -341,11 +309,6 @@ class UsageJournal:
 
 
 def execute_with_usage(command, cwd, env, receipt, *, profile=None, deadline=None, cost_stop=None, output=None):
-    """Capture usage; optionally stop even a silent worker at an absolute deadline.
-
-    deadline is a callable so the normalized, saved user limit takes precedence
-    as soon as setup completes. Terminate this worker's process group only.
-    """
     code = None
     output = output or sys.stdout
     stopped = threading.Event()
@@ -367,16 +330,11 @@ def execute_with_usage(command, cwd, env, receipt, *, profile=None, deadline=Non
             except ProcessLookupError:
                 return
             except PermissionError:
-                # Still stop the owned leader if a platform denies group signals.
-                # Record the group-cleanup failure; never report clean completion.
                 termination['cleanup_error'] = 'Worker process-group cleanup was denied'
                 if child.poll() is None:
                     child.send_signal(sig)
             if sig == signal.SIGTERM:
-                # A descendant can still hold stdout open after its parent exits.
                 time.sleep(0.5)
-                # Reap the leader before probing the group again. macOS can
-                # return EPERM for a group containing only its zombie leader.
                 child.poll()
 
     def watch(child):
@@ -395,8 +353,6 @@ def execute_with_usage(command, cwd, env, receipt, *, profile=None, deadline=Non
 
     child = None
     try:
-        # The worker runs in its own session, so a cancel that landed after it started but before
-        # the receipt named its group would leave it running with no owner. Cancellation waits.
         with cancellation_held():
             child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, text=True, encoding='utf-8',
@@ -412,12 +368,9 @@ def execute_with_usage(command, cwd, env, receipt, *, profile=None, deadline=Non
                     output.write(line)
                     output.flush()
                 except BrokenPipeError:
-                    # A disconnected observer must not lose model usage
-                    # or kill useful research. Disk journal failures still raise.
                     if output is not sys.stdout:
                         raise
                     output = None
-            # Only small metadata events can contain retained usage.
             if len(line) <= 65536:
                 try:
                     event = json.loads(line)
@@ -435,7 +388,6 @@ def execute_with_usage(command, cwd, env, receipt, *, profile=None, deadline=Non
         termination['failure_kind'] = 'cancelled'
         raise
     finally:
-        # A cancel during the stop waits for it, and a repeated cancel is never raised again.
         with cancellation_held():
             stopped.set()
             if watchdog:
@@ -447,19 +399,15 @@ def execute_with_usage(command, cwd, env, receipt, *, profile=None, deadline=Non
                 child.stdout.close()
             receipt.data.update(termination)
             record_stop_request(receipt)
-            capture_journal()  # The worker has flushed its journal before profile cleanup.
+            capture_journal()
             receipt.finish(code)
     return code or (0 if receipt.data['status'] == 'complete' else 2)
 
 
-# The watchdog's own stops that only a grace can push past a stop request (before it, a spent budget was stopped at
-# once): the request's reason replaces them. A real failure (cancelled, a usage limit, a connection error) stands.
 WATCHDOG_TIMING_STOPS = ('deadline_reached', 'pool_stopped')
 
 
 def record_stop_request(receipt):
-    """A worker asked to end its turn (a spent budget) is stopped for that reason, whether it ended in time or was
-    stopped during the grace by the deadline or the pool: the receipt says why, and when the request came."""
     try:
         request = json.loads(receipt.stop_path.read_text())
     except (OSError, ValueError):
@@ -474,7 +422,6 @@ def record_stop_request(receipt):
 
 
 def report(results, receipt_paths, run_directory=None, *, provider_accounting=None):
-    """One known subtotal. Unknown charges stay pending, never projected."""
     provider_usd, pending, held = Decimal(0), 0, Decimal(0)
     provider_missing = []
     if provider_accounting is not None:
@@ -528,15 +475,12 @@ def report(results, receipt_paths, run_directory=None, *, provider_accounting=No
         missing.append('Provider billing is pending')
     if held:
         missing.append('Documented price bounds (tariff ceilings and unknown charges) remain held; these are not confirmed charges')
-    # A call with no catalog price billed above its provisional hold: counted in full, its tool refused from then on.
     overruns = (provider_accounting or {}).get('unpriced_hold_overruns', [])
     total = provider_usd + llm
     count = len(results.get('accepted', []))
     searches = sum(int(r.get('hosted_web_search_calls') or 0) for r in workers)
     hosted = {'hosted_web_search_calls': searches,
               'hosted_web_search_other_actions': sum(int(r.get('hosted_web_search_other_actions') or 0) for r in workers),
-              # A receipt written before the count existed did not count (a floor); an item with no identity could not
-              # be told from a repeat (a bound). Either way the count is not exact.
               'hosted_web_search_count_complete': all('hosted_web_search_calls' in r and not r.get('hosted_web_search_unidentified')
                                                       for r in workers),
               'estimated_hosted_tool_usd': float(searches * Decimal(WEB_SEARCH_PRICING['usd_per_call'])),
@@ -561,7 +505,6 @@ def report(results, receipt_paths, run_directory=None, *, provider_accounting=No
 
 
 def save_report(run_directory, results_path=None):
-    """Refresh the saved report from all attempts; no caller-supplied subset."""
     directory = Path(run_directory).resolve()
     results_path = Path(results_path) if results_path is not None else directory / 'results.json'
     results = json.loads(results_path.read_text()) if results_path.exists() else {}
@@ -586,7 +529,6 @@ def save_report(run_directory, results_path=None):
 
 
 def write_research_report(directory, results, costs, commentary):
-    """Render saved facts and accounting. Research prose remains agent-authored."""
     def cell(value):
         return str(value if value is not None else 'unknown').replace('|', '\\|').replace('\n', ' ')
 
@@ -596,7 +538,6 @@ def write_research_report(directory, results, costs, commentary):
         ref = value.get('source', value)
         label = '/'.join(str(ref[k]) for k in ('provider', 'tool') if ref.get(k)) or 'unknown'
         rid = ref.get('route_id')
-        # IDs are generated/validated by the run helpers; never accept a path.
         if rid and all(c.isalnum() or c in '._-' for c in rid):
             label += f' ([{rid}](receipts/{rid}.json))'
         url = value.get('evidence_url', value.get('url'))
@@ -648,7 +589,6 @@ def write_research_report(directory, results, costs, commentary):
         label = discovery.split(' (')[0]
         counts['discovery'][label] = counts['discovery'].get(label, 0) + 1
 
-    # Caveats written by code from the cited passages, identical to the workbook's Review Notes and leads.json.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.agents/skills/lead-sourcing/scripts'))
     import client_caveats
     notes = client_caveats.caveats(results)

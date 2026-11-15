@@ -5543,6 +5543,41 @@
         "usdPerUnit": 0
       },
       "callable": true
+    },
+    "contextdev_get_web_competitors": {
+      "toolId": "contextdev_get_web_competitors",
+      "provider": "contextdev",
+      "description": "Find a company's direct competitors from its domain, using its website and web search evidence. Returns each competitor's name, domain, a one-line description, a confidence label and source URLs.",
+      "inputSchema": {
+        "description": "Analyze a company's landing page and web search evidence to return direct competitors for the same product or market.",
+        "fields": [
+          {
+            "description": "Company domain to analyze, such as `stripe.com`. Full http(s) URLs are accepted and normalized to their domain.",
+            "name": "domain",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "default": 5,
+            "description": "Exact number of direct competitors to return. Defaults to 5; at most 10.",
+            "name": "numCompetitors",
+            "required": false,
+            "type": "integer"
+          }
+        ]
+      },
+      "pricing": {
+        "creditsPerUnit": 0.14,
+        "currency": "USD",
+        "details": [
+          "About 0.093 Deepline credits per call; the bound leaves a margin."
+        ],
+        "displayText": "At most 0.14 Deepline credits / $0.014 per call",
+        "summary": null,
+        "unit": "call",
+        "usdPerUnit": 0.014
+      },
+      "callable": true
     }
   }
 }

@@ -1,4 +1,3 @@
-"""Check saved LinkedIn company facts against this run's HarvestAPI company getter receipts."""
 
 from __future__ import annotations
 
@@ -15,15 +14,13 @@ from run_coordination import company_key
 
 
 def _linkedin_url(value: Any, kind: str) -> bool:
-    """Require a direct LinkedIn /company/ (or /in/) URL, not a post, search or lookalike host."""
     return isinstance(value, str) and re.fullmatch(
-        rf"https?://(?:[a-z0-9-]+\.)*linkedin\.com/{kind}/[\w%~.'&-]+/?(?:[?#][^\s]*)?",  # As company_links.LINK reads them.
+        rf"https?://(?:[a-z0-9-]+\.)*linkedin\.com/{kind}/[\w%~.'&-]+/?(?:[?#][^\s]*)?",
         value.strip(), re.IGNORECASE,
     ) is not None
 
 
 def employee_range_bounds(value: Any) -> Optional[tuple[int, Optional[int]]]:
-    """Read a published range without converting a member count into a band."""
     if not isinstance(value, str):
         return None
     value = re.sub(r"[\s,]", "", value).replace("–", "-").replace("—", "-")
@@ -43,8 +40,6 @@ def _text(value):
 
 
 def identity_page(company):
-    """The LinkedIn page that identifies a company for other records: its getter's own page only. A link saved from
-    the company's own site shows what the site links, which may be a network's or a brand's page."""
     return company.get("linkedin_url") if isinstance(company, dict) and "linkedin_url_evidence" not in company else None
 
 
@@ -56,14 +51,11 @@ def _domain_key(value):
 
 
 def searched_without_website(receipt, record):
-    """A getter asked to search by name returns LinkedIn's best match. With no website, that record cannot show it
-    is the searched company's, so it never identifies a company; a getter asked for a page keeps its own record."""
     payload = ((receipt.get("attempt") or {}).get("request") or {}).get("payload")
     return isinstance(payload, dict) and "search" in payload and not record.get("domain")
 
 
 def company_record(run_file, source, url, routes):
-    """The company record this run's HarvestAPI company getter returned for the LinkedIn page at url."""
     rid = source.get("route_id")
     if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", rid):
         raise ValueError("requires a saved HarvestAPI route ID")
@@ -89,8 +81,6 @@ def company_record(run_file, source, url, routes):
     response = receipt.get("provider_response")
     if not isinstance(response, dict) or "body" not in response:
         raise ValueError("requires the captured HarvestAPI response body")
-    # Reuse provider normalization on the captured body. Reviewer-authored
-    # evidence text and edited normalized results cannot supply field values.
     normalized = deepline._execute_output(response["body"], tool, "company")
     if normalized.get("status") not in {"ok", "partial"}:
         raise ValueError("captured HarvestAPI response did not return usable company data")
@@ -107,17 +97,13 @@ def company_record(run_file, source, url, routes):
 
 
 def linkedin_receipt_errors(document, run_file, *, fill_missing=False):
-    """A saved LinkedIn employee range must match this company's own getter receipt.
-
-    Read-only by default; review saves may fill a missing range before validation.
-    """
     if not isinstance(document, dict) or not isinstance(document.get("accepted", []), list):
         return ["results must be an object with an accepted array"]
     errors = []
     for index, row in enumerate(document.get("accepted", [])):
         company = row.get("company") if isinstance(row, dict) else None
         if not isinstance(company, dict) or not ("employee_range" in company or "employee_range_evidence" in company):
-            continue  # LinkedIn company facts are optional; the structural contract reports a missing company.
+            continue
         path = f"accepted[{index}].company"
         evidence = company.get("employee_range_evidence")
         evidence = evidence if isinstance(evidence, dict) else {}
@@ -136,7 +122,7 @@ def linkedin_receipt_errors(document, run_file, *, fill_missing=False):
         if fill_missing and not supplied and actual:
             company["employee_range"] = supplied = actual
         if actual is None and supplied is None:
-            continue  # The record states no range; it still identifies the company and its LinkedIn page.
+            continue
         if employee_range_bounds(actual) is None or employee_range_bounds(supplied) != employee_range_bounds(actual):
             errors.append(f"{path}.employee_range must match the saved HarvestAPI LinkedIn value ({actual!r})")
     return errors

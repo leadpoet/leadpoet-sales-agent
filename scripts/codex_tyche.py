@@ -18,7 +18,7 @@ import time
 try:
     from .run_costs import (MODEL_PRICING, UsageReceipt, cancel_on_signals, cancellation_held,
                             execute_with_usage, save_report)
-except ImportError:  # Direct CLI invocation.
+except ImportError:
     from run_costs import (MODEL_PRICING, UsageReceipt, cancel_on_signals, cancellation_held,
                            execute_with_usage, save_report)
 
@@ -27,22 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = ROOT / '.agents' / 'skills'
 sys.path.insert(0, str(SKILL_ROOT / 'lead-sourcing' / 'scripts'))
 CODEX_VERSION = '0.154.0'
-# DeepSeek V4.1 Flash is the model in and out of Leadpoet's Arena (Gavin, 2026-10-27). On round 10-23's ICPs it matched
-# Luna on quality at about the same cost per company (tc35), and it returns its full reasoning, which Leadpoet's
-# full-thinking rounds require. The Codex login does not serve it, so a run needs a host's model route
-# (CODEX_PROVIDER_OVERRIDES, such as ARETE's bridge); TYCHE_MODEL=gpt-5.6-luna runs Luna on the login. gpt-6-luna is
-# priced and selectable, but on 2026-09-22 the pinned Codex 0.154.0 did not receive it in this login's model list and
-# the backend refused its first turn (docs/model-comparison-gpt-6-luna-2026-09-22.md).
 DEFAULT_MODEL = 'deepseek/deepseek-v4.1-flash-1017'
-# One setup per model, read by this launcher and by the Leadpoet Arena host (tyche_arena/host.py), so the two run a
-# model alike; scripts/test_model_parity.py fails on any other difference than its listed Arena-only ones.
-# - route_id: the model's id on a host route (OpenRouter's name); the Codex login uses the key.
-# - route_only: the login does not serve it, so a run needs a host's model route and no login model listing.
-# - code_mode: Codex 0.154.0 runs its own models in code mode, where MCP tools are reached only inside a JavaScript
-#   exec cell. Any other model gets fallback metadata and calls each TYCHE tool as a plain function whose schema is
-#   already in the request, so exec wording and the exec tool card would mislead it.
-# - service_tier: Fast is an OpenAI tier; a routed model has none.
-# - context_window: for a model Codex has no metadata for, gpt-5.6-luna's window, so Codex sizes its history alike.
 MODEL_SETUPS = {
     'gpt-5.6-luna': {'route_id': 'openai/gpt-5.6-luna', 'route_only': False, 'code_mode': True,
                      'service_tier': 'fast', 'context_window': None},
@@ -54,7 +39,6 @@ MODEL_SETUPS = {
 
 
 def selected_model(environ=os.environ):
-    """The pinned sourcing model; TYCHE_MODEL runs another model on the same revision (main() checks its pricing)."""
     return environ.get('TYCHE_MODEL') or DEFAULT_MODEL
 
 
@@ -65,7 +49,6 @@ def require_priced_model(model):
 
 
 def saved_run_model_conflict(request_file, model):
-    """A resumed run keeps the model its receipts were written under; mixing models is refused, not averaged."""
     models = set()
     for path in (Path(request_file).resolve().parent / 'model-usage').glob('*.json'):
         try:
@@ -83,33 +66,17 @@ def saved_run_model_conflict(request_file, model):
 
 
 MODEL = selected_model()
-SETUP = MODEL_SETUPS.get(MODEL, {})  # main() refuses a model without a setup before anything uses it.
-REASONING_EFFORT = 'high'
+SETUP = MODEL_SETUPS.get(MODEL, {})
+REASONING_EFFORT = 'medium'
 SERVICE_TIER = SETUP.get('service_tier')
 CODE_MODE = SETUP.get('code_mode', True)
-# Hosted web search is on for every host. The model rarely calls it (once in four tc35 DeepSeek runs), but without a
-# hosted tool in the request Fireworks decodes tool arguments against their schemas, and Arena runs with it off scored
-# lower (tc36, tc37). Leadpoet's merged policy (PR 732, b967993) accepts it on its DeepSeek routes, and PR 784
-# (a11c966) replays Codex's completed searches in the form OpenRouter accepts.
 WEB_SEARCH = 'live'
-# A refused accept is saved as a hold, and a company refused this many reviews in a row is held so its worker moves on
-# (ResearchTools.refusal_limit). In tc35, 281 of 414 refused company reviews came after six in a row for that company;
-# 2 of 76 companies were accepted after so many. A hold is not a loss: a held company can still take an empty slot,
-# while each refused review is a costly call that delays the next candidate. Time, not budget, ends most runs.
-# A refused review is one model turn and a new company about seven minutes. At 3 a local run on 11-02 held McCANN Canada,
-# fully proved and qualified for two entries, over quote formatting.
 REVIEW_REFUSAL_LIMIT = 6
 
 
 def codex_settings():
-    """The Codex settings every host sends for the selected model (the Arena host through Leadpoet's runtime)."""
     settings = {'model': MODEL, 'model_reasoning_effort': REASONING_EFFORT, 'web_search': WEB_SEARCH,
-                # One research worker per Codex session (the supervisor runs parallel workers itself), text only.
-                # features.multi_agent=false alone does not override Luna's model metadata.
                 'agents.enabled': False, 'features.multi_agent_v2': False, 'features.image_generation': False,
-                # The question-to-the-user tool works only in Plan mode, yet the pinned client describes it in every
-                # request (1.4K of the first request's 43.7K characters, 2026-09-29). The image viewer stays: the
-                # worker inspects the delivery preview.
                 'tools.experimental_request_user_input.enabled': False}
     if SERVICE_TIER:
         settings['service_tier'] = SERVICE_TIER
@@ -119,42 +86,26 @@ def codex_settings():
 
 
 def research_environment():
-    """The research settings every host gives its workers and TYCHE's tool server."""
     return {'TYCHE_REVIEW_REFUSAL_LIMIT': str(REVIEW_REFUSAL_LIMIT),
-            **({} if CODE_MODE else {'TYCHE_CODE_MODE': '0'})}  # Plain function tools: no exec directive.
+            **({} if CODE_MODE else {'TYCHE_CODE_MODE': '0'})}
 
 
 def standing_instructions():
-    """The worker's standing instructions, with the exec tool card only for a model in code mode."""
     return worker_instructions() if CODE_MODE else ISOLATION_INSTRUCTIONS
 
 
-# Fresh review packets exceed the default tool-history limit; research keeps its default.
 FINAL_REVIEW_TOOL_OUTPUT_TOKENS = 100_000
-# A host such as ARETE may route this run's model requests through its own loopback bridge (to OpenRouter) instead of
-# the Codex login: a JSON object of Codex provider settings. See provider_overrides().
 PROVIDER_ENV = 'CODEX_PROVIDER_OVERRIDES'
 _PROVIDER_ID = re.compile(r'[a-z0-9_-]{1,40}')
-# Every provider setting accepted, with its type. Anything else (auth.command runs a host program; env_key,
-# env_http_headers and query_params send environment values upstream) is refused.
 _PROVIDER_FIELDS = {'name': str, 'base_url': str, 'http_headers.Authorization': str, 'wire_api': str,
                     'requires_openai_auth': bool, 'supports_websockets': bool, 'supports_standalone_web_search': bool,
                     'request_max_retries': int, 'stream_max_retries': int, 'stream_idle_timeout_ms': int}
-# Required, with exactly these values: the Responses wire, no OpenAI login, and no resent request.
 _PROVIDER_FIXED = {'wire_api': 'responses', 'requires_openai_auth': False, 'request_max_retries': 0,
                    'stream_max_retries': 0}
 _LOOPBACK_URL = re.compile(r'http://(127\.0\.0\.1|localhost):\d{1,5}(/[A-Za-z0-9_./-]*)?')
 
 
 def provider_overrides(environ=os.environ):
-    """The host's Codex provider for this run as `-c` overrides, or [] when none is set.
-
-    Only `model_provider` and the listed settings of that provider are accepted, so the switch changes where model
-    requests go and nothing else (sandbox, tools and instructions stay TYCHE's). The provider must be a loopback bridge
-    on the Responses wire that needs no OpenAI login and never resends a request: a failed paid request has an unknown
-    bill, so `request_max_retries` and `stream_max_retries` are 0. The values can hold the bridge's per-run token, so
-    an error never echoes them.
-    """
     raw = environ.get(PROVIDER_ENV)
     if not raw:
         return []
@@ -185,7 +136,6 @@ def provider_overrides(environ=os.environ):
 
 
 def model_support_error(listed, model, effort, service_tier):
-    """Why the runtime's own model list cannot run the pinned selection; None when it can."""
     entry = next((m for m in listed if m.get('id') == model), None)
     if entry is None:
         return (f'Codex {CODEX_VERSION} does not receive model {model!r} in this login\'s model list '
@@ -200,7 +150,6 @@ def model_support_error(listed, model, effort, service_tier):
 
 
 def listed_models(request):
-    """Every page of the app-server's model list; a malformed reply is an error, never an empty list."""
     models, cursor, ident = [], None, 5
     while True:
         reply = request(ident, 'model/list', {'cursor': cursor} if cursor else {})
@@ -210,19 +159,11 @@ def listed_models(request):
         cursor, ident = reply.get('nextCursor'), ident + 1
         if not cursor or ident > 25:
             return models
-FINALIZATION_SECONDS = 600
+FINALIZATION_SECONDS = 300
 STARTUP_SECONDS = 600
-WIND_DOWN_SECONDS = 120  # Research closes this long before an explicit time limit.
-# After an early exit, no new research session starts this close to research closing: it could do little research
-# and risks being stopped at the hard deadline, where its usage never reconciles. (The parallel pool is not covered.)
+WIND_DOWN_SECONDS = 120
 MIN_RESEARCH_SECONDS = 300
-# A spent budget leaves no paid call to stop (dispatch refuses each one): only the worker's own turn, whose usage
-# reconciles when it ends that turn itself and is lost when the turn is killed. So the worker is asked to end it, its
-# tools refusing every call, and is stopped only if it has not ended this long after the request.
 STOP_GRACE_SECONDS = 120
-# Every provider charge is admitted against the cap. A Deepline call with no catalog price is
-# admitted at a provisional hold and settled at its exact bill; any other call with no documented
-# price bound is refused. Saved with the run; a resumed run keeps its own setting.
 UNPRICED_CALLS = 'hold'
 MAX_UNCHANGED_EXITS = 5
 DEFAULT_WORKERS = 1
@@ -234,7 +175,6 @@ def saved_run(request_file):
 
 
 def original_start(request_file, fallback):
-    """Even a restart before tyche_start must not receive a fresh clock."""
     document = saved_run(request_file)
     if document is not None:
         return document['stop_check']['started_at']
@@ -263,18 +203,16 @@ def research_deadline(request_file, started_at):
 
 
 def research_close(request_file):
-    """When research stops opening for the saved run (its deadline less the saved closing window), or None."""
     from validate_run import research_closes
     document = saved_run(request_file)
     try:
         closes = research_closes(document) if document is not None else None
     except ValueError:
-        return None  # The stop check reports a malformed window.
+        return None
     return closes.timestamp() if closes is not None else None
 
 
 def authorize_resume(request_file, until, reason):
-    """Operator-only amendment: keep request, original start and ledger intact."""
     import budget_guard
     from validate_run import research_closes, run_deadline
     if not isinstance(reason, str) or not reason.strip():
@@ -292,7 +230,7 @@ def authorize_resume(request_file, until, reason):
             raise ValueError('This run has no research deadline to extend')
         extensions = document['stop_check'].get('research_extensions', [])
         if extensions and revised == deadline and extensions[-1]['authorization'] == reason:
-            return  # Retrying the same launch cannot grant additional time.
+            return
         if revised <= deadline:
             raise ValueError('--resume-until must extend the saved deadline')
         errors = budget_guard.audit_ledger(run_file, document, state=state, allow_pending=True)
@@ -303,22 +241,18 @@ def authorize_resume(request_file, until, reason):
             'recorded_at': datetime.now(timezone.utc).isoformat(), 'authorization': reason})
         run_deadline(document)
         if research_closes(document) <= datetime.now(timezone.utc):
-            # Raising here leaves the saved run untouched: nothing is recorded as granted.
             raise ValueError('--resume-until must leave research time: this run closes research '
                              + str(document['stop_check'].get('closing_seconds', 0)) + ' seconds before its deadline')
 
 
 def cost_stop(request_file, active_model_receipt=None):
-    """The same observed-cost threshold used by provider dispatch."""
     import budget_guard
     run_file = Path(request_file).resolve().parent / 'results.json'
     if not run_file.exists():
-        return None  # The first response initializes the authoritative run.
+        return None
     state = budget_guard.load_ledger(run_file)
     if state is None or state['version'] != 2:
         return None
-    # Settlement precedes response/route persistence. Let both writes finish
-    # before terminating the worker that owns the dispatch.
     document = saved_run(request_file)
     recorded = {r['route_id'] for r in document.get('routes', [])}
     if (any(c.get('state') == 'in_flight' for c in state['calls'].values())
@@ -326,14 +260,9 @@ def cost_stop(request_file, active_model_receipt=None):
         return None
     reason = budget_guard.spending_stop(state, accepted_count=len(document['accepted']),
                                        active_model_receipt=active_model_receipt)
-    # Provider dispatch is already paused. Let the current model response close
-    # its usage normally before billing recovery; killing it would create a
-    # second, irrecoverable missing-usage problem solely from a delayed bill.
     if active_model_receipt and reason == 'billing_pending':
         return None
     if active_model_receipt and reason == 'budget_exhausted':
-        # The same holds for a spent budget: ask the worker to end its turn (its tools now refuse every call, so
-        # nothing more is saved) and stop it only after the grace. 2026-10-13: 7 of 139 sessions were killed here.
         request = budget_guard.request_stop(run_file, active_model_receipt, reason)
         if time.time() < request['requested_at'] + STOP_GRACE_SECONDS:
             return None
@@ -341,7 +270,6 @@ def cost_stop(request_file, active_model_receipt=None):
 
 
 def supervise_worker(command, request_file, env, profile, *, host=None):
-    """Continue saved research, not paid calls. Completion is a checked artifact."""
     import run_coordination as coordination
     host = host or LocalHost()
     run_file = Path(request_file).resolve().parent / 'results.json'
@@ -367,15 +295,12 @@ def supervise_worker(command, request_file, env, profile, *, host=None):
 
 
 def recover_stopped_workers(run_file, *, receipts_directory='model-usage'):
-    """Only the exclusive supervisor may close abandoned invocation state."""
     import run_coordination as coordination
     state = coordination.snapshot(run_file)
     if state:
         for worker in state['workers'].values():
             if worker['status'] == 'running' and not (run_file.parent / receipts_directory / (worker['generation'] + '.json')).is_file():
                 raise ValueError('Running worker receipt is missing; preserve invocation state')
-    # A killed supervisor may leave its child process group alive. Never reuse
-    # ownership until that group is gone, even if the saved receipt says stopped.
     for path in (run_file.parent / receipts_directory).glob('*.json'):
         receipt = json.loads(path.read_text())
         if not isinstance(receipt, dict):
@@ -428,8 +353,6 @@ def _supervise_worker(command, request_file, env, profile, *, host=None):
     while True:
         document = saved_run(request_file)
         if attempt and document is None:
-            # No authoritative budget exists yet. Preserve the first worker's
-            # usage, but never spend on automatic retries of incomplete setup.
             blocked = {'reason': 'run_not_initialized',
                 'resume': 'Repair startup before explicitly resuming this saved request. Preserve its clock and usage receipts.'}
             startup_status = run_file.parent / 'operational-status.json'
@@ -465,19 +388,14 @@ def _supervise_worker(command, request_file, env, profile, *, host=None):
             return 1
         closes = research_close(request_file)
         if attempt and not terminal and closes is not None and closes - time.time() < MIN_RESEARCH_SECONDS:
-            # A replacement for a session that ended early would be stopped at the hard deadline, and a stopped
-            # session's model usage never reconciles, which blocks delivery of everything already reviewed. Let
-            # research close, then review.
             waits = [moment - time.time() for moment in (closes, limit) if moment is not None and moment > time.time()]
             print(json.dumps({'waiting_for_research_to_close': round(min(waits) + 1 if waits else 1),
                               'reason': 'too_little_research_time_for_a_new_session'}), flush=True)
             time.sleep(min(waits) + 1 if waits else 1)
             continue
         if not terminal:
-            # A semantic review may demote a row after reaching the target.
-            # Re-evaluate the saved clock/budget; finalization is not a new stop reason.
             if finishing_until is not None:
-                failed_exits = 0  # A resumed research phase does not inherit review failures.
+                failed_exits = 0
             finishing_until = None
             if int(env.get('TYCHE_PARALLEL_WORKERS', '1')) > 1:
                 try:
@@ -491,16 +409,15 @@ def _supervise_worker(command, request_file, env, profile, *, host=None):
                 attempt += 1
                 continue
         elif finishing_until is None:
-            # Review may use the original remaining time. The short grace is
-            # for runs at their deadline, not an earlier cap on a valid repair.
+            if stop == 'target_met' and callable(getattr(host, 'bonus_pass', None)):
+                host.bonus_pass(request_file, env)  # Arena only (tyche_arena/host.py); bounded by the research deadline
             finishing_until = max(time.time(), limit or 0) + FINALIZATION_SECONDS
-            failed_exits = 0  # A fresh review does not inherit research worker failures.
+            failed_exits = 0
         if finishing_until is not None and time.time() >= finishing_until:
             write_worker_status(request_file, {'status': 'blocked', 'delivery_allowed': False,
                 'reason': 'finalization_timeout', 'run_file': str(run_file),
                 'resume': 'Review/export saved evidence only; do not reopen sourcing or reset accounting.'})
             return 1
-        # Research and final review use separate contexts, sharing the same run.
         worker_env = dict(env, TYCHE_FINALIZATION_ONLY='1' if terminal else '0')
         worker_command = list(command)
         if attempt or terminal:
@@ -534,9 +451,6 @@ def _supervise_worker(command, request_file, env, profile, *, host=None):
             status.update(status='blocked', reason=execution.get('cleanup_error') or failure)
             write_worker_status(request_file, status)
             return 1
-        # An open research turn may fail after research has closed. Its failure
-        # must not consume the fresh final review's failure allowance: the
-        # saved clock now permits review, not a replacement research turn.
         closed = research_close(request_file) if not terminal and execution.get('exit_code') else None
         handoff_after_failure = closed is not None and time.time() >= closed
         if handoff_after_failure:
@@ -560,7 +474,6 @@ def _supervise_worker(command, request_file, env, profile, *, host=None):
 
 
 class LocalHost:
-    """Local authentication, usage receipts and workbook delivery for the shared loop."""
 
     receipts_directory = 'model-usage'
 
@@ -570,7 +483,6 @@ class LocalHost:
 
     @staticmethod
     def execute_research(command, request_file, env, receipt, **options):
-        # Import at invocation time, as the original pool did.
         try:
             from .run_costs import execute_with_usage
         except ImportError:
@@ -599,7 +511,7 @@ class LocalHost:
         if ledger and ledger['version'] == 2:
             from billing_reconciliation import reconcile
             billing_until = time.monotonic() + 120
-            reconcile(run_file)  # Read-only settlement also helps stopped/incomplete runs.
+            reconcile(run_file)
             if cost_stop(request_file) == 'billing_pending':
                 from billing_reconciliation import wait_for_billing
                 write_worker_status(request_file, {'status': 'waiting', 'delivery_allowed': False,
@@ -612,7 +524,7 @@ class LocalHost:
             if reason == 'budget_exhausted':
                 from run_attempt import save_stop_checkpoint
                 audit = save_stop_checkpoint(run_file)
-            update(run_file)  # Preserve reviewed partial output without another model turn.
+            update(run_file)
             return {'status': 'stopped', 'delivery_allowed': False,
                 'reason': reason, 'run_file': str(run_file), 'stop_validation': audit,
                 'partial_output': str(run_file.parent / 'leads.json'),
@@ -655,7 +567,6 @@ def write_worker_status(request_file, status):
 
 
 def close_worker(request_file, receipt, environment=None):
-    """One local export recovery after explicit review; never relaunch research."""
     directory = Path(request_file).resolve().parent
     path = directory / 'results.json'
     from research_tools import ResearchTools
@@ -675,7 +586,6 @@ def close_worker(request_file, receipt, environment=None):
             return False
         saved = json.loads(validation.read_text())
         current = json.loads(path.read_text())
-        # A host that bound workbook false (request-options.json) takes results.json only: no workbook is saved.
         wants_workbook = current.get('request', {}).get('workbook', True) is not False
         if wants_workbook and not workbook.exists():
             return False
@@ -699,11 +609,8 @@ def close_worker(request_file, receipt, environment=None):
         reviewed = (document.get('final_review', {}).get('review_ref') == review_fingerprint(document)
                     and current_invocation(document.get('final_review', {}).get('reviewed_at')))
         if not delivered() and reviewed and receipt.data.get('failure_kind') != 'cancelled':
-            # The agent already approved this exact research. Retry only the
-            # deterministic finish, once, with existing budget/evidence gates.
             status['finish_recovery'] = ResearchTools(path, environment=environment).finish()
         if delivered():
-            # Export success and reaching the requested count are different outcomes.
             document = json.loads(path.read_text())
             status['accepted_count'] = len(document['accepted'])
             status['target_count'] = document['request']['target_count']
@@ -745,7 +652,6 @@ ISOLATION_INSTRUCTIONS = (
 
 
 def worker_instructions():
-    """The isolated worker's standing instructions: the rules above and the exact exec call for each native tool."""
     from research_tools import native_tool_card
     return ISOLATION_INSTRUCTIONS + ' ' + native_tool_card()
 
@@ -762,7 +668,6 @@ SMOKE_PROMPT = (
 
 
 def codex_binary(env):
-    """Use the pinned released client, without changing the global CLI."""
     installed = ROOT / '.runtime/node_modules/.bin/codex'
     binary = env.get('TYCHE_CODEX_BINARY') or (str(installed) if installed.is_file() else 'codex')
     version = subprocess.run([binary, '--version'], env=env, capture_output=True,
@@ -786,14 +691,6 @@ HOST_SANDBOX_ENV = 'TYCHE_HOST_SANDBOX'
 
 
 def host_sandbox_overrides(environ=os.environ):
-    """The session sandbox a host sets with TYCHE_HOST_SANDBOX, as `-c` overrides (last, so they win over the project
-    config); [] when unset, so every other host is unchanged.
-
-    readonly-shell is for a Linux host whose containers can neither create user namespaces nor run Codex's
-    workspace-write profile on Landlock (Railway): the model's session runs on Codex's Landlock backend read-only with
-    no network, so its shell can read but never write or reach the internet, and the managed proxy is off. TYCHE's own
-    tool worker, the only code that calls Deepline and ScrapingDog, then runs outside Codex's sandbox (tyche_tools.py).
-    Any other value refuses the launch."""
     mode = environ.get(HOST_SANDBOX_ENV)
     if not mode:
         return []
@@ -804,8 +701,6 @@ def host_sandbox_overrides(environ=os.environ):
 
 
 def host_wants_workbook(exec_file):
-    """False when the host bound workbook false in request-options.json beside the request (it takes results.json
-    only), so the Codex workbook runtime is not needed. An unreadable file is left to the run's own strict check."""
     options = Path(exec_file).resolve().parent / 'request-options.json'
     try:
         return json.loads(options.read_text(encoding='utf-8')).get('workbook', True) is not False
@@ -814,7 +709,6 @@ def host_wants_workbook(exec_file):
 
 
 def workspace_environment(env):
-    """Use configured paths or the installed desktop bundle, without downloads."""
     env = dict(env)
     bundle = Path.home() / '.cache/codex-runtimes/codex-primary-runtime/dependencies'
     defaults = {
@@ -831,12 +725,6 @@ def workspace_environment(env):
 
 
 def tool_configuration(run_file, *, readonly=False):
-    """Bind the MCP process to this run and the existing command sandbox.
-
-    The stdio relay obtains sandbox metadata from Codex on the first tool call.
-    Research executes in its child with that exact filesystem/network policy, or, on a Linux host in readonly-shell
-    mode (host_sandbox_overrides), outside the session's read-only, no-network sandbox.
-    """
     args = [str(SKILL_ROOT / 'lead-sourcing/scripts/tyche_tools.py'),
             '--run-file', str(Path(run_file).resolve())]
     if readonly:
@@ -856,23 +744,16 @@ def tool_configuration(run_file, *, readonly=False):
 
 
 def isolation_overrides():
-    """The pinned model and the settings that keep the isolated worker's prompt to TYCHE's own context.
-
-    Pin the isolated runner's model selection instead of inheriting the user's current Codex default, keeping the
-    repository's shared model setup (codex_settings) consistent for isolated sourcing.
-    """
     overrides = [part for key, value in codex_settings().items() for part in ('-c', key + '=' + json.dumps(value))]
     for feature in ('plugins', 'apps', 'memories', 'hooks', 'shell_snapshot'):
         overrides.extend(['--disable', feature])
     overrides.extend(['-c', 'developer_instructions=' + json.dumps(standing_instructions())])
-    # Last, so the runtime check, the smoke test and every worker use the same provider as the run.
     overrides.extend(provider_overrides())
     overrides.extend(host_sandbox_overrides())
     return overrides
 
 
 def inspect_runtime(env, overrides, start_thread=False, native_tools=False):
-    """Use the installed runtime's discovery results, not a filesystem guess."""
     messages = queue.Queue()
     with tempfile.TemporaryFile(mode='w+') as errors:
         proc = None
@@ -904,8 +785,6 @@ def inspect_runtime(env, overrides, start_thread=False, native_tools=False):
             raise RuntimeError(f'Codex timed out during {method}; no test was launched.')
 
         try:
-            # A cancel cannot land between starting the app-server and owning it; a held one is raised
-            # inside this try, so the finally below stops the server.
             with cancellation_held():
                 proc = subprocess.Popen(
                     [env.get('TYCHE_CODEX_BINARY', 'codex'), 'app-server', '--stdio', *overrides], cwd=ROOT, env=env,
@@ -928,9 +807,6 @@ def inspect_runtime(env, overrides, start_thread=False, native_tools=False):
             ]
             result = {'skills': skills}
             if start_thread:
-                # Inherit the same project sandbox/network configuration as
-                # the real execution. A read-only override hid proxy startup
-                # failures that occurred only when sourcing enabled networking.
                 started = request(3, 'thread/start', {
                     'cwd': str(ROOT), 'ephemeral': True,
                 })
@@ -938,8 +814,6 @@ def inspect_runtime(env, overrides, start_thread=False, native_tools=False):
                     raise RuntimeError('This Codex version cannot report loaded instruction sources.')
                 result['instruction_sources'] = started['instructionSources']
                 result['model'] = started.get('model')
-                # The runtime's own list decides support; a thread echoes the configured name even for
-                # a model it cannot run (fallback metadata, omitted service tier, refused first turn).
                 result['models'] = listed_models(request)
                 result['native_tools'] = []
                 if native_tools:
@@ -965,7 +839,6 @@ def inspect_runtime(env, overrides, start_thread=False, native_tools=False):
 
 
 def smoke(command, env):
-    """A model exit code alone cannot prove the native tool actually worked."""
     completed = subprocess.run(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, timeout=120)
     print(completed.stdout, end='', flush=True)
@@ -995,7 +868,7 @@ def smoke(command, env):
 
 
 def main():
-    cancel_on_signals()  # Before any child starts, so every stop runs the cleanup that ends owned workers.
+    cancel_on_signals()
     launched_at = datetime.now(timezone.utc).isoformat()
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -1032,7 +905,7 @@ def main():
         if conflict:
             raise RuntimeError(conflict)
         from validate_run import refuse_earlier_results
-        refuse_earlier_results(args.exec_file.resolve().parent / 'results.json')  # Before anything is written there.
+        refuse_earlier_results(args.exec_file.resolve().parent / 'results.json')
     if not SETUP:
         raise RuntimeError(f'Model {MODEL!r} has no entry in MODEL_SETUPS; nothing was launched.')
     if SETUP['route_only'] and not provider_overrides():
@@ -1040,8 +913,6 @@ def main():
                            'TYCHE_MODEL=gpt-5.6-luna runs on the Codex login. Nothing was launched.')
 
     source_home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).resolve()
-    # Give CODEX_HOME its documented meaning only in the child process. The
-    # parent environment and the user's global instruction/config files stay intact.
     with tempfile.TemporaryDirectory(prefix='tyche-codex-home-') as profile:
         tyche_codex_home = Path(profile)
         native_tools = args.exec_file is not None or args.check or args.smoke
@@ -1052,19 +923,15 @@ def main():
             + (tool_configuration(tool_run_file, readonly=args.check or args.smoke) if native_tools else '')
         )
         routed = bool(provider_overrides())
-        # With a host's model route, no login enters the profile: a request that skipped the route would fail
-        # instead of running unrecorded on the login.
         for name in ('rules',) if routed else ('auth.json', 'rules'):
             source = source_home / name
             if source.exists():
                 (tyche_codex_home / name).symlink_to(source, target_is_directory=source.is_dir())
-        # Research uses the installed CLI and project skill. CLI self-updates
-        # and global skill sync can contact npm or alter context mid-run.
         env = dict(os.environ, CODEX_HOME=profile, TYCHE_ISOLATED_RUN='1',
                    DEEPLINE_NO_AUTO_UPDATE='1', DEEPLINE_SKIP_SKILLS_SYNC='1',
                    TYCHE_RUN_STARTED_AT=launched_at, TYCHE_WIND_DOWN_SECONDS=str(WIND_DOWN_SECONDS),
                    TYCHE_UNPRICED_CALLS=UNPRICED_CALLS, **research_environment())
-        env.pop(PROVIDER_ENV, None)  # the route reaches Codex as -c settings only, never its shell's environment
+        env.pop(PROVIDER_ENV, None)
         env = workspace_environment(env)
         if args.budget_policy:
             env['TYCHE_BUDGET_POLICY'] = args.budget_policy
@@ -1089,7 +956,6 @@ def main():
         if verified.get('model') != MODEL:
             raise RuntimeError(f'Codex started with model {verified.get("model")!r} instead of the pinned {MODEL!r}; '
                                'no fallback was launched. Check the pinned Codex version and the account model list.')
-        # A route-only model is not in the login's list; its host route decides what it supports.
         unsupported = None if SETUP['route_only'] else model_support_error(verified['models'], MODEL,
                                                                            REASONING_EFFORT, SERVICE_TIER)
         if unsupported:
@@ -1119,8 +985,6 @@ def main():
             raise RuntimeError('No reusable file-based Codex login. Run codex login first, or use a separately authenticated profile.')
 
         if args.smoke or args.exec or args.exec_file is not None:
-            # File-based runs retain a journal only inside this temporary
-            # profile, long enough to capture numeric per-response usage.
             command = [env['TYCHE_CODEX_BINARY'], 'exec', *([] if args.exec_file is not None else ['--ephemeral']), *overrides]
             if args.exec_file is not None or args.smoke:
                 command.append('--json')

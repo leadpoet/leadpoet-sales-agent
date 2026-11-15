@@ -1,9 +1,3 @@
-"""Render a Leadpoet ICP as the same request text and host bindings a local run uses.
-
-The model interprets this text with tyche_start exactly as it does locally. The host
-binds only what the caller owns: the original text, exclusion list, total budget
-and research deadline (request-exclusions.json and request-options.json).
-"""
 
 import json
 import re
@@ -11,20 +5,18 @@ from datetime import timedelta
 
 SIGNAL_PREFIX = "Intent signal "
 STAGE_PREFIX = "Required company stage: "
-USD_PER_COMPANY = 0.8
+USD_PER_COMPANY = 1.1
+# TYCHE starts a new run with a zero ScrapingDog credit cap unless a limit is given. Leadpoet bills ScrapingDog at
+# $0.00005 per credit: 20,000 credits is at most $1 of the ICP.
+SCRAPINGDOG_CREDITS = 20_000
+SCRAPINGDOG_USD_PER_CREDIT = 0.00005
+SCRAPINGDOG_ALLOWANCE_FILE = "scrapingdog-allowance.json"  # Read by tyche_arena.tools at tyche_start.
 _UNSET = {"", "any", "all", "unknown", "n/a", "na", "not specified"}
-# What each stage means to Leadpoet's verifier (qualification/scoring/company_evidence_investigator.py), so the
-# worker judges the stage Leadpoet scores. On 2026-10-08 a worker read "Private Equity" as "is a private-equity
-# firm" and published TPG, KKR, Carlyle and Ares, which Leadpoet's definition rejects. On 2026-10-09 workers read
-# "an IPO supersedes it" as meeting the stage and passed Nuix, listed on the ASX since 2020, as Series C+ in all
-# four arms of two rounds; Leadpoet's verifier takes the latest completed event, so a listed company is Public.
-# Leadpoet keeps the newest completed event it finds. On 2026-10-12 reviews held Navro (Series B, May 2025) and Origis
-# (PE-owned since January 2025), both Leadpoet-qualified, for lacking a newer page; no extra lookup is asked for.
 _CURRENT = ("; the newest such event in captured sources stays current unless a captured source shows a later round, "
             "sale or listing, with no need for a newer page restating it")
 _ROUND = ("its latest completed priced-equity round is {}; debt, grants and planned rounds do not count{}; a company "
           "acquired by another company or listed after an IPO is at the Acquired or Public stage instead and fails "
-          "this one" + _CURRENT)  # One sentence, so the worker saves the line whole and the host still matches it.
+          "this one" + _CURRENT)
 _LATER = ", and a later completed round moves it to that round's stage"
 STAGE_MEANINGS = {
     "seed": _ROUND.format("a seed round", _LATER),
@@ -36,7 +28,10 @@ STAGE_MEANINGS = {
                        "captured acquisition or majority stake by that firm stays current unless a captured source "
                        "shows a later sale, listing or exit, with no need for a newer page restating it"),
     "public": ("this company's shares are currently listed, shown by a current exchange and ticker; a 'Public "
-               "Company' label, a planned IPO or an old listing does not count"),
+               "Company' label, a planned IPO or an old listing does not count. A company currently wholly or "
+               "majority owned by a parent whose shares are currently listed also counts, shown by one sentence that "
+               "names both the company and that parent and states the ownership, plus a current exchange and ticker "
+               "for that same parent; a bare parent ticker or a minority stake does not count"),
 }
 
 
@@ -45,7 +40,6 @@ def _text(value):
 
 
 def intent_signals(icp):
-    """The ICP's own signal list, in the order matched_icp_signal indexes."""
     signals = icp.get("intent_signals")
     if not signals and _text(icp.get("intent_signal")):
         signals = [icp["intent_signal"]]
@@ -55,7 +49,6 @@ def intent_signals(icp):
 
 
 def intent_signal_ages(icp):
-    """Per-signal bonus age overrides, with the caller's explicit primary fallback."""
     primary = icp.get("intent_max_age_days")
     primary = primary if type(primary) is int and primary > 0 else None
     bonus = {
@@ -77,12 +70,16 @@ def intent_signal_ages(icp):
 
 
 def company_stage(icp):
-    """The ICP's requested funding stage, or '' when none is required."""
     stage = icp.get("company_stage")
     if isinstance(stage, list):
         stage = next((_text(value) for value in stage if _text(value)), "")
     stage = _text(stage)
     return "" if stage.casefold() in _UNSET else stage
+
+
+def offering(icp):
+    value = _text(icp.get("product_service"))
+    return "" if value.casefold() in _UNSET else value
 
 
 def exclusions(icp):
@@ -92,11 +89,6 @@ def exclusions(icp):
     return [value.strip() for value in values]
 
 
-# How Leadpoet's judge checks a returned company (qualification/scoring/intent_signal_gate.py and
-# company_evidence_investigator.py), so the worker accepts what Leadpoet will score. Blind review of the
-# 2026-10-08 benchmark found stale or recapped signals, careers pages taken as hiring, and HQ errors. On 2026-10-13
-# the most common holds were an unknown stage (46) and an unknown signal (35); the stage and date sentences follow
-# the judge (intent_signal_gate: passage, then URL, then byline date; a page with none fails) and the stage lines.
 JUDGING = ("Before detailed signal research, check any required current company stage. Reuse current captured "
            "evidence; otherwise search the company's latest funding or ownership without filtering the query "
            "to the requested stage. Prefer a company or investor source with a contiguous passage naming the "
@@ -132,13 +124,11 @@ JUDGING = ("Before detailed signal research, check any required current company 
 
 
 def stage_line(stage):
-    """The request's stage line: the stage, with Leadpoet's meaning when it defines one."""
     meaning = STAGE_MEANINGS.get(stage.casefold())
     return STAGE_PREFIX + stage + (" (" + meaning + ")" if meaning else "")
 
 
 def required_attributes(icp):
-    """Exact standalone must-haves emitted in request.txt and bound at startup."""
     value = icp.get("required_attribute")
     if isinstance(value, list):
         value = ", ".join(_text(item) for item in value if _text(item))
@@ -156,15 +146,15 @@ def required_attributes(icp):
 
 
 def request_text(icp, limit):
-    """Plain lines, so each criterion stays verbatim for tyche_start's paraphrase check."""
     if not isinstance(icp, dict):
         raise ValueError("ICP must be an object")
     if not 1 <= limit <= 5:
         raise ValueError("company limit must be 1 through 5")
     lines = [f"Find {limit} companies that match this ideal customer profile; {limit} is the target and an unfilled "
              "slot scores nothing. "
-             f"Budget: USD 0.80 per requested company, USD {USD_PER_COMPANY * limit:.2f} total for this run. "
-             "Intent signal 0 is required; any later intent signals are preferred, not required: do not research them. "
+             f"Budget: USD {USD_PER_COMPANY:.2f} per requested company, USD {USD_PER_COMPANY * limit:.2f} total for this run. "
+             "Intent signal 0 is required; later intent signals are optional bonus points: research one only as the strategy's "
+             "bonus rule allows. "
              "Each company's employee count must be one of the "
              "listed LinkedIn bands, from its own LinkedIn company record; Leadpoet reads that record's current "
              "band, so the band is the company's current size even after an acquisition, merger or change of "
@@ -187,6 +177,11 @@ def request_text(icp, limit):
             value = ", ".join(_text(item) for item in value if _text(item))
         if _text(value) and _text(value).lower() not in {"any", "all", "n/a", "not specified"}:
             lines.append(f"{label}: {_text(value)}")
+    from .output import requested_us_states  # late import: output imports this module
+    allowed = requested_us_states(icp)
+    if allowed and len(allowed) > 1:
+        lines.append("Headquarters states Leadpoet's judge counts for this geography: " + ", ".join(sorted(allowed))
+                     + "; a company headquartered in any other state fails geography, wherever its event happened.")
     stage = company_stage(icp)
     if stage:
         lines.append(stage_line(stage))
@@ -201,24 +196,21 @@ def request_text(icp, limit):
             lines.append(f"Intent signal {index} age limit: {age} days")
     if exclusions(icp):
         lines.append("Excluded companies: " + ", ".join(exclusions(icp)))
+        if offering(icp):
+            lines.append("Discovery hint: the 'What the companies offer' line usually describes the excluded company. "
+                         "Its direct competitors and lookalikes that meet every requirement are the strongest candidates; "
+                         "never return the excluded company itself.")
     example = _text(icp.get("verified_example_company"))
     if example:
         lines.append("Example of a matching company (do not return it): " + example)
     return "\n".join(lines) + "\n"
 
 
-# Round arena-2026-10-15: the qualified companies TYCHE never considered (CopilotKit, usecure) were each named by one
-# dated page about the requested event, often stating the stage too; TYCHE's category and database searches missed
-# them. The opening searches look for those pages first. On TYCHE's round 10-17/10-18 opening queries, Exa's news
-# search within the signal's window named 18 field-qualified companies where the free web search named 3-5
-# (2026-10-20, $0.01 a call); Deepline now publishes its rate, so provider_pricing bounds it.
 OPENING_TOOL = "exa_search"
 _SIGNAL_TAILS = (" in the last", " within the last", " within ", ", per ", ", with ", ", as shown", " per ", " (")
 STAGE_SEARCH_DAYS = 3 * 365
-# 11-01: seven of ten ICPs named no stage and so opened with three searches. On three of them other entries qualified
-# 7, 9 and 7 different companies while ours took 2, 2 and 3 and never returned the rest.
-STAGE_FREE_RESULTS = 25
-COMPANY_LIST_RESULTS = 25
+STAGE_FREE_RESULTS = 50
+COMPANY_LIST_RESULTS = 50
 _STAGE_QUERIES = {
     "seed": "raises seed round",
     "series a": "raises Series A",
@@ -230,11 +222,9 @@ _STAGE_QUERIES = {
 _STAGE_WORDS = {"seed": "seed", "series a": "\"Series A\"", "series b": "\"Series B\"",
                 "series c+": "\"Series C\" OR \"Series D\"", "private equity": "\"private equity\"",
                 "public": "(NYSE OR Nasdaq)"}
-# What reaching a stage looks like in the news, where "raised Public funding" names nobody.
 _STAGE_EVENTS = {"public": "listed on NYSE OR Nasdaq", "private equity": "majority stake acquired by private equity firm"}
 
 
-# How press releases word the events Leadpoet's ICP signals name; matched on the signal's own words, first match wins.
 _PRESS_WORDS = (
     (("certification", "attestation", "accreditation", "compliance"),
      '(achieves OR earns OR awarded) ("ISO 27001" OR "SOC 2" OR "Cyber Essentials" OR certification)'),
@@ -250,14 +240,18 @@ _PRESS_WORDS = (
 )
 
 
+_ANNOUNCED_FACILITY = re.compile(r"\bor announced\b|\bannounced\b[^.;()]*\bexpansion\b", re.I)
+
+
 def _press_words(signal):
-    """Press-release wording for a signal's event, or '' when no common type matches."""
     folded = signal.casefold()
-    return next((words for keys, words in _PRESS_WORDS if any(key in folded for key in keys)), "")
+    words = next((words for keys, words in _PRESS_WORDS if any(key in folded for key in keys)), "")
+    if words.startswith('(opens OR "opened" OR unveils) new (facility') and _ANNOUNCED_FACILITY.search(signal):
+        words = words.replace("unveils)", "unveils OR announces)", 1)
+    return words
 
 
 def _signal_core(signal):
-    """The signal without its age limit or evidence clause."""
     text = " ".join(signal.split())
     return text[:min((text.find(tail) for tail in _SIGNAL_TAILS if text.find(tail) > 0), default=len(text))]
 
@@ -266,44 +260,47 @@ HIRING = re.compile(r"\bhiring\b", re.I)
 
 
 def _signal_event(signal):
-    """The event a signal names, without its age limit, evidence clause or later alternatives."""
     event = _signal_core(signal).split(",")[0].rstrip(" ,.;")
     return event[0].lower() + event[1:] if event else ""
 
 
-def opening_searches(icp, as_of):
-    """Up to six dated news searches for pages that name a company and show intent signal 0 and the stage.
+_GOOGLE_COUNTRY = {"united states": "us", "usa": "us", "united kingdom": "uk", "uk": "uk", "canada": "ca", "australia": "au",
+                   "germany": "de", "france": "fr", "india": "in", "netherlands": "nl", "spain": "es", "italy": "it"}
 
-    Leadpoet only. The searches change where discovery starts, never what TYCHE checks or accepts.
-    """
+
+def google_country(icp):
+    """ScrapingDog's two-letter Google country for the ICP's country, or None."""
+    country = _text(icp.get("country")).casefold()
+    return _GOOGLE_COUNTRY.get(country) or next((code for name, code in _GOOGLE_COUNTRY.items() if name in country), None)
+
+
+def opening_searches(icp, as_of):
     what = _text(icp.get("sub_industry")) or _text(icp.get("industry"))
-    where = _text(icp.get("geography")) or _text(icp.get("country"))  # "Canada, Toronto" over "Canada".
+    where = _text(icp.get("geography")) or _text(icp.get("country"))
     if where.casefold() in _UNSET:
         where = ""
     signal = intent_signals(icp)[0]
     plain_event, plain_stage = _signal_event(signal), company_stage(icp)
-    # Match the event, never its evidence clause: "per a press release" once turned a leadership-change signal into
-    # product-launch wording (round 10-18). The first alternative goes first, so "hiring for engineering, ...,
-    # partnerships ... roles" stays hiring (round 10-17); the whole list still finds "SOC 2, ISO 27001 or certification".
     event = _press_words(_signal_event(signal)) or _press_words(_signal_core(signal)) or _signal_event(signal)
     stage = company_stage(icp).casefold()
     age = intent_signal_ages(icp)[0] or 365
-    options = {"category": "news", "type": "auto", "numResults": 10,
+    options = {"category": "news", "type": "auto", "numResults": 20,
                "startPublishedDate": (as_of - timedelta(days=age)).isoformat() + "T00:00:00Z",
                "endPublishedDate": as_of.isoformat() + "T23:59:59Z"}
     place = (" " + where) if where else ""
     searches = []
-    # A stage is not an event inside the signal's age limit: WRITER's Series C was two years old when it qualified on
-    # 11-01, so a stage search held to the signal's window could never name it.
     stage_options = {**options, "startPublishedDate": (as_of - timedelta(days=STAGE_SEARCH_DAYS)).isoformat() + "T00:00:00Z"}
 
     def search(purpose, query, inputs=options):
         searches.append({"purpose": purpose, "tool": OPENING_TOOL, "inputs": {"query": " ".join(query.split()), **inputs}})
-    # Exa ranks by meaning: the ICP's own words named 14 field-qualified round 10-17/10-18 companies, the press-release
-    # wording below 11, and both together 18 (2026-10-20). Plain wording runs first.
-    company = f"{what} company" + (f" in {where}" if where else "")
+    # "headquartered in": a bare "in <place>" pulls events located there (a plant opened in the region by an
+    # out-of-region company) instead of companies based there (Nov 10 ICP0: 3 of 5 rival-only finds).
+    company = f"{what} company" + (f" headquartered in {where}" if where else "")
     if what and plain_event:
         search("Companies named by dated news about intent signal 0", f"{company} {plain_event}")
+    if offering(icp) and plain_event:
+        search("Companies offering the requested product or service named by dated news about intent signal 0",
+               f"{offering(icp)}{place} {plain_event}")
     if what and plain_event and stage in _STAGE_WORDS:
         search("Companies at the requested stage named by dated news about intent signal 0",
                f"{plain_stage} {company} {plain_event}")
@@ -314,33 +311,70 @@ def opening_searches(icp, as_of):
         search("Companies named by a dated page showing intent signal 0 and the requested stage",
                f"{what}{place} {event} {_STAGE_WORDS[stage]}")
     if what and event:
-        search("Companies named by a dated page showing intent signal 0", f"{what}{place} {event}")
+        # No place words: the event may happen anywhere; headquarters is checked from each company's own record.
+        search("Companies named by a dated page showing intent signal 0", f"{what} {event}")
     if what and stage in _STAGE_QUERIES:
         search("Companies named by a dated page showing the requested stage", f"{what}{place} company {_STAGE_QUERIES[stage]}",
                stage_options)
     if what and HIRING.search(signal):
-        # Every search above is news, and job postings are not: 11-02's four hiring ICPs qualified two companies each.
         searches.append({"purpose": "Companies with an open posting for intent signal 0", "tool": OPENING_TOOL,
                          "inputs": {"query": " ".join(f"{what}{place} {_signal_core(signal)} job opening".split()),
                                     "type": "auto", "numResults": STAGE_FREE_RESULTS}})
     if stage not in _STAGE_WORDS:
         for item in searches:
             item["inputs"]["numResults"] = STAGE_FREE_RESULTS
+    # ScrapingDog Google searches beside Exa: Google ranks exact words, so the sub-industry, the place and the event's
+    # press wording surface press releases Exa's semantic ranking buries, and a hiring signal gets Google Jobs, whose
+    # rows name the company, role and posting. Results are candidates only; pages are still captured.
+    if what:
+        country = google_country(icp)
+        google = {"results": 10, **({"country": country} if country else {})}
+        if plain_event and not HIRING.search(signal):
+            searches.append({"purpose": "Google: press releases naming companies with intent signal 0",
+                             "provider": "scrapingdog",
+                             "inputs": {"operation": "google_search", **google,
+                                        "query": " ".join(f"{what}{place} {plain_event} press release".split())}})
+        if HIRING.search(signal):
+            searches.append({"purpose": "Google Jobs: open postings for intent signal 0", "provider": "scrapingdog",
+                             "inputs": {"operation": "google_jobs", **({"country": country} if country else {}),
+                                        "query": " ".join(f"{what}{place} {_signal_core(signal)}".split())}})
     return searches
 
 
-def company_list_searches(icp):
-    """Exa company searches for one worker's own candidate list: no event, no dates, only who is in the market.
+SEED_TOOL = "contextdev_get_web_competitors"
+_SEED_DOMAIN = re.compile(r"^(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+)/?$", re.I)
 
-    Each row gives headcount, headquarters and latest funding round, so most mismatches cost no lookup. On four 11-01
-    ICPs they named 25 on-topic companies each, few of them in any entry's news results.
-    """
+
+def seed_domains(icp):
+    found = []
+    for name in exclusions(icp) + [_text(icp.get("verified_example_company"))]:
+        match = _SEED_DOMAIN.match(name.strip()) if name else None
+        if match and match.group(1).lower() not in found:
+            found.append(match.group(1).lower())
+    return found[:2]
+
+
+def seed_step(icp):
+    checks = [{"target": "discovery", "purpose": f"seed competitors {index + 1}: direct competitors of {domain}",
+               "phase": "account_discovery", "provider": "deepline", "tool": SEED_TOOL,
+               "inputs": {"domain": domain, "numCompetitors": 10}} for index, domain in enumerate(seed_domains(icp))]
+    if not checks:
+        return ""
+    return ("0. First run each check below as its own tyche_lookup discovery pilot. It lists the direct competitors of "
+            "the company this profile was written from, with their domains. Put the ones that plausibly fit the size, "
+            "headquarters and offering at the top of your list; skip very large multi-product groups and excluded "
+            "companies. If a lookup is refused, times out or returns nothing, go on with step 1 and never retry it.\n"
+            + "\n".join(json.dumps(check) for check in checks) + "\n")
+
+
+def company_list_searches(icp):
     what = _text(icp.get("sub_industry")) or _text(icp.get("industry"))
     if not what:
         return []
     where = _text(icp.get("geography")) or _text(icp.get("country"))
     place = "" if where.casefold() in _UNSET else f" headquartered in {where}"
-    queries = [("Companies in the requested sub-industry", f"{what} company{place}")]
+    queries = [("Companies offering the requested product or service", f"{offering(icp)}{place}")] if offering(icp) else []
+    queries += [("Companies in the requested sub-industry", f"{what} company{place}")]
     queries += [("Companies with the required attribute", f"{attribute}{place}") for attribute in required_attributes(icp)[:1]]
     return [{"target": "discovery", "purpose": f"company list {index + 1}: {purpose}", "phase": "account_discovery",
              "provider": "deepline", "tool": OPENING_TOOL,
@@ -349,12 +383,6 @@ def company_list_searches(icp):
 
 
 def company_first_lane(icp, as_of):
-    """Worker 2's discovery lane: start from companies in the market, not from news about an event.
-
-    On 11-01 entries qualified 36 companies between them and ours returned 12, all of which qualified: the other 24
-    were never found. A news search names whoever had loud press and misses a company whose event is only on its own
-    newsroom. Changes where discovery starts, never what is checked or accepted.
-    """
     signal = intent_signals(icp)[0]
     event = _signal_core(signal).rstrip(" ,.;")
     age = intent_signal_ages(icp)[0] or 365
@@ -367,7 +395,6 @@ def company_first_lane(icp, as_of):
              "qualification. If that lookup and one news search naming the company find no dated event, hold the company "
              "with that gap at once and take the next name.\n")
     if HIRING.search(signal):
-        # A posting usually sits on an applicant-tracking or job site, and a domain or date filter drops those pages.
         own_site = {**own_site, "purpose": "intent signal 0: an open posting at the company",
                     "inputs": {"query": f"COMPANY {event} job opening", "type": "auto", "numResults": 8}}
         found = ("In the query, put the company's name in place of COMPANY. An open posting for the requested role family "
@@ -376,12 +403,21 @@ def company_first_lane(icp, as_of):
     checks = "\n".join(json.dumps(check) for check in company_list_searches(icp))
     return ("Discovery lane: company-first. Worker-1 runs the Opening discovery checks, so skip that section; where the "
             "strategy says to discover event-first, you start from companies instead. Every other rule, requirement "
-            "and evidence standard still applies.\n"
+            "and evidence standard still applies.\n" + seed_step(icp) +
             "1. Before claiming anything, run each check below as its own tyche_lookup discovery pilot:\n" + checks + "\n"
             "2. Make a list of at least ten companies. Each row gives headcount, headquarters and latest funding round: "
-            "take the rows whose description plainly states the requested sub-industry and whose facts fit the request. "
+            "take the rows whose description plainly states the requested offering or sub-industry and whose facts fit the "
+            "request, rows matching the offering line first. "
             "Add the established companies you know fit, long-standing leaders as well as young companies, and leave "
             "out excluded ones. These facts only rank candidates: each requirement is still proved on a cited page.\n"
+            "2b. Before claiming, screen the list for free in one discovery check: tyche_lookup with provider deepline, "
+            "tool free_simple_company_search and inputs {\"sql\": \"SELECT normalized_domain, employee_count, location "
+            "FROM companies WHERE normalized_domain IN ('a.com','b.com') LIMIT 50\"} with the list's domains. "
+            "employee_count is the upper bound of the company's size bucket (200 means 51-200, 500 means 201-500, 1000 "
+            "means 501-1,000, 5000 means 1,001-5,000). Move a company whose bucket is outside the requested bands, or "
+            "whose location names another country or a state the request does not allow, to the end of the list; a "
+            "domain with no row is often not the company's own site, so check that domain first. The LinkedIn record "
+            "still decides size, so never reject a company on this screen alone.\n"
             "3. Work down the list, best fit first. Claim the domain, then run this lookup first, with the company's "
             "domain in place of DOMAIN:\n" + json.dumps(own_site) + "\n"
             + found +
@@ -389,18 +425,16 @@ def company_first_lane(icp, as_of):
 
 
 def worker_lanes(icp, as_of, count):
-    """{worker position: extra discovery instruction}, so two workers do not search the same pages."""
     return {2: company_first_lane(icp, as_of)} if count >= 2 else {}
 
 
 def opening_plan(icp, as_of):
-    """The task-prompt section that starts discovery with the opening searches; empty when none apply."""
     searches = opening_searches(icp, as_of)
     if not searches:
         return ""
-    # "discovery" is the only target a research worker may search under; the number goes in the purpose.
     checks = [json.dumps({"target": "discovery", "purpose": "opening search " + str(index + 1) + ": " + item["purpose"],
-                          "phase": "account_discovery", "provider": "deepline", "tool": item["tool"],
+                          "phase": "account_discovery", "provider": item.get("provider", "deepline"),
+                          **({"tool": item["tool"]} if item.get("provider", "deepline") == "deepline" else {}),
                           "inputs": item["inputs"]}) for index, item in enumerate(searches)]
     return ("\n\nOpening discovery: once the run is ready and before any other discovery, run each check below as "
             "its own tyche_lookup discovery pilot, in order (skip one the run already shows as done). You may "
@@ -409,11 +443,17 @@ def opening_plan(icp, as_of):
             "searching more broadly. A stage search reaches back three years: a company it "
             "names must prove intent signal 0 inside that signal's own age limit, and its own blog, newsroom or "
             "changelog often shows it, so search with includeDomains set to its domain before dropping it.\n"
-            + "\n".join(checks) + "\n")
+            + "\n".join(checks) + "\n"
+            + "After these searches and before claiming, screen the named companies' domains for free in one discovery "
+              "check: tyche_lookup with provider deepline, tool free_simple_company_search and inputs {\"sql\": \"SELECT "
+              "normalized_domain, employee_count, location FROM companies WHERE normalized_domain IN ('a.com','b.com') "
+              "LIMIT 50\"}. employee_count is the upper bound of the size bucket (200 means 51-200, 500 means 201-500). "
+              "Move a company whose bucket is outside the requested bands, or located in another country or a state the "
+              "request does not allow, to the end of the list; a domain with no row is often not the company's own site. "
+              "The LinkedIn record still decides size, so never reject a company on this screen alone.\n")
 
 
 def prepare(run_dir, icp, limit, research_seconds):
-    """Write the three files the local launcher also uses; return the request file."""
     options_file = run_dir / "request-options.json"
     prior = json.loads(options_file.read_text(encoding="utf-8")) if options_file.exists() else {}
     if not isinstance(prior, dict):
@@ -423,13 +463,14 @@ def prepare(run_dir, icp, limit, research_seconds):
     excluded = exclusions(icp)
     example = _text(icp.get("verified_example_company"))
     if example and example not in excluded:
-        excluded.append(example)  # The scorer treats the example as already known.
+        excluded.append(example)
     (run_dir / "request-exclusions.json").write_text(json.dumps(excluded), encoding="utf-8")
     options = {"max_duration_seconds": int(research_seconds), "max_usd": round(USD_PER_COMPANY * limit, 2)}
+    # The allowance lives in its own file because request-options.json admits only TYCHE's keys.
+    (run_dir / SCRAPINGDOG_ALLOWANCE_FILE).write_text(json.dumps(
+        {"scrapingdog_credits": SCRAPINGDOG_CREDITS, "scrapingdog_usd_per_credit": SCRAPINGDOG_USD_PER_CREDIT}), encoding="utf-8")
     if attributes := required_attributes(icp):
         options["required_attributes"] = attributes
-    # Arena submits one primary quote, but its judge can corroborate the complete attribute across fetched sources.
-    # Keep an explicit or previously saved one-passage binding; preparing a run never loosens that contract.
     if "single_source_attributes" in prior:
         options["single_source_attributes"] = prior["single_source_attributes"]
     options_file.write_text(json.dumps(options), encoding="utf-8")

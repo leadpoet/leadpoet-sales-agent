@@ -22,23 +22,17 @@ from validate_run import (BLOCKING_PROVIDER_STATUSES, DETERMINATE_PROVIDER_STATU
                           sourcing_target_met, calculate_cost_summary, calculate_review_counts, criteria,
                           evaluate_stop, progress_snapshot, qualification_errors, _reviewed_company_scopes,
                           accepted_errors, validate_run, stalled_approaches, _research_key, DELIVERY_STOPS,
-                          CONTACT_HANDOFF, refuse_earlier_results, company_domain)
+                          CONTACT_HANDOFF, refuse_earlier_results, company_domain, bonus_pass_refusal)
 
 ATTEMPT_STATUSES = DETERMINATE_PROVIDER_STATUSES | BLOCKING_PROVIDER_STATUSES
 PHASES = ("account_discovery", "account_verification")
-# Tools that find, verify or return people, recognised from their id words, their documented output fields or an
-# email/phone add-on in the payload. The word lists cover the people and email providers named in
-# references/provider-capabilities.md; an unlisted id that returns people is still forbidden by instruction and
-# visible in the receipts.
 PERSON_TOOL_WORDS = {"people", "person", "persons", "employee", "employees", "buyer", "buyers", "prospect",
                      "prospects", "contact", "contacts", "lead", "leads", "email", "emails", "phone", "phones",
                      "mobile", "role", "roles"}
-# A people or email provider's tool finds people unless its id names a company (its domain search finds emails).
 PEOPLE_PROVIDERS = {"hunter", "findymail", "prospeo", "datagma", "contactout", "rocketreach", "fullenrich", "lusha",
                     "icypeas", "wiza", "forager", "zerobounce", "bounceban"}
 FIRM_WORDS = {"company", "companies", "organization", "organizations", "organisation", "organisations",
               "firm", "firms", "business", "businesses"}
-# "profile", "enrich" and "lookup" name people unless the id says whose: a company, or a social account.
 ENTITY_TOOL_WORDS = {"profile", "profiles", "enrich", "enrichment", "lookup"}
 COMPANY_TOOL_WORDS = FIRM_WORDS | {"domain", "website", "instagram", "tiktok", "twitter", "x", "facebook", "youtube",
                                    "reddit", "bluesky"}
@@ -46,17 +40,13 @@ PERSON_OUTPUT_FIELDS = {"firstname", "lastname", "fullname", "personname", "cont
                         "linkedinprofileurl", "linkedinprofile", "persons", "people", "contacts", "employees",
                         "leads", "workemail", "personalemail", "email", "emails", "phone", "mobilephone"}
 CONTACT_ADDONS = {"findemail", "enrichemail", "includeemail", "includeemails", "findphone", "includephone"}
-# Documented company routes whose ids the word rules would misread: a people provider's job or company search and
-# a maps alias. Their described output fields are still checked.
 COMPANY_TOOLS = {"forager_job_search", "hunter_discover", "google_maps_lookup"}
-# An option that points a general search at people, such as exa_search category "people" or type "profile".
 SEARCH_MODE_KEYS = {"category", "type", "searchtype", "entitytype", "resulttype"}
 PERSON_SEARCH_MODES = {"people", "person", "persons", "profile", "profiles", "linkedinprofile", "linkedinprofiles",
                        "contact", "contacts", "employee", "employees"}
 
 
 def person_tool(tool, contract=None):
-    """Recognise a person search, profile or contact tool from its id or its documented output fields."""
     words = set(re.findall(r"[a-z]+", str(tool or "").casefold()))
     if str(tool or "").casefold() not in COMPANY_TOOLS and (
             words & PERSON_TOOL_WORDS or words & PEOPLE_PROVIDERS and not words & FIRM_WORDS
@@ -72,9 +62,8 @@ def person_tool(tool, contract=None):
 
 
 def contact_work_refusal(*, tool=None, provider=None, operation=None, payload=None, contract=None):
-    """TYCHE sources companies: person, email and phone work is refused before any call or reservation."""
     if provider == "deepline" and operation in {"search", "describe"}:
-        return None  # Reading the free catalog finds no one.
+        return None
     def people_option(key, value):
         name = re.sub(r"[^a-z]", "", str(key).casefold())
         values = value if isinstance(value, list) else [value]
@@ -96,7 +85,6 @@ def review_fingerprint(document):
 
 
 def start_run(run_file, setup):
-    """Initialize or resume the existing records from one interpreted request."""
     run_file = Path(run_file).resolve()
     existing = budget_guard.read_object(run_file) if run_file.exists() else None
     ledger_file = run_file.with_name(run_file.name + ".budget.json")
@@ -111,7 +99,6 @@ def start_run(run_file, setup):
 
 
 def run_lookup(run_file, lookup, *, execute=None, plan_only=False):
-    """Adapt research choices to the one existing dispatch/recovery path."""
     is_batch = isinstance(lookup, list)
     values = lookup if is_batch else [lookup]
     if not 1 <= len(values) <= 3:
@@ -128,7 +115,6 @@ def run_lookup(run_file, lookup, *, execute=None, plan_only=False):
 
 
 def _preflight_contracts(run_file, specs, *, plan_only=False):
-    """Check all user-facing lookup inputs before any batch member is planned."""
     for index, spec in enumerate(specs):
         adapter, action, request = _validate_spec(spec, f"lookup[{index}]", plan_only=plan_only)
         if action["provider"] == "deepline" and request["operation"] == "execute":
@@ -143,7 +129,6 @@ def _preflight_contracts(run_file, specs, *, plan_only=False):
 
 
 def refresh(document):
-    """Recompute bookkeeping only; never qualify leads or declare routes exhausted."""
     accepted = document.get("accepted", [])
     count, target = len(accepted), document["request"]["target_count"]
     summary = document.setdefault("summary", {})
@@ -171,7 +156,6 @@ def refresh(document):
 
 
 def pending_source_reviews(document):
-    """Attempted sources still open in the existing frontier, including discovery."""
     attempted = {r["route_id"] for r in document.get("routes", [])}
     return [{"ref": r["route_id"], "target": r.get("scope"), "reason": r.get("reason")}
             for r in document.get("stop_audit", {}).get("route_frontier", [])
@@ -179,14 +163,12 @@ def pending_source_reviews(document):
 
 
 def review_reminder(document):
-    """Compact advice from the same pending sources used at finalization."""
     pending = pending_source_reviews(document)
     scopes = list(dict.fromkeys(r["target"] for r in pending))
     return {"count": len(pending), "scopes": scopes[:3], "sources": pending[:3]}
 
 
 def strategy_reminder(document):
-    """Advisory history only; reuse saved reviews and the existing progress check."""
     if sourcing_target_met(document):
         return {"count": 0, "items": []}
     reviewed = {r["route_id"] for r in document.get("stop_audit", {}).get("route_frontier", [])
@@ -219,7 +201,6 @@ def strategy_reminder(document):
 
 
 def run_status(document, decision):
-    """The saved request and actionable work, without replaying the entire audit."""
     return {"request": document["request"], "summary": document.get("summary", {}),
             "review_due": review_reminder(document),
             "next_actions": document.get("stop_check", {}).get("next_actions", []),
@@ -230,7 +211,6 @@ def run_status(document, decision):
 
 
 def delivery_preflight(run_file, document, *, check_review=True):
-    """Check a proposed final state without writing, shared by review and export."""
     document = refresh(copy.deepcopy(document))
     ledger = budget_guard.load_ledger(run_file)
     problems = budget_guard.audit_ledger(run_file, document, state=ledger)
@@ -250,12 +230,6 @@ def delivery_preflight(run_file, document, *, check_review=True):
 
 
 def save_stop_checkpoint(run_file):
-    """Persist a terminal audit even when evidence still prevents delivery.
-
-    The budget supervisor cannot buy another review turn. Reuse the strict
-    preflight to derive stop fields, retaining all remaining work and errors.
-    This does not approve research, change accounting or authorize an export.
-    """
     checked = {}
 
     def update(document):
@@ -270,7 +244,6 @@ def save_stop_checkpoint(run_file):
 
 
 def finalize_run(run_file):
-    """Prepare derived completion fields only after review and full delivery checks."""
     checked = {}
 
     def update(document):
@@ -278,7 +251,6 @@ def finalize_run(run_file):
         if result["errors"]:
             raise ValueError("; ".join(result["errors"]))
         checked.update(result)
-        # Bind the exporter to the exact bytes validated inside the state lock.
         saved = json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
         checked["results_sha256"] = hashlib.sha256(saved.encode("utf-8")).hexdigest()
         return document
@@ -288,7 +260,6 @@ def finalize_run(run_file):
 
 
 def save_review(run_file, review):
-    """Preserve optional web observations, then atomically save judgments; never dispatch."""
     if not isinstance(review, dict) or set(review) - {"companies", "routes", "next_actions"}:
         raise ValueError("review accepts only companies, routes and next_actions; the saved request is authoritative")
     for key in ("companies", "routes", "next_actions"):
@@ -297,8 +268,6 @@ def save_review(run_file, review):
     review = copy.deepcopy(review)
     observations = []
     seen = set()
-    # Validate every attached response before saving any. Receipts are saved
-    # first so a rejected/interrupted judgment can be retried without research.
     for index, item in enumerate(review.get("routes", [])):
         label = f"review.routes[{index}]"
         research_input.object_fields(item, {"route_id", "reason", "state", "continuation_route_ids", "response"}, label)
@@ -321,7 +290,6 @@ def save_review(run_file, review):
     def update(document):
         changed = set()
         for item in review.get("companies", []):
-            # Code owns criterion labels, importance, the initial signal and the reason code.
             item = research_input.company_update(document, item)
             state, row = item["state"], item["row"]
             scope = _company_key(row)
@@ -379,15 +347,11 @@ def save_review(run_file, review):
         active_ids = {rid for r in document["stop_audit"]["route_frontier"]
                       if r.get("state") in {"untried", "continuable"}
                       for rid in [r["route_id"], *r.get("continuation_route_ids", [])]}
-        # Retire only completed work and the reviewed companies' speculative
-        # follow-ups. Explicit new actions below can reopen a concrete source.
         actions[:] = [a for a in actions if a["id"] not in closed | supplied_ids
                       and (a["id"] in active_ids or a.get("scope") not in reviewed_scopes & (parked | terminal))] + copy.deepcopy(supplied)
         refresh(document)
         ledger = budget_guard.load_ledger(run_file)
         decision = evaluate_stop(document, execution_budget=ledger)
-        # A spending pause must not discard research judgments. Keep every
-        # accounting consistency check and expose the unchanged pause in status.
         problems = budget_guard.audit_ledger(run_file, document, state=ledger, allow_pending=True) + decision["errors"]
         problems = [error for error in problems if error != ledger.get("blocked")]
         if problems:
@@ -401,7 +365,6 @@ def save_review(run_file, review):
 
 
 def _validate_spec(spec, label="input", *, plan_only=False):
-    """Normalize input without touching run state, receipts, budgets or providers."""
     if not isinstance(spec, dict):
         raise ValueError(f"{label} must be an object containing action and request objects")
     for field in ("action", "request"):
@@ -489,8 +452,6 @@ def _prepare(run_file, validated):
                 raise ValueError("Research is closed. Reopen only the exact saved source URL for this accepted company.")
         audit = document.setdefault("stop_audit", {})
         frontier = audit.setdefault("route_frontier", [])
-        # An explicit free catalog refresh may recover a schema/price change
-        # before substantive research. Paid request deduplication is unchanged.
         recent = [] if provider == "deepline" and operation in {"search", "describe"} else frontier
         matches = [r for r in recent if r.get("request_fingerprint") == fingerprint]
         if matches:
@@ -504,9 +465,6 @@ def _prepare(run_file, validated):
                 unsent_local_refusal = (saved.get("request_sent") is False
                     and saved.get("error_stage") in {"pricing", "coordination"}
                     and matches[-1]["route_id"] not in ledger.get("calls", {}))
-            # Only reread an explicitly free, completed status call that reported
-            # a job still in progress, or retry a receipted local pricing/coordination refusal
-            # that never reserved or dispatched. Uncertain calls stay blocked.
             if not unsent_local_refusal and not (action.get("status_read") and matches[-1].get("status_read")
                     and previous.get("provider_status") == "partial"
                     and previous.get("cost_credits") in (None, 0)
@@ -519,9 +477,6 @@ def _prepare(run_file, validated):
         actions = document["stop_check"]["next_actions"]
         actions[:] = [a for a in actions if a["id"] != action["id"]] + [action]
         decision = evaluate_stop(document, execution_budget=budget_guard.load_ledger(run_file))
-        # Saving an already observed source for an accepted company remains
-        # possible during final review. This executes no provider call and
-        # does not reopen discovery or extend a user-specified time limit.
         review_observation = (not decision["errors"] and
             (decision["decision"] == "target_met" or finalization and decision["decision"] in DELIVERY_STOPS)
             and provider == "public_web"
@@ -529,13 +484,20 @@ def _prepare(run_file, validated):
             and action["scope"] in {_company_key(row) for row in document["accepted"]})
         free_recovery = (catalog_recovery and not decision["errors"] and decision["decision"] in
                          DELIVERY_STOPS | {"provider_stop", "input_or_configuration_stop"})
-        if action["id"] not in decision["eligible_actions"] and not review_observation and not free_recovery:
+        bonus_lookup = False
+        if (os.environ.get("TYCHE_BONUS_PASS") == "active" and not finalization and not decision["errors"]
+                and decision["decision"] == "target_met" and action["id"] not in decision["eligible_actions"]
+                and not review_observation and not free_recovery):
+            # Arena bonus pass (tyche_arena/host.py): one later-signal lookup for an accepted company.
+            refusal = bonus_pass_refusal(document, action, budget_guard.load_ledger(run_file))
+            if refusal:
+                prepared["refusal"] = refusal
+                return document
+            bonus_lookup = True
+        if (action["id"] not in decision["eligible_actions"] and not review_observation and not free_recovery
+                and not bonus_lookup):
             reason = decision.get("blocked_actions", {}).get(action["id"])
             if reason:
-                # Keep the agent's concrete, unaffordable choice for the stop
-                # audit. No route, receipt or reservation is created. Otherwise
-                # the agent has to rebuild next_actions by hand to explain why
-                # this work cannot proceed at the remaining budget.
                 prepared["refusal"] = reason
                 return document
             raise ValueError("action not eligible: " + (reason or json.dumps(decision)))
@@ -561,7 +523,6 @@ def _prepare(run_file, validated):
 
 
 def finish_attempt(run_file, route_id, body, *, check_stop=True):
-    """Record a saved response without dispatching anything (also the resume path)."""
     def finish(document):
         if body.get("run_fingerprint") != budget_guard.run_fingerprint(run_file):
             raise ValueError("saved response belongs to another run or lacks run identity; preserve it and reconcile its origin")
@@ -629,7 +590,6 @@ def finish_attempt(run_file, route_id, body, *, check_stop=True):
 
 
 def _recover_captured_response(run_file, rid, saved, call):
-    """Finish an interrupted local write from raw evidence, never from a retry."""
     raw = saved.get("provider_response")
     if (saved.get("receipt_status") != "response_received" or not isinstance(raw, dict)
             or not ({"body", "transport_status"} & raw.keys())):
@@ -644,8 +604,6 @@ def _recover_captured_response(run_file, rid, saved, call):
     adapter, request = research_input.normalize_provider_request(provider, request, "saved response")
     body, _ = adapter.normalize_response(request, raw)
     if provider == "scrapingdog":
-        # Only a dispatch-bound tariff can settle a new ScrapingDog request.
-        # Historical receipts without one keep their original accounting.
         if not call.get("tariff"):
             return saved
         import scrapingdog_billing
@@ -670,7 +628,7 @@ def _settle_recovered_response(run_file, rid, saved, call):
             current = ledger["calls"][rid]
             if ledger["version"] == 2 and current.get("state") == "in_flight":
                 if current.get("admission_bound_source"):
-                    budget_guard.hold_unpriced(current)  # As on the live path: held at its hold, never pending.
+                    budget_guard.hold_unpriced(current)
                 else:
                     current["state"] = "reserved" if current.get("tariff") and current.get("held_credits") is not None else "pending_billing"
         return
@@ -686,7 +644,6 @@ def _settle_recovered_response(run_file, rid, saved, call):
 
 
 def recover_completed_attempts(run_file):
-    """Reconcile saved dispatches between worker invocations; never call a provider."""
     run_file = Path(run_file)
     refuse_earlier_results(run_file)
     ledger = budget_guard.load_ledger(run_file)
@@ -703,7 +660,7 @@ def recover_completed_attempts(run_file):
             saved = _recover_captured_response(run_file, rid, saved, ledger["calls"][rid])
         if saved.get("receipt_status") == "complete" and saved.get("status") in ATTEMPT_STATUSES:
             if rid not in ledger["calls"] and saved.get("request_sent") is not False:
-                continue  # No proof of an unsent attempt; retain its original state.
+                continue
             if rid in ledger["calls"]:
                 _settle_recovered_response(run_file, rid, saved, ledger["calls"][rid])
             finish_attempt(run_file, rid, saved, check_stop=False)
@@ -717,7 +674,7 @@ def recover_completed_attempts(run_file):
 
 
 def _start_attempt(run_file, validated):
-    budget_guard.load_ledger(run_file)  # Refuse imported state before planning or dispatch.
+    budget_guard.load_ledger(run_file)
     adapter, request, prepared = _prepare(run_file, validated)
     receipts = run_file.parent / "receipts"
     receipts.mkdir(exist_ok=True)
@@ -726,7 +683,6 @@ def _start_attempt(run_file, validated):
     metadata = {k: prepared[k] for k in ("progress_before", "accepted_before")}
     metadata.update(run_fingerprint=budget_guard.run_fingerprint(run_file),
                     request_fingerprint=prepared["action"]["request_fingerprint"], provider=prepared["action"]["provider"])
-    # Keep audit identity recoverable even if the main draft is damaged.
     metadata["attempt"] = copy.deepcopy({"action": prepared["action"],
                            "request": {k: v for k, v in request.items() if k != "spend"}})
     capture = ResponseFile(output, redact, metadata=metadata)
@@ -739,11 +695,8 @@ def _dispatch(adapter, request, capture, *, execute=None, plan_only=False):
         if not capture.finish(dict(metadata, status="pending")):
             raise OSError("public-web plan could not be saved; recover its receipt before dispatch")
         return {"pending": True, "receipt_file": str(capture.path), **metadata}
-    # Provider capture writes this call's lines once its receipt is saved, never while the call runs.
     with provider_capture.dispatch(request):
         body, code = (execute or adapter.run)(request, capture.capture)
-        # Adapters can return valid JSON with exit 0 for a provider-level failure.
-        # Keep their nonzero codes, but never report a failed attempt as success.
         code = code or (0 if body.get("status") in DETERMINATE_PROVIDER_STATUSES else 2)
         body.update(metadata)
         if not capture.finish(body):
@@ -762,7 +715,6 @@ def run_attempt(run_file, spec, *, execute=None, plan_only=False):
 
 
 def run_batch(run_file, specs, *, execute=None, plan_only=False):
-    """One writer plans/records; at most three workers dispatch to their own receipts."""
     run_file = Path(run_file).resolve(strict=True)
     if not isinstance(specs, list) or not 1 <= len(specs) <= 3:
         raise ValueError("a batch requires 1-3 independent company checks")
@@ -781,8 +733,6 @@ def run_batch(run_file, specs, *, execute=None, plan_only=False):
         inputs.append(validated)
 
     results, prepared = [], []
-    # Save every plan before any network work. A refused member does not discard
-    # its siblings, and a failed dispatch is never automatically resubmitted.
     for validated in inputs:
         result = {"route_id": validated[1]["id"], "exit_code": 0}
         results.append(result)
@@ -811,7 +761,6 @@ def run_batch(run_file, specs, *, execute=None, plan_only=False):
 
 
 def _harvest_display(value):
-    """Project known LinkedIn company rows for review, keeping a path to complete receipts."""
     omitted = {"similarOrganizations", "logo", "logos", "backgroundCover",
                "backgroundCovers", "profilePicture", "coverPicture", "photo"}
     if isinstance(value, dict):
@@ -835,7 +784,6 @@ def _harvest_display(value):
 
 
 def cli_output(result):
-    """Trim repeated audit metadata only from stdout; saved receipts stay complete."""
     output = {k: v for k, v in result.items() if k != "progress_before"}
     if "attempts" in output:
         output["attempts"] = [cli_output(attempt) for attempt in output["attempts"]]
@@ -854,7 +802,6 @@ def cli_output(result):
 
 
 def _public_web_observation(body, response):
-    """Validate an observation against the original plan without changing it."""
     try:
         research_input.object_fields(response, {"status", "operation", "results", "error"}, "web response")
     except ValueError as exc:
@@ -875,13 +822,10 @@ def _public_web_observation(body, response):
 
 
 def complete_public_web(run_file, route_id, response, *, check_stop=True):
-    """Attach observed web results to their saved plan, never to a paid receipt."""
     run_file = Path(run_file).resolve(strict=True)
     receipt = read_receipt(run_file, route_id)
     path = Path(receipt["receipt_file"])
     with budget_guard.transaction(path) as body:
-        # Recheck identity while holding the receipt lock. Save before recording
-        # run state so --complete can recover without another search.
         read_receipt(run_file, route_id)
         observed = _public_web_observation(body, response)
         if body.get("status") == "pending":
@@ -909,8 +853,6 @@ def main():
         parser.error("--response-file requires --complete and cannot be used with --plan-only")
     if args.plan_only and not (args.lookup_file or args.input_file or args.batch_files):
         parser.error("--plan-only requires a lookup or attempt input")
-    # Inside the isolated runtime only the native tools research: their start binds the launcher's
-    # accounting settings, which a start or lookup from here would skip.
     if os.environ.get("TYCHE_ISOLATED_RUN") == "1" and not (args.receipt or args.status or args.finalize):
         parser.exit(2, "The isolated TYCHE runtime researches only through its native tools; this command would "
                        "bypass their safeguards. Report the native tool failure instead.\n")

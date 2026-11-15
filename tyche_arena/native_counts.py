@@ -1,4 +1,3 @@
-"""Private, content-free counts of completed Arena native tool calls."""
 
 from collections import Counter
 import fcntl
@@ -17,7 +16,6 @@ TOOLS = frozenset(TOOLS)
 TOOL_NAMES = TOOLS | {"unknown_tool"}
 MODES = frozenset({"other", "invalid", "overview", "company", "company_review",
                    "source", "literal_find", "tool", "capability_search", "recovery", "saved_field"})
-# Only statuses returned by the existing tool and Arena adapter are printed.
 STATUSES = frozenset({"arena_output_validated", "available_for_default_options", "config_error", "confirmed_leads_saved",
     "export_failed", "invalid_approval", "invalid_state", "missing_approval",
     "needs_repair", "needs_research", "no_documented_rate", "not_started", "operationally_blocked",
@@ -41,7 +39,6 @@ _MODULES = frozenset(
 
 
 def _exception_detail(exc):
-    """Use only a fixed type family and the innermost trusted source location."""
     family = next((cls.__name__ for cls in EXCEPTION_FAMILIES
                    if issubclass(type(exc), cls)), "other")
     try:
@@ -103,7 +100,6 @@ def outcome(result):
 
 
 def record(path, phase, name, mode, result, exception=None):
-    """One locked append; diagnostic failure never changes a native tool result."""
     if phase not in PHASES or name not in TOOL_NAMES or mode not in MODES or result not in OUTCOMES:
         return
     detail = ""
@@ -120,7 +116,7 @@ def record(path, phase, name, mode, result, exception=None):
                     or details.st_mode & 0o077):
                 return
             fcntl.flock(fd, fcntl.LOCK_EX)
-            size = os.fstat(fd).st_size  # Another process may have appended before this lock.
+            size = os.fstat(fd).st_size
             if size >= len(TRUNCATED) and os.pread(fd, len(TRUNCATED), size - len(TRUNCATED)) == TRUNCATED:
                 return
             if size + len(line) <= MAX_BYTES - len(TRUNCATED):

@@ -1,4 +1,3 @@
-"""Leadpoet Arena host for TYCHE's shared research implementation."""
 
 import sys
 from pathlib import Path

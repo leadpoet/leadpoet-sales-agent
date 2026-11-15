@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Small JSON adapter for Deepline API execution and CLI-backed tool discovery.
-
-API-key executions preserve raw errors for accounting. CLI-only authentication
-continues to use the installed CLI; no uncertain execution is retried.
-"""
 
 from __future__ import annotations
 
@@ -23,7 +18,6 @@ import provider_capture
 from provider_output import ResponseFile, load_json, response_body
 from budget_guard import guarded_call, amount as billing_amount
 
-# Tools whose rows are structured provider records, not captured pages: their text is a record field.
 STRUCTURED_RECORD_TOOLS = frozenset({"harvestapi_get_company", "aviato_get_company_funding_rounds"})
 
 
@@ -80,31 +74,18 @@ _EXTRACTED_RESULT_KEYS = (
     "matches",
     "evidence",
 )
-# Top-level fields that can carry a provider's output or a call's outcome, as opposed to metadata.
 _PROVIDER_OUTPUT_FIELDS = (_EMPTY_CONTAINER_KEYS | set(_EXTRACTED_RESULT_KEYS) | set(_SCALAR_RESULT_KEYS)
                            | {"data", "result", "results", "response", "output"})
 _OUTCOME_FIELDS = {"status", "success", "outcome", "state", "errors", "error_code", "tool_error"}
 
 
 def _extracted_list_records(value: Any) -> List[Any]:
-    """Extract rows from serialized Deepline list/getter output.
-
-    ``deepline tools execute --json`` normally exposes provider rows through
-    ``toolResponse.raw``. Some tools, including autocomplete tools, expose
-    only a declared list such as ``suggestions`` (or a serialized dataset
-    preview) in the command envelope. Keep this handling scoped to the
-    extracted-list container so a generic ``{"value": ...}`` response is not
-    accepted as a provider envelope by accident.
-    """
 
     if isinstance(value, list):
         return value
     if not isinstance(value, dict):
         return []
     empty_rows: Optional[List[Any]] = None
-    # The CLI may include several lists in this container. Only inspect known
-    # result-bearing keys first, because metadata lists such as ``columns``
-    # can appear before the actual provider rows.
     for key in _EXTRACTED_RESULT_KEYS:
         candidate = value.get(key)
         if isinstance(candidate, list):
@@ -119,14 +100,12 @@ def _extracted_list_records(value: Any) -> List[Any]:
         rows = _extracted_list_records(candidate)
         if rows:
             return rows
-    # A serialized single row can be represented directly in the container.
     if any(key in value for key in ("value", "label")):
         return [value]
     return empty_rows or []
 
 
 def _is_extracted_list_envelope(value: Any) -> bool:
-    """Return whether a serialized extracted-list container has a known shape."""
 
     if isinstance(value, list):
         return True
@@ -148,7 +127,6 @@ def _is_extracted_list_envelope(value: Any) -> bool:
 
 
 def _scalar_result(value: Any) -> Optional[Dict[str, Any]]:
-    """Return a valid count/total summary object as one result row."""
 
     if not isinstance(value, dict):
         return None
@@ -163,13 +141,10 @@ def _scalar_result(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def _scraped_document(value: Any) -> Optional[Dict[str, Any]]:
-    """Recognize a successful captured page, not a company or buyer."""
     if not isinstance(value, dict) or not isinstance(value.get("metadata"), dict):
         return None
     metadata = value["metadata"]
     status = metadata.get("statusCode")
-    # ContextDev can return an explicit successful capture without HTTP
-    # metadata. A supplied status still takes precedence over that flag.
     successful = (type(status) is int and 200 <= status < 300 if "statusCode" in metadata
                   else value.get("success") is True)
     url = metadata.get("sourceURL") or metadata.get("sourceUrl") or metadata.get("url") or metadata.get("finalUrl")
@@ -191,7 +166,6 @@ def _scraped_document(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def _native_page_output(parsed, request):
-    """Map observed page-reader replies onto the existing captured-page shape."""
     tool = request["tool"]
     if (tool not in {"discolike_extract", "generic_http_request"}
             or not isinstance(parsed, dict) or parsed.get("status") != "completed"):
@@ -209,8 +183,6 @@ def _native_page_output(parsed, request):
     url = payload.get("url")
     if tool == "discolike_extract" and url is None:
         domain = payload.get("domain")
-        # The domain-only endpoint returns homepage text without a URL. Bind
-        # only a literal hostname, never a path, redirect or inferred subpage.
         if (isinstance(domain, str) and len(domain) <= 253 and re.fullmatch(
                 r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+", domain)):
             url = "https://" + domain.lower()
@@ -221,7 +193,6 @@ def _native_page_output(parsed, request):
     except ValueError:
         return parsed
     if tool == "discolike_extract":
-        # This extractor omits the URL; bind its text to the executed request.
         if not isinstance(raw.get("language"), str):
             return parsed
         page = {"success": True, "metadata": {"sourceURL": url}, "text": raw.get("text")}
@@ -241,20 +212,18 @@ def _native_page_output(parsed, request):
                 content_format: raw.get("data")}
     if _scraped_document(page) is None:
         return parsed
-    # Do not mutate the captured response or replace its billing/request IDs.
     return dict(parsed, toolResponse={**envelope, "rawV2": {"results": [page]}})
 
 
 class InputError(ValueError):
-    """An invalid local request."""
+    pass
 
 
 class ConfigError(RuntimeError):
-    """A local invocation/configuration failure."""
+    pass
 
 
 class CallTimeout(RuntimeError):
-    """The bounded Deepline process timeout elapsed."""
 
     def __init__(self, message, stdout="", stderr=""):
         super().__init__(message)
@@ -263,7 +232,6 @@ class CallTimeout(RuntimeError):
 
 
 def _redact_schema(value: Any, sensitive: bool = False) -> Any:
-    """Preserve schema structure while removing credentials in literal values."""
     if not isinstance(value, dict):
         return value if isinstance(value, bool) else redact(value)
     result = {}
@@ -281,9 +249,8 @@ def _redact_schema(value: Any, sensitive: bool = False) -> Any:
         elif key in {"allOf", "anyOf", "oneOf", "prefixItems"} and isinstance(item, list):
             result[key] = [_redact_schema(child, sensitive) for child in item]
         elif sensitive and key in {"default", "examples"}:
-            continue  # Optional annotations can contain an actual credential.
+            continue
         elif sensitive and key in {"const", "enum"}:
-            # Do not publish a credential or silently remove its input constraint.
             return False
         elif _SECRET_KEY.search(key):
             result[key] = "[REDACTED]"
@@ -293,7 +260,6 @@ def _redact_schema(value: Any, sensitive: bool = False) -> Any:
 
 
 def redact(value: Any) -> Any:
-    """Remove likely credentials from arbitrary provider data before output."""
 
     if isinstance(value, dict):
         result: Dict[str, Any] = {}
@@ -318,7 +284,6 @@ def redact(value: Any) -> Any:
 
 
 def _safe_error(message: str) -> Dict[str, str]:
-    """Return one bounded, redacted failure line without echoing the command."""
 
     redacted = str(redact(message or ""))
     lines = [re.sub(r"\s+", " ", line).strip() for line in redacted.splitlines()]
@@ -340,18 +305,15 @@ def _safe_error(message: str) -> Dict[str, str]:
 
 
 def _json_from_text(text: str, *, billing_feed=False) -> Any:
-    """Decode JSON despite a CLI notice before the JSON payload."""
 
     if not isinstance(text, str) or not text.strip():
         raise ValueError("empty provider response")
-    # Preserve undecodable CLI bytes in the receipt, never as a parsed result.
     text.encode("utf-8")
     try:
         return load_json(text, billing_feed=billing_feed)
     except json.JSONDecodeError:
         if text.lstrip().startswith(("{", "[")):
             raise
-    # Skip a leading CLI notice, never a malformed enclosing JSON document.
     start = re.search(r"(?m)^[ \t]*[\[{]", text)
     if start:
         return load_json(text[start.start():], billing_feed=billing_feed)
@@ -400,13 +362,10 @@ def _is_linkedin_url(value: Any) -> bool:
     )
 
 
-# LinkedIn company records sometimes give their website wrapped in one of these redirect pages.
 LINKEDIN_REDIRECTS = frozenset({"/redir/redirect", "/redir/suspicious-page"})
 
 
 def linkedin_redirect_target(value: Any) -> Any:
-    """The one destination a LinkedIn redirect wrapper names in url=, read and never followed; None when it names
-    none or several. Any other value is returned unchanged."""
     text = _text(value)
     if not _is_linkedin_url(text):
         return value
@@ -416,7 +375,7 @@ def linkedin_redirect_target(value: Any) -> Any:
     targets = parse_qs(parsed.query).get("url", [])
     if len(targets) != 1:
         return None
-    try:  # A destination urllib cannot parse names no domain; it never stops normalization.
+    try:
         urlsplit(targets[0] if "://" in targets[0] else "https://" + targets[0])
     except ValueError:
         return None
@@ -424,7 +383,6 @@ def linkedin_redirect_target(value: Any) -> Any:
 
 
 def _is_linkedin_company_url(value: Any) -> bool:
-    """Return whether a URL is a LinkedIn company page, not a person profile."""
 
     text = _text(value)
     if not text:
@@ -459,14 +417,11 @@ def normalize_evidence(
     tool: Optional[str] = None,
     entity_type: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Normalize one provider row while retaining useful provider metadata."""
 
-    # Result lists bypass the envelope parser's single-document path.
     captured = _scraped_document(row)
     source: Dict[str, Any] = captured or (row if isinstance(row, dict) else {"value": row})
     company_search = tool in {"peopledatalabs_company_search", "crustdata_v3_company_search", "fullenrich_company_search"}
     if company_search:
-        # Company search fields describe firms, not people or buying signals.
         entity_type = "company"
         source = dict(source, company_name=source.get("name"))
     if tool == "crustdata_v3_company_search" and isinstance(source.get("basic_info"), dict):
@@ -480,8 +435,6 @@ def normalize_evidence(
         company = source["company"]
         info = company.get("basic_info") if isinstance(company.get("basic_info"), dict) else {}
         job = source.get("job_details") if isinstance(source.get("job_details"), dict) else {}
-        # Keep the firm's metrics and original job metadata available for review.
-        # Indexing dates are not publication dates or evidence of an open vacancy.
         source = dict(source, company_details=company, company=info.get("name"),
                       domain=info.get("primary_domain") or info.get("website"), evidence_url=job.get("url"))
     result: Dict[str, Any] = redact(source)
@@ -521,7 +474,6 @@ def normalize_evidence(
         )
     if domain_value in (None, "") and nested_company_identity:
         domain_value = _first(link, "domain", "website")
-    # The destination's domain, never LinkedIn's own; the caller still matches it to the company.
     domain_value = linkedin_redirect_target(domain_value)
     result["domain"] = None if _is_linkedin_url(domain_value) else _domain(domain_value)
     result["signal"] = None if company_search else _text(_first(source, "signal", "signal_type", "intent", "type", "category"))
@@ -532,9 +484,6 @@ def normalize_evidence(
     result["tool"] = _text(_first(source, "tool", "tool_name")) or tool
 
     if tool == "aviato_get_company_funding_rounds":
-        # announcedOn is the financing announcement, not an ingestion timestamp.
-        # Preserve the original fields and order; the researcher judges current
-        # stage and reconciles conflicting records.
         result["evidence_date"] = None
         result["evidence_date_basis"] = "published"
         announced = _text(source.get("announcedOn"))
@@ -545,8 +494,6 @@ def normalize_evidence(
                 pass
         result["evidence_text"] = result["evidence_text"] or _text(source.get("name"))
 
-    # LinkedIn company page fields: the published employee band, not an associated-member count.
-    # Preserve the raw HarvestAPI fields alongside the stable output.
     if "harvestapi" in (tool or "").lower():
         linkedin = _text(source.get("linkedinUrl"))
         if _is_linkedin_company_url(linkedin):
@@ -565,7 +512,6 @@ def normalize_evidence(
     refs = _artifact_refs(source)
     if refs is not None:
         result["raw_artifact_refs"] = refs
-    # Provenance comes from the adapter, never from an authored evidence label.
     result["content_kind"] = ("captured_page" if captured else "structured_record" if tool in STRUCTURED_RECORD_TOOLS
                               else "search_excerpt" if result.get("evidence_url") and result.get("evidence_text")
                               else "unverified")
@@ -598,7 +544,6 @@ def _is_linkedin_post_url(value: Any) -> bool:
 
 
 def _structured_execute_envelope(value: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Select a complete structured provider result for execute only."""
 
     if isinstance(value, str):
         try:
@@ -792,7 +737,6 @@ def _structured_metadata(kind: str, envelope: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _output_preview_metadata(value: Any) -> Dict[str, Any]:
-    """Retain observed preview counts without inferring provider completeness."""
 
     if not isinstance(value, dict):
         return {}
@@ -820,7 +764,6 @@ def _output_preview_metadata(value: Any) -> Dict[str, Any]:
 
 
 def _structured_status(envelope: Dict[str, Any]) -> Optional[str]:
-    """Read route failure state only from a selected provider envelope."""
 
     status = envelope.get("status")
     if status is not None and (
@@ -855,7 +798,6 @@ def _structured_status(envelope: Dict[str, Any]) -> Optional[str]:
 
 
 def _records(value: Any) -> List[Any]:
-    """Extract rows from common Deepline response envelopes."""
 
     if isinstance(value, str):
         try:
@@ -866,9 +808,6 @@ def _records(value: Any) -> List[Any]:
         return value
     if not isinstance(value, dict):
         return []
-    # Firecrawl's declared web list can be larger than its CLI preview.
-    # Do not follow arbitrary paths: getters also preview unrelated lists
-    # such as profile interests and similar companies.
     preview = value.get("output_preview", {})
     source_path = preview.get("listSourcePath") if isinstance(preview, dict) else None
     if source_path == "toolResponse.rawV2.data.web" and "results" not in value:
@@ -923,8 +862,6 @@ def _records(value: Any) -> List[Any]:
             found = _records(candidate)
             if found:
                 return found
-    # The CLI emits a bounded row preview when it materializes a declared list
-    # but the raw provider envelope does not contain the list inline.
     for key in ("output_preview", "outputPreview"):
         candidate = value.get(key)
         if isinstance(candidate, dict):
@@ -938,7 +875,6 @@ def _records(value: Any) -> List[Any]:
                 return [scalar]
     if empty_direct is not None:
         return empty_direct
-    # A single row is useful for a provider that returns one company/evidence object.
     if any(
         key in value
         for key in (
@@ -981,12 +917,10 @@ def _execution_metadata(parsed: Any) -> Dict[str, Any]:
                     raise ValueError("billing amount exceeds the report range")
                 amounts[key] = value
             except ValueError:
-                amounts = {}  # Contradictory/invalid billing must not partially settle.
+                amounts = {}
                 break
         if amounts:
             metadata["billing"] = amounts
-            # Price finality and posting are different: a final price can be
-            # queued for ledger posting. Keep both facts in the saved receipt.
             for key in ("pricing_status", "settlement_status"):
                 if isinstance(billing.get(key), str):
                     metadata["billing"][key] = billing[key]
@@ -995,7 +929,6 @@ def _execution_metadata(parsed: Any) -> Dict[str, Any]:
 
 
 def _envelope_status(value: Any) -> Optional[str]:
-    """Read status only from response envelopes, never from result rows."""
 
     def direct_status(mapping: Dict[str, Any]) -> Optional[str]:
         for key in ("status", "provider_status", "outcome", "state"):
@@ -1026,9 +959,6 @@ def _envelope_status(value: Any) -> Optional[str]:
     status = direct_status(value)
     if status:
         return status
-    # toolResponse is the only nested object treated as an envelope.  rawV2,
-    # raw, getters, and result/data payloads may themselves contain a row whose
-    # `status` field is provider data, not a route-level failure.
     for key in ("toolResponse", "tool_response"):
         candidate = value.get(key)
         if isinstance(candidate, dict):
@@ -1039,7 +969,6 @@ def _envelope_status(value: Any) -> Optional[str]:
 
 
 def _envelope_error(value: Any) -> Optional[Dict[str, str]]:
-    """Extract bounded, redacted diagnostics from recognized response envelopes."""
 
     if not isinstance(value, dict):
         return None
@@ -1076,7 +1005,6 @@ def _envelope_error(value: Any) -> Optional[Dict[str, str]]:
 
 
 def _known_envelope(value: Any) -> bool:
-    """Return whether the CLI response has a recognized envelope shape."""
 
     if isinstance(value, list):
         return True
@@ -1089,8 +1017,6 @@ def _known_envelope(value: Any) -> bool:
         return False
     if _scalar_result(value) is not None or _scraped_document(value) is not None:
         return True
-    # Observed single-object getter success: explicit null is a miss, not a
-    # malformed response. Missing payloads or nested failures stay unrecognized.
     if (set(value) <= {"error", "status", "element"} and "element" in value
             and value["element"] is None and value.get("status") == 200
             and value.get("error") is None):
@@ -1260,9 +1186,6 @@ def _validate_request(request: Any) -> Dict[str, Any]:
         entity_type = request["entity_type"]
         if not isinstance(entity_type, str) or not entity_type.strip():
             raise InputError("entity_type must be a non-empty string")
-        # This is wrapper metadata only. It is deliberately not added to the
-        # payload sent to the live Deepline tool, whose schema is discovered at
-        # runtime and must not be guessed here.
         request["entity_type"] = entity_type.strip()
     if operation == "search":
         query = request.get("query", request.get("q"))
@@ -1283,12 +1206,7 @@ def _validate_request(request: Any) -> Dict[str, Any]:
             raise InputError("execute payload must be a JSON object")
         request["tool"] = tool.strip()
         request["payload"] = payload
-        # This wrapper-only bound keeps every execute pilot within the skill's
-        # maximum returned-row limit. It is not sent to the provider tool.
         request["limit"] = _result_limit(request.get("limit"))
-    # Paid execute calls can take longer than catalog reads. A longer default
-    # reduces the risk that a local timeout tempts a caller to repeat a paid
-    # call whose remote outcome is unknown.
     if operation == "execute":
         request["timeout_seconds"] = _timeout_seconds(
             request.get("timeout_seconds"), default=240.0, maximum=780.0
@@ -1303,7 +1221,7 @@ def _invoke(command: Sequence[str], timeout_seconds: float) -> Tuple[int, str, s
         completed = provider_capture.run(
             "deepline",
             list(command),
-            stdin=subprocess.DEVNULL,  # Provider CLI must not own the MCP control pipe.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1368,7 +1286,6 @@ def _catalog_output(
 
 
 def _native_result_envelope(parsed, tool):
-    """Unwrap observed native outputs; retain IDs/billing and the raw receipt."""
     if (tool in {"aviato_get_company_funding_rounds", "deepline_native_get_funding_updates"}
             and isinstance(parsed, dict) and parsed.get("status") == "completed"):
         envelope = parsed.get("toolResponse")
@@ -1391,8 +1308,6 @@ def _native_result_envelope(parsed, tool):
                     if not isinstance(row, dict):
                         return False
                     if tool == "aviato_get_company_funding_rounds":
-                        # Incomplete older rounds remain visible; funding_record
-                        # checks stage and announcement date before qualification.
                         return True
                     return (isinstance(row.get("data"), dict) and isinstance(row.get("content"), dict)
                             and all(isinstance(row.get(key), str) and row[key].strip()
@@ -1402,7 +1317,6 @@ def _native_result_envelope(parsed, tool):
                     return dict(parsed, results=rows)
                 return dict(parsed, status="schema_error", results=[],
                             error=f"Expected {tool} array of objects")
-    # Where each tool's result rows sit in its reply (the Glassdoor overview is one record, not a list).
     lists = {"crustdata_v3_job_search": ("job_listings",), "crustdata_v3_company_search": ("companies",),
              "fullenrich_company_search": ("companies",), "bloomberry_search_job_postings": ("jobs",),
              "openwebninja_glassdoor_company_reviews": ("data", "data", "reviews"),
@@ -1415,15 +1329,13 @@ def _native_result_envelope(parsed, tool):
         return parsed
     raw = parsed.get("toolResponse", {}).get("rawV2") if isinstance(parsed.get("toolResponse"), dict) else None
     if tool in lists:
-        # Every envelope on the way to the rows can carry the provider's failure (Glassdoor's sits in rawV2.data).
         rows, parts = raw, [parsed, parsed.get("toolResponse"), raw.get("meta") if isinstance(raw, dict) else None]
         for key in lists[tool]:
             parts.append(rows)
             rows = rows.get(key) if isinstance(rows, dict) else None
         if isinstance(rows, dict):
-            parts.append(rows)  # A single record (the Glassdoor overview) can carry the failure itself.
+            parts.append(rows)
         for part in parts:
-            # A miss explains an empty list; it never excuses an error beside rows.
             if not isinstance(part, dict) or not rows and _explained_miss(part):
                 continue
             status = _structured_status(part)
@@ -1433,13 +1345,11 @@ def _native_result_envelope(parsed, tool):
         if tool == "openwebninja_glassdoor_company_overview" and isinstance(rows, dict):
             rows = [rows] if rows else []
         if rows is None and parsed.get("status") == "no_result":
-            return parsed  # Deepline's own miss can arrive without the list.
+            return parsed
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             return dict(parsed, status="schema_error", results=[],
                         error=f"Expected {tool} {'.'.join(lists[tool])} array of objects")
         return dict(parsed, results=rows)
-    # Native search returns web/news lists without a CLI list preview.
-    # Keep every returned row and the original envelope, including billing.
     data = raw.get("data") if isinstance(raw, dict) else None
     meta = raw.get("meta") if isinstance(raw, dict) else None
     for part in (parsed, parsed.get("toolResponse"), raw, meta):
@@ -1475,8 +1385,6 @@ def _native_result_envelope(parsed, tool):
 
 
 def _explained_miss(envelope):
-    """A reply that reports success with empty result lists and says nothing was found ("No jobs found for the given
-    company information.") is a miss, not a failure. Any other message, or one naming a known failure, still fails."""
     return (isinstance(envelope, dict) and envelope.get("success") is True and isinstance(envelope.get("error"), str)
             and re.match(r"no\b.*\bfound\b", envelope["error"].strip(), re.IGNORECASE | re.DOTALL) is not None
             and _classify_error(envelope["error"]) == "provider_error" and isinstance(envelope.get("data"), dict)
@@ -1484,15 +1392,9 @@ def _explained_miss(envelope):
 
 
 def _empty_result_failure(parsed):
-    """Read explicit envelope failures after extraction found no result rows.
-
-    Follow only wrapper dictionaries, never lists or arbitrary row fields.
-    """
     pending = [parsed] if isinstance(parsed, dict) else []
     while pending:
         envelope = pending.pop()
-        # Some providers encode a canonical miss as a boolean error marker.
-        # Accept only that exact shape; additional failure fields still apply.
         if (set(envelope) == {"error", "error_code", "status"}
                 and envelope["error"] is True and envelope["error_code"] == "NO_MATCH"
                 and envelope["status"] in ("no_result", "no_results")):
@@ -1515,7 +1417,6 @@ def _execute_output(
     limit: int = 10,
 ) -> Dict[str, Any]:
     native = _native_result_envelope(parsed, tool)
-    # The tool's own result list decides its rows; an empty list is not a cue to search other fields.
     unwrapped = native is not parsed and isinstance(native.get("results"), list)
     parsed = native
     structured = _structured_execute_envelope(parsed)
@@ -1542,9 +1443,6 @@ def _execute_output(
         records = parsed["results"] if unwrapped else _records(parsed)
     outer_status = _envelope_status(parsed)
     selected_status = _structured_status(envelope) if structured else None
-    # Harvest's single-company endpoint can wrap its failure as a one-item
-    # result list. Recognize that exact shape without treating company fields
-    # (or other providers' row-level statuses) as route failures.
     company_failure = None
     if (tool == "harvestapi_get_company" and len(records) == 1
             and isinstance(records[0], dict)
@@ -1559,7 +1457,6 @@ def _execute_output(
         "partial" if "partial" in statuses else selected_status or outer_status,
     )
     if outer_status == "no_results":
-        # A canonical empty outcome need not contain a row-shaped payload.
         nested = parsed.get("toolResponse", parsed.get("tool_response", {}))
         nested_status = empty_status or _envelope_status(nested)
         error = empty_error or _envelope_error(parsed)
@@ -1623,7 +1520,6 @@ def _execute_output(
 
 
 def run(request: Dict[str, Any], capture=None) -> Tuple[Dict[str, Any], int]:
-    """Run one validated request and return (JSON body, process exit code)."""
 
     request = _validate_request(request)
     if request["operation"] == "execute":
@@ -1632,7 +1528,6 @@ def run(request: Dict[str, Any], capture=None) -> Tuple[Dict[str, Any], int]:
             key = api_key()
         except (OSError, ValueError):
             raise ConfigError("Deepline authentication could not be read; request was not sent") from None
-        # Only the direct API sends an execution key; the ledger saves it before dispatch.
         execution_key = new_execution_key() if key and request["tool"] not in UNKEYED_TOOLS else None
         return guarded_call(request, "deepline",
                             lambda saved_key=None: _run_validated(request, capture, key, saved_key),
@@ -1703,12 +1598,6 @@ def _run_command(request: Dict[str, Any], command: Sequence[str], timeout_second
 
 
 def _completed_execute_output(parsed: Any, tool: str) -> Any:
-    """Interpret observed raw API results without changing the captured receipt.
-
-    The CLI and a hosted transport can return the same completed-job envelope.
-    Keep generated answers separate from cited evidence and recognize only
-    validated provider-specific result shapes. Other shapes use the normal parser.
-    """
     if (not isinstance(parsed, dict)
             or parsed.get("status") != "completed"
             or not isinstance(parsed.get("job_id"), str) or not parsed["job_id"].strip()):
@@ -1722,7 +1611,6 @@ def _completed_execute_output(parsed: Any, tool: str) -> Any:
             and not set(parsed) - {"billing", "job_id", "request_id", "requestId", "toolResponse", "status"}
             and isinstance(response, dict) and not set(response) - {"rawV2", "view"}
             and response.get("view", "rawV2") in {"rawV2", "data"}):
-        # The CLI wraps the same provider result differently from the API.
         data = response.get("rawV2")
     else:
         return parsed
@@ -1765,8 +1653,6 @@ def _completed_execute_output(parsed: Any, tool: str) -> Any:
                 or not isinstance(user.get("username"), str) or not re.fullmatch(r"[A-Za-z0-9._]{1,30}", user["username"])
                 or (user.get("biography") is not None and not isinstance(user["biography"], str))):
             return parsed
-        # A social account can represent an organization. Keep its full_name
-        # inside the profile so it does not become a purported business contact.
         rows = [{"instagram_profile": user, "evidence_url": "https://www.instagram.com/" + user["username"] + "/",
                  "evidence_text": user.get("biography") or ""}]
         status = "ok"
@@ -1839,7 +1725,6 @@ def _completed_execute_output(parsed: Any, tool: str) -> Any:
                 and isinstance(errors[0], dict) and set(errors[0]) == {"error", "status"}
                 and errors[0]["status"] == 404
                 and isinstance(errors[0]["error"], str) and errors[0]["error"].strip()):
-            # Preserve the error for the existing company-failure classifier.
             status, rows = "ok", [{"status": 400, "error": errors}]
     if status is None:
         return parsed
@@ -1848,11 +1733,6 @@ def _completed_execute_output(parsed: Any, tool: str) -> Any:
 
 
 def _firecrawl_batch_output(parsed, tool):
-    """Keep the provider's async result state separate from Deepline's wrapper.
-
-    Observed wrappers call an unfinished batch 'completed' and a free getter
-    with a completed page 'no_result'. Neither label proves a charge or a miss.
-    """
     if (tool not in {"firecrawl_batch_scrape", "firecrawl_get_batch_scrape_status"}
             or not isinstance(parsed, dict) or parsed.get("status") not in {"completed", "no_result"}
             or not parsed.get("job_id")):
@@ -1873,7 +1753,6 @@ def _firecrawl_batch_output(parsed, tool):
 
 
 def normalize_response(request: Dict[str, Any], response: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
-    """Interpret a captured response using the live adapter rules, without I/O."""
     body, code = _normalize_response(request, response)
     if not body.get("request_id"):
         headers = response.get("headers", {})
@@ -1896,8 +1775,6 @@ def _normalize_response(request: Dict[str, Any], response: Dict[str, Any]) -> Tu
         except ValueError:
             parsed = None
     if isinstance(parsed, dict) and "executionRecovery" in parsed:
-        # A keyed call's execution state is Deepline metadata, not provider output; exact-shape
-        # rules must read a keyed response as they read an unkeyed one. The receipt keeps it.
         parsed = {key: value for key, value in parsed.items() if key != "executionRecovery"}
     stderr = response.get("stderr", "")
     if not isinstance(stderr, str):
@@ -1917,9 +1794,6 @@ def _normalize_response(request: Dict[str, Any], response: Dict[str, Any]) -> Tu
     returncode = response.get("exit_code")
     if type(returncode) is not int:
         raise ValueError("captured response requires an exit code or timeout")
-    # Hunter's observed data-absence error is not an endpoint or transport 404. Deepline may add
-    # metadata fields to its responses (2026-10-08: parsers should tolerate them), so only a
-    # field that could carry provider output or a different outcome rules this reading out.
     if (request["operation"] == "execute" and request.get("tool") == "hunter_companies_find"
             and request.get("entity_type") == "company" and isinstance(parsed, dict)
             and not set(parsed) & (_PROVIDER_OUTPUT_FIELDS | _OUTCOME_FIELDS) and parsed.get("ok") is False
@@ -1932,9 +1806,6 @@ def _normalize_response(request: Dict[str, Any], response: Dict[str, Any]) -> Tu
             "error": _envelope_error(parsed), **_execution_metadata(parsed),
         }, 0
     if returncode != 0:
-        # A current CLI can print an update notice before a structured provider
-        # error. Prefer that parsed error over notice/help text. Otherwise,
-        # prefer stderr because stdout help examples can contain status words.
         parsed_error = _envelope_error(parsed)
         parsed_status = _envelope_status(parsed)
         diagnostic = stderr.strip() or stdout.strip()
@@ -2022,8 +1893,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if receipt is not None and not receipt.finish(body):
         body = dict(body, receipt_error="Response file could not be finalized. Preserve this output; do not repeat a possibly billed request.")
         code = 2
-    # One compact JSON object is the only stdout output.  Operational detail is
-    # intentionally omitted to keep credentials from appearing in logs.
     sys.stdout.write(json.dumps(redact(body), ensure_ascii=True, separators=(",", ":")) + "\n")
     return code
 

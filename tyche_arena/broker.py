@@ -1,4 +1,3 @@
-"""Credential-free Arena operation frames; no HTTP or direct-provider fallback."""
 
 import base64
 import copy
@@ -18,7 +17,7 @@ import deepline
 import scrapingdog
 import scrapingdog_billing
 
-PROVIDER_OVERHEAD_SECONDS = 65  # Arena admission 20 + billing 30 + API grace 15.
+PROVIDER_OVERHEAD_SECONDS = 65
 SCRAPINGDOG_PROVIDER_TIMEOUT_SECONDS = 60
 DEEPLINE_PROVIDER_TIMEOUT_SECONDS = 240
 PROVIDER_WAIT_SECONDS = PROVIDER_OVERHEAD_SECONDS + SCRAPINGDOG_PROVIDER_TIMEOUT_SECONDS
@@ -27,15 +26,11 @@ PROVIDER_TIMEOUT_LIMITS = {
     "deepline": DEEPLINE_PROVIDER_TIMEOUT_SECONDS,
     "scrapingdog": SCRAPINGDOG_PROVIDER_TIMEOUT_SECONDS,
 }
-# Leadpoet's own per-operation limits (lab_arena/operations.py); a longer frame timeout is refused.
 OPERATION_TIMEOUT_LIMITS = {"scrapingdog.scrape": 60, "scrapingdog.google": 60}
 SCRAPINGDOG_DEFAULT_OPERATION_TIMEOUT_SECONDS = 45
 PROVIDERS = ("deepline", "scrapingdog")
 SCRAPINGDOG_RUNTIME_HANDLE = "lab-arena-brokered-scrapingdog"
 
-# These are the intersections between the native adapter and the Arena's
-# existing closed operation table. Fields absent here are rejected before a
-# budget reservation; they are never silently removed from a paid request.
 _SCRAPINGDOG_ROUTES = {
     "google_search": ("/google", "scrapingdog.google", {"query", "country", "results"}),
     "scrape": ("/scrape", "scrapingdog.scrape", {"url", "dynamic", "premium", "wait"}),
@@ -87,7 +82,6 @@ class BrokerError(RuntimeError):
 
 
 class BrokerRefusal(BrokerError):
-    """A known refusal before provider dispatch, with its original code."""
 
     def __init__(self, code):
         self.code = code
@@ -118,14 +112,10 @@ class Broker:
             raise ValueError("Arena provider block states must be booleans by provider")
         self._calls = dict(initial_calls)
         self.lock = threading.Lock()
-        # The host permits overlapping paid calls. Bound this adapter to the
-        # existing three-check lookup batch; native reservations still own caps.
         self._paid_dispatch_lock = threading.BoundedSemaphore(3)
         self.stopped = threading.Event()
         self._provider_blocked = dict(provider_blocked)
 
-    # Preserve the previous Deepline-only test and integration surface while
-    # the model-visible budget below reports both provider counters.
     @property
     def calls(self):
         return self._calls["deepline"]
@@ -155,7 +145,6 @@ class Broker:
             self._provider_blocked[provider] = True
 
     def local_dispatch_budget(self):
-        """Return adapter telemetry; the Arena host owns dispatch capacity."""
         with self.lock:
             used = dict(self._calls)
         return {
@@ -186,7 +175,6 @@ class Broker:
         return bytes(result)
 
     def _admit(self, provider="deepline", *, allow_after_deadline=False):
-        """Claim one local dispatch slot before the native budget is reserved."""
 
         if provider not in PROVIDERS:
             raise ValueError("Unsupported Arena provider")
@@ -203,7 +191,6 @@ class Broker:
             self._calls[provider] += 1
 
     def _release_admission(self, provider="deepline"):
-        """Release only a slot proved not to have reached the Arena worker."""
 
         with self.lock:
             if self._calls[provider] <= 0:
@@ -211,7 +198,6 @@ class Broker:
             self._calls[provider] -= 1
 
     def _acquire_paid_dispatch(self, *, allow_after_deadline=False):
-        """Wait interruptibly for one of this ICP's three paid transport slots."""
 
         deadline = self.response_deadline if allow_after_deadline else self.deadline
         deadline_code = "response_deadline_reached" if allow_after_deadline else "deadline_reached"
@@ -226,19 +212,16 @@ class Broker:
             self.stopped.wait(min(0.05, remaining))
 
     def _requires_paid_dispatch(self, request, provider):
-        """Recognize only catalog-confirmed zero-cost calls as gate-free."""
 
         spend = request.get("spend", {})
         if not isinstance(spend, dict):
-            return True  # The native guard rejects malformed spend before transport.
+            return True
         if "max_cost_credits" in spend:
             try:
                 if budget_guard.amount(spend["max_cost_credits"], "maximum call cost") != 0:
                     return True
             except (ValueError, TypeError, ArithmeticError):
                 return True
-        # Actual-cost ledgers omit a reservation bound. Absence does not make
-        # the request free: only the bundled provider catalog can establish that.
         if provider != "deepline":
             return True
         tool = self.catalog.get(request.get("tool"))
@@ -291,9 +274,6 @@ class Broker:
             raise ValueError("Arena request exceeds frame limit")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                # The frame timeout limits provider execution. The worker can
-                # still validly spend bounded time on admission and billing;
-                # wait for that envelope without crossing the phase cutoff.
                 wait_seconds = (PROVIDER_OVERHEAD_SECONDS + provider_timeout
                                 if provider == "deepline" else PROVIDER_WAIT_SECONDS)
                 wait_deadline = min(self.response_deadline, time.monotonic() + wait_seconds)
@@ -306,7 +286,6 @@ class Broker:
                     raise BrokerError("Invalid Arena response size")
                 response = json.loads(self._receive(connection, size, deadline=wait_deadline))
         except (OSError, ValueError) as exc:
-            # Dispatch may have billed. Never replay this request.
             raise BrokerError("Arena transport failed; do not retry the call") from exc
         if not isinstance(response, dict):
             raise BrokerError("Invalid Arena response envelope")
@@ -327,7 +306,7 @@ class Broker:
         return response["status"], response["headers"], body
 
     def _after_call(self, body):
-        """Host hook run before this call releases its transport slot; base does nothing."""
+        pass
 
     @staticmethod
     def _valid_https_url(value):
@@ -371,7 +350,6 @@ class Broker:
 
     @staticmethod
     def _scrapingdog_frame(request):
-        """Match the native outbound request to one existing closed Arena operation."""
 
         operation_kind = request["operation_kind"]
         route = _SCRAPINGDOG_ROUTES.get(operation_kind)
@@ -422,7 +400,6 @@ class Broker:
 
     @staticmethod
     def _scrapingdog_runner(transport):
-        """Bind transport per call without modifying the shared native module."""
 
         native = scrapingdog._run_validated
         globals_ = dict(native.__globals__)
@@ -431,7 +408,6 @@ class Broker:
 
     @staticmethod
     def _scrapingdog_preflight_failure(request, capture, exc):
-        """Finish an expected native no-send failure in the adapter response schema."""
 
         is_input = isinstance(exc, scrapingdog.InputError)
         status = "schema_error" if is_input else "config_error"
@@ -475,7 +451,7 @@ class Broker:
                     try:
                         bound = budget_guard.amount(spend["max_cost_credits"], "ScrapingDog maximum call cost")
                     except (ValueError, TypeError, ArithmeticError):
-                        pass  # The native guard returns its existing no-send refusal.
+                        pass
                     else:
                         minimum = self._scrapingdog_minimum_credits(operation_id, parameters)
                         if bound <= 0:
@@ -518,10 +494,12 @@ class Broker:
         def dispatch():
             try:
                 if is_deepline:
-                    parameters = {"tool": request["tool"], "payload": request["payload"]}
+                    # Named apart from the ScrapingDog frame's `parameters`: assigning `parameters` here made it a local
+                    # of dispatch(), so transport() below read an unassigned local and every ScrapingDog call failed.
+                    deepline_parameters = {"tool": request["tool"], "payload": request["payload"]}
                     if request["tool"] == "generic_http_request":
-                        parameters["response_contract"] = "raw-v2"  # Match the native HTTP transport's page provenance.
-                    status, headers, payload = self.request("deepline.execute", parameters, admitted=True,
+                        deepline_parameters["response_contract"] = "raw-v2"
+                    status, headers, payload = self.request("deepline.execute", deepline_parameters, admitted=True,
                         timeout_seconds=request["timeout_seconds"])
                 else:
                     def transport(url, native_timeout_seconds):
@@ -533,13 +511,8 @@ class Broker:
 
                     return self._scrapingdog_runner(transport)(request, capture)
             except BrokerRefusal as exc:
-                # A worker refusal is not a provider response or billing receipt.
-                # Preserve its code and keep the conservative reservation.
                 return refusal(exc, request_sent=True)
             except BrokerError as exc:
-                # The outcome is uncertain: keep this call's reservation and never replay it
-                # (TYCHE refuses a repeated request). Other lookups continue, as in local runs;
-                # Leadpoet settles the bill. No invented zero-cost receipt.
                 raw = ({"body": {}, "timed_out": True, "stderr": str(exc)} if is_deepline else
                        {"timed_out": True, "incomplete": True, "arena": {"error": str(exc)}})
                 capture(raw)
@@ -564,7 +537,6 @@ class Broker:
             try:
                 self._admit(provider, allow_after_deadline=allow_after_deadline)
             except BrokerRefusal as exc:
-                # No native reservation and no Arena frame exist for this refusal.
                 return refusal(exc, request_sent=False)
 
             def accounted_dispatch():
@@ -573,14 +545,11 @@ class Broker:
                     body.update(tariff=tariff, **scrapingdog_billing.outcome(tariff, captured))
                 return body, code
             body, code = budget_guard.guarded_call(request, provider, accounted_dispatch, tariff=tariff)
-            self._after_call(body)  # Still inside this ICP's paid-dispatch slot.
+            self._after_call(body)
             if body.get("request_sent") is False:
-                # The native ledger rejected before dispatch, so this local slot is
-                # also unused. Never release after an Arena frame might have left.
                 self._release_admission(provider)
             return body, code
         except BrokerRefusal as exc:
-            # Waiting for the per-ICP transport never admits or reserves a call.
             return refusal(exc, request_sent=False)
         finally:
             if paid_dispatch_acquired:

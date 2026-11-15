@@ -1,19 +1,3 @@
-"""Keep every outside call TYCHE makes itself, by ARETE's provider-call capture contract v1.
-
-A host turns capture on with PROVIDER_CAPTURE_DIR=<folder>. Unset or empty, nothing here changes a call and nothing
-is written. Each attempt is one JSON line (schema arete.provider_call/1) appended to
-<folder>/provider-calls-<pid>.jsonl: the exact request, the raw reply up to 16 MiB, status, headers and timing, with
-every credential redacted. Capture never raises into the stage and never changes what it sends, receives or decides;
-a line it cannot write is lost, and the stage's own ledger still shows the call.
-
-The lowest send points carry the hooks: an HTTP function decorated with http() marks its urllib request with sent()
-and reads its reply through read(); the Deepline CLI runs through run(). route() and dispatch() say what those sends
-are for: the ledger call a paid dispatch sends, or reads (catalog, billing, recovery) that send none. A billing read's
-reply lists other runs' records, so it is stored only as the stage keeps it (keeping()).
-
-A call only notes plain facts while it runs. Its line is rendered and written once the stage is done with it: when its
-outermost route ends (after the stage's reads, deadline checks and resends), or as it ends outside any route.
-"""
 
 from contextlib import contextmanager, nullcontext
 import contextvars
@@ -37,32 +21,29 @@ from urllib.parse import quote, quote_plus, unquote_plus, urlsplit
 
 ENV = "PROVIDER_CAPTURE_DIR"
 SCHEMA = "arete.provider_call/1"
-BOUND = 16 * 1024 * 1024  # A longer reply keeps its first BOUND bytes; its sha256 and size stay of the whole.
-SHORTEST_SECRET = 8  # A shorter value is a placeholder, not a credential.
+BOUND = 16 * 1024 * 1024
+SHORTEST_SECRET = 8
 REDACTED = "[REDACTED]"
 CREDENTIAL_GAP = "a credential reached this call and was redacted"
 _HIDDEN_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
-_KEY_HEADER_WORDS = ("api-key", "api_key", "apikey", "token", "secret", "password")  # never an idempotency key
+_KEY_HEADER_WORDS = ("api-key", "api_key", "apikey", "token", "secret", "password")
 _CREDENTIAL_PARAMS = {"api_key", "apikey", "api-key", "key", "access_token", "auth_token", "token", "secret",
                       "client_secret", "password"}
-_KEY_FILES = (".env.deepline",)  # TYCHE's project credentials, read from the working folder up
-_CLI_KEYS = Path(".local/deepline")  # The Deepline CLI's host credentials: ~/.local/deepline/<host>/.env
+_KEY_FILES = (".env.deepline",)
+_CLI_KEYS = Path(".local/deepline")
 _ROUTE = contextvars.ContextVar("provider_capture_route", default=None)
 _CALL = contextvars.ContextVar("provider_capture_call", default=None)
-_WRITE = threading.Lock()  # Capture's own; the stage never holds it.
-_WRITE_WAIT = 5  # Seconds; a writer never blocks the stage for longer, and loses its line instead.
+_WRITE = threading.Lock()
+_WRITE_WAIT = 5
 _HELD_LOCK = threading.Lock()
-_HELD = set()  # Every credential this process has sent, so any later line (a CLI's output too) redacts it.
-_ROUTE_ENV = "CODEX_PROVIDER_OVERRIDES"  # The host's model route; its Authorization header holds a per-run token.
-# A ledger call's attempts continue across processes (a resumed run): this process's sends of each (folder, call id)
-# are counted as they go, and added at write time to the highest attempt the folder's files already held for that
-# call when this process first wrote a send there. Route ids are random, so one ARETE run's TYCHE runs never share one.
-_SENDS_LOCK = threading.Lock()  # Held only to count one send, never while a file is read.
-_SENDS = {}  # (folder, call id) -> this process's sends so far
-_SEED_LOCK = threading.Lock()  # Held while a folder's files are read, at write time only.
-_SEEDS = {}  # folder -> {call id: highest attempt in the folder's files before this process wrote a send there}
+_HELD = set()
+_ROUTE_ENV = "CODEX_PROVIDER_OVERRIDES"
+_SENDS_LOCK = threading.Lock()
+_SENDS = {}
+_SEED_LOCK = threading.Lock()
+_SEEDS = {}
 _SEND_HEAD = re.compile(rb'\{"schema": "arete\.provider_call/1", "stage": "tyche", "call_id": ("(?:[^"\\\n]|\\.)*"), '
-                        rb'"attempt": (\d+)')  # Matched at each line's start only.
+                        rb'"attempt": (\d+)')
 
 
 def _folder():
@@ -71,10 +52,6 @@ def _folder():
 
 @contextmanager
 def route(call_id, operation=None, paid=None):
-    """Say what the calls sent inside are for: a ledger call's own sends (its id), or reads that send none (None).
-
-    The lines of every call inside are written when the outermost route ends, once the stage is done with them.
-    """
     if not _folder():
         yield
         return
@@ -90,13 +67,11 @@ def route(call_id, operation=None, paid=None):
         except Exception:
             pass
         if parent is None:
-            pending["open"] = False  # A call still ending elsewhere writes its own line.
+            pending["open"] = False
             _flush(pending["calls"])
 
 
 def dispatch(request):
-    """The route of one dispatched request. Only a paid request, which carries its spend reservation, sends a ledger
-    call (spend.route_id); a free catalog read sends none."""
     if not _folder():
         return nullcontext()
     try:
@@ -108,27 +83,18 @@ def dispatch(request):
 
 
 def reading_for(call_id):
-    """Name the ledger call that the billing or recovery reads from here on read for; None once they stop."""
     current = _ROUTE.get()
     if current is not None and current["call_id"] is None:
         current["for_call"] = call_id
 
 
 def keeping(keep):
-    """Store each reply of the reads from here on only as keep(raw bytes, url) returns what the stage keeps of it
-    (response_kept "as_kept"; None keeps nothing): a billing page lists other runs' records."""
     current = _ROUTE.get()
     if current is not None and current["call_id"] is None:
         current["keep"] = keep
 
 
 def http(provider, *, kept=False):
-    """Keep one line per call of the decorated function, which sends one urllib request.
-
-    It marks the request with sent() as it opens it and reads its reply through read(); an exception it handles itself
-    goes to failed(). With kept=True its reply is never stored raw, only as the route's keeping() function returns it.
-    Without the switch the function runs unchanged.
-    """
     def decorate(function):
         @functools.wraps(function)
         def captured(*args, **kwargs):
@@ -150,7 +116,6 @@ def http(provider, *, kept=False):
 
 
 def sent(request):
-    """Mark the urllib request about to be opened; it is returned unchanged."""
     call = _CALL.get()
     if call is not None:
         call.sent(request)
@@ -158,8 +123,6 @@ def sent(request):
 
 
 def read(response, *amount):
-    """response.read(*amount), noting the reply's status, headers and bytes. Capture never reads on for the stage: a
-    bounded read that stops before the reply's end keeps what the stage read."""
     call = _CALL.get()
     if call is None:
         return response.read(*amount)
@@ -167,17 +130,16 @@ def read(response, *amount):
     try:
         data = response.read(*amount)
     except BaseException:
-        call.cut_short = True  # The read itself failed: the reply could not be read to its end.
+        call.cut_short = True
         raise
     call.reply(response, data, complete=_read_to_end(response, data, amount))
     return data
 
 
 def _read_to_end(response, data, amount):
-    """Whether a read reached the reply's end, judged from what http.client already knows."""
     try:
         if not amount or amount[0] is None or amount[0] < 0:
-            return True  # An unbounded read returns only at the end; a reply that breaks off raises.
+            return True
         remaining = getattr(response, "length", None)
         return remaining == 0 if type(remaining) is int else len(data) < amount[0]
     except Exception:
@@ -185,18 +147,12 @@ def _read_to_end(response, data, amount):
 
 
 def failed(error):
-    """Note an exception the sending function handles itself, such as a timeout it reports in its result."""
     call = _CALL.get()
     if call is not None:
         call.failed(error)
 
 
 def run(provider, argv, **options):
-    """subprocess.run(argv, **options), kept as one line when the switch is on.
-
-    The line keeps the exact bytes, so the child runs in binary mode and its output is decoded here as subprocess's
-    own text mode decodes it on POSIX (with universal newlines); the caller receives the same text.
-    """
     folder = _folder()
     try:
         call = folder and _Process(provider, folder, argv)
@@ -235,7 +191,6 @@ def run(provider, argv, **options):
 
 
 def _flush(calls):
-    """Render and write the lines of a route that has ended, in the order their calls ended."""
     while calls:
         try:
             calls.pop(0).write()
@@ -244,13 +199,12 @@ def _flush(calls):
 
 
 class _Call:
-    """One attempt. While it runs it only notes plain facts; its line is rendered once the stage is done with it."""
     transport = "http"
 
     def __init__(self, provider, folder, kept=False):
         self.provider, self.folder, self.kept, self.route = provider, folder, kept, _ROUTE.get()
         self.pending = None if self.route is None else self.route["pending"]
-        self.outer = sys.exc_info()[1]  # An exception the caller was already handling is not this call's.
+        self.outer = sys.exc_info()[1]
         self.started = self.ended = self.error = self.keep = None
         self.data, self.complete, self.cut_short = None, False, False
 
@@ -258,7 +212,7 @@ class _Call:
         try:
             self._note_send()
         except Exception:
-            self.started = None  # Capture never raises into the stage; this call's line is lost.
+            self.started = None
 
     def _note_send(self):
         self.started = _clock()
@@ -268,7 +222,7 @@ class _Call:
             self.call_id, self.attempt, self.for_call = route["call_id"], None, None
             with _SENDS_LOCK:
                 key = (self.folder, self.call_id)
-                self.send = _SENDS[key] = _SENDS.get(key, 0) + 1  # Its attempt is numbered when its line is written.
+                self.send = _SENDS[key] = _SENDS.get(key, 0) + 1
         else:
             self.call_id, self.attempt, self.for_call, self.keep = None, 1, route.get("for_call"), route.get("keep")
 
@@ -277,15 +231,12 @@ class _Call:
             self.error, self.ended = error, self.ended or _clock()
 
     def end(self):
-        """The call is over: keep the facts its line needs, let go of every object it saw, and write its line now
-        outside any route, or when the outermost route ends."""
         try:
             if self.started is not None:
                 self._settle()
         except Exception:
             self.started = None
         finally:
-            # Hold nothing past the call: a kept exception or reply would keep its connection open.
             self.error = self.outer = self.route = None
             self.__dict__.pop("request", None)
             self.__dict__.pop("response", None)
@@ -301,16 +252,15 @@ class _Call:
             if self.call_id is not None:
                 seed = _seed(self.folder)
                 if seed is None:
-                    return  # Its attempt cannot be numbered, so its line is lost; the ledger still shows the call.
+                    return
                 self.attempt = seed.get(self.call_id, 0) + self.send
             _write(self.folder, self.line())
         except Exception:
-            pass  # Capture never raises into the stage; the ledger still shows the call.
+            pass
         finally:
             self.__dict__.clear()
 
     def _ending(self, chain, replied, broke=False):
-        """(outcome, the text of the exception that ended the call, how its reply is kept)."""
         outcome, cause = "answered", self.error
         if self.error is not None and not self.complete:
             for name, test in (("timeout", _timed_out), ("transport_error", _transport_failed)):
@@ -320,22 +270,18 @@ class _Call:
                     break
             else:
                 if not replied or self.cut_short:
-                    outcome = "interrupted"  # The stage's own exception while the call ran.
-        # After the reply came, an exception is the stage's own decision about it, and is named in `error`.
+                    outcome = "interrupted"
         if not replied and self.data is None:
             kept = "none"
         elif self.complete:
             kept = "whole"
         elif broke or self.cut_short or outcome in {"timeout", "transport_error"}:
-            kept = "broke"  # The reply broke off, or could not be read to its end.
+            kept = "broke"
         else:
-            kept = "as_read"  # The stage stopped reading (or never read) before the reply's end.
+            kept = "as_read"
         return outcome, None if cause is None else f"{type(cause).__name__}: {cause}", kept
 
     def _reply(self, url, secrets, gaps):
-        """The reply's fields. A read route's keeping() function (or kept=True) stores only what the stage keeps of
-        the reply it read to its end, with the sha256 and size of the raw reply; of a reply it did not read to its end
-        (one it stopped reading, never read, or that broke off) it keeps nothing, and the sha256 and size are null."""
         data, kept = self.data, self.kept_as
         if kept == "none" or (self.keep is None and not self.kept):
             return _reply(data, kept, secrets, gaps)
@@ -391,10 +337,10 @@ class _Http(_Call):
         self.settled = _clock()
         request, response = self.request, self.response
         chain = _chain(self.error, self.outer)
-        if response is None:  # An HTTP error status is a reply, even one the stage never read.
+        if response is None:
             response = next((exc for exc in chain if isinstance(exc, HTTPError)), None)
         broke = next((exc.partial for exc in chain if isinstance(exc, IncompleteRead)), None)
-        if self.data is None:  # http.client keeps what arrived of a reply that broke off.
+        if self.data is None:
             self.data = broke
         self.outcome, self.cause, self.kept_as = self._ending(chain, response is not None, broke is not None)
         self.method, self.url, self.sent_headers = request.get_method(), request.full_url, request.header_items()
@@ -430,12 +376,11 @@ class _Process(_Call):
 
     def _settle(self):
         self.settled = _clock()
-        # A child killed at its timeout has a partial reply: it broke off.
         self.outcome, self.cause, self.kept_as = self._ending(_chain(self.error, self.outer),
                                                               self.exit_code is not None, self.data is not None)
         self.argv = [os.fsdecode(part) for part in self.argv]
         self.body = self.unstored = None
-        try:  # The Deepline CLI reads its payload from `--input @file`: that file is the body it sent.
+        try:
             path = next((value[1:] for flag, value in zip(self.argv, self.argv[1:])
                          if flag == "--input" and value.startswith("@")), None)
             self.body = None if path is None else Path(path).read_bytes()
@@ -463,7 +408,6 @@ def _iso(seconds):
 
 
 def _chain(error, outer=None):
-    """The exception and its causes, stopping at the one the caller was already handling."""
     seen, pending = [], [error]
     while pending:
         exc = pending.pop(0)
@@ -491,7 +435,6 @@ def _status(response):
 
 
 def _hold(url, headers):
-    """Remember every credential a request sent in an authorization header or a credential query parameter."""
     sent = set()
     for name, value in headers:
         if str(name).lower() in {"authorization", "proxy-authorization"}:
@@ -506,8 +449,6 @@ def _hold(url, headers):
 
 
 def _file_keys():
-    """The keys TYCHE and the Deepline CLI load from files: every .env.deepline from the working folder up, and the
-    CLI's host credentials (~/.local/deepline/<host>/.env)."""
     paths = []
     try:
         here = Path.cwd()
@@ -536,8 +477,6 @@ def _file_keys():
 
 
 def _route_tokens():
-    """The model route's token: the value after `Bearer ` in each http_headers.Authorization of the JSON settings in
-    CODEX_PROVIDER_OVERRIDES (flat keys such as model_providers.<id>.http_headers.Authorization, or nested)."""
     tokens, pending = set(), []
     try:
         pending.append(("", json.loads(os.environ.get(_ROUTE_ENV) or "null")))
@@ -553,9 +492,6 @@ def _route_tokens():
 
 
 def _secrets():
-    """Every credential value a line could carry, longest first: each *_API_KEY and *_TOKEN in the environment,
-    every key TYCHE or the Deepline CLI loads from a file, the model route's token, and every value this process has
-    sent as one; as raw and stripped values and their JSON-escaped, repr and URL-encoded forms."""
     values = {value for name, value in os.environ.items() if name.upper().endswith(("_API_KEY", "_TOKEN"))}
     values |= _file_keys() | _route_tokens()
     with _HELD_LOCK:
@@ -580,7 +516,6 @@ def _scrub(text, secrets):
 
 
 def _scrubbed(text, secrets, gaps):
-    """Redact a body, reply, stderr or error text; a credential found there is a gap."""
     text, found = _scrub(text, secrets)
     if found and CREDENTIAL_GAP not in gaps:
         gaps.append(CREDENTIAL_GAP)
@@ -621,7 +556,6 @@ def _request(body, secrets, gaps):
 
 
 def _text(raw, secrets, gaps, what):
-    """Bytes as stored text: every credential redacted first, so no part of one survives the cut to BOUND bytes."""
     over = len(raw) > BOUND
     if over:
         gaps.append(f"{what} was over {BOUND} bytes; only its first {BOUND} bytes are kept")
@@ -643,9 +577,6 @@ def _broke(raw):
 
 
 def _reply(data, kept, secrets, gaps):
-    """The raw reply: whole; as_read when the stage stopped reading early (what it read, no gap); cut when it was
-    over BOUND or broke off (always with a gap); none when no reply arrived. The sha256 and size are of every byte
-    that arrived or that the stage read."""
     if kept == "none":
         return {"response": None, "response_sha256": None, "response_bytes": 0, "response_kept": "none"}
     data = data or b""
@@ -661,8 +592,6 @@ def _error(cause, secrets, gaps):
 
 
 def _seed(folder):
-    """The highest attempt of each call id in the folder's files, read once, when this process first writes a send
-    there; None when capture's lock is not free in time. A file that cannot be read adds nothing."""
     if not _SEED_LOCK.acquire(timeout=_WRITE_WAIT):
         return None
     try:
@@ -680,7 +609,6 @@ def _seed(folder):
 
 
 def _highest(path, highest):
-    """Note the highest attempt of each send line's call id in one file, read from its line heads alone."""
     with open(path, "rb") as stream:
         if not os.fstat(stream.fileno()).st_size:
             return
@@ -703,11 +631,6 @@ def _last_byte(fd, size):
 
 
 def _write(folder, line):
-    """Append one whole line with one write; a line that cannot be written is lost.
-
-    A file whose last byte is not a newline (a line cut short by a crash or a full disk) gets one first, so the two
-    never fuse. The lock is capture's own, and a writer waits for it only so long.
-    """
     data = (json.dumps(line, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
     if not _WRITE.acquire(timeout=_WRITE_WAIT):
         return

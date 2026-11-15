@@ -1,4 +1,3 @@
-"""Run a fixed pool of identical researchers on the same saved sourcing loop."""
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import json
 from pathlib import Path
@@ -24,23 +23,17 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
     status_path = request_file.parent / "operational-status.json"
 
     def status_version():
-        # Status writes replace the file, so a new version means this launch wrote it.
         try:
             saved = status_path.stat()
         except FileNotFoundError:
             return None
         return saved.st_ino, saved.st_mtime_ns, saved.st_size
-    # A block saved by an earlier launch is history, not this initializer's verdict.
-    # tyche_start clears it only when the ledger holds no spending block.
     inherited_status = status_version()
     stopped = threading.Event()
     active, failures, attempts = {}, {}, {}
-    # Like the serial supervisor's MAX_UNCHANGED_EXITS: a worker whose clean invocations leave the run unchanged
-    # that many times in a row goes idle and is not relaunched; when every worker is idle, research stops.
     unchanged, idle = {}, set()
     reason = None
     billing_drain = False
-    # This function is entered only after the prior research pool was joined.
     def reopen(value):
         value["phase"] = "research"
         if run_file.exists():
@@ -62,19 +55,13 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
         return launcher.research_deadline(request_file, env["TYCHE_RUN_STARTED_AT"]) if run_file.exists() else startup_until
 
     def observe_progress():
-        # Read the stop and its cause from one decision. A separate billing read
-        # can settle between snapshots and turn a temporary pause into a fatal stop.
         progress = ResearchTools(run_file, environment=env)._overview()
         pending_billing = (progress.get("stop") == "input_or_configuration_stop"
                            and progress.get("stop_reason") == "billing_pending")
         if pending_billing:
-            # Match the serial runner: recover attributable bills without a
-            # paid retry, and let active model turns close their usage records.
             try:
                 host.reconcile_research(run_file)
             except (OSError, RuntimeError, ValueError):
-                # Preserve the pending stop. The supervisor retries/blocks
-                # after model turns have closed; never kill them for a read failure.
                 pass
             progress = ResearchTools(run_file, environment=env)._overview()
             pending_billing = (progress.get("stop") == "input_or_configuration_stop"
@@ -131,8 +118,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                     profile=profile, deadline=deadline, output=output,
                     cost_stop=lambda: (reason or "pool_stopped") if stopped.is_set() else launcher.cost_stop(request_file, receipt.path.stem))
         except (OSError, RuntimeError) as exc:
-            # execute_with_usage reaps its owned process group before returning or raising.
-            # Shared cleanup/state/accounting failures still stop the pool below.
             receipt.data.update(failure_kind="worker_error", failure_detail=type(exc).__name__, exit_code=1)
             if not receipt.data.get("finished_at"):
                 receipt.finish(1)
@@ -168,8 +153,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                 state = coordination.snapshot(run_file)
             progress, pending_billing = observe_progress() if state["ready"] else ({}, False)
             if billing_drain and not pending_billing and not stopped.is_set():
-                # A posted bill may restore normal work while a peer is still
-                # running. Cancel the old billing timer before restarting work.
                 drain_until = None
             if not stopped.is_set():
                 billing_drain = pending_billing
@@ -190,21 +173,14 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                     if status.get("status") == "operationally_blocked":
                         startup_block = status.get("reason", "Run setup is blocked")
             if startup_drain and not startup_block and not stopped.is_set():
-                # tyche_start repaired startup within the wait. Cancel the block timer.
                 drain_until, startup_drain = None, False
             terminal = billing_drain or stop in DELIVERY_STOPS or limit is not None and time.time() >= limit
             if fatal:
                 reason = str(progress.get("operational_block") or progress.get("stop_reason") or fatal)
                 stopped.set()
             elif startup_block and drain_until is None:
-                # The tool already refused startup. As with billing_pending, let the
-                # initializer end its own turn so its usage receipt closes normally.
-                # Killing it would strand an actual_cost run on unknown model usage.
                 drain_until, startup_drain = time.time() + 45, True
             elif terminal and drain_until is None:
-                # Tools refuse new work at the shared stop. Give researchers a
-                # bounded chance to save the judgments they already possess. Research
-                # that closed early for its time limit keeps the rest of that window.
                 closing = stop == "time_limit_reached" and limit is not None and limit > time.time()
                 drain_until = limit if closing else time.time() + 45
             if drain_until is not None and time.time() >= drain_until:
@@ -232,13 +208,11 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                 try:
                     data = future.result()
                 except Exception as exc:
-                    # Local model transport errors were handled after cleanup in invoke.
-                    # An escaping lifecycle/receipt/registry failure is shared state: fail closed.
                     raise RuntimeError(f"worker_lifecycle_state_failure: {worker} ({type(exc).__name__})") from exc
                 failure = data.get("failure_kind")
                 if not coordination.snapshot(run_file)["ready"]:
                     reason = "run_not_initialized"
-                    stopped.set()  # No authoritative budget exists for an automatic retry.
+                    stopped.set()
                 if data.get("cleanup_error") or failure in {"cancelled", "model_usage_limit", "invalid_saved_state", "host_limit"}:
                     reason = data.get("cleanup_error") or failure
                     stopped.set()
@@ -256,8 +230,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                 latest = coordination.snapshot(run_file)
                 if (not terminal and not stopped.is_set() and worker not in idle and not latest["workers"][worker].get("disabled")
                         and not coordination.should_yield(latest, worker)):
-                    # The same slot retains its companies. Never give a live
-                    # worker's claims to another slot or replay a paid request.
                     active[pool.submit(invoke, worker)] = worker
             if not active and not reason:
                 latest = coordination.snapshot(run_file)
@@ -266,8 +238,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
                            if not latest["workers"].get(f"worker-{i}", {}).get("disabled")]
                 awake = [w for w in standby if w not in idle]
                 if not terminal and serial and latest["workers"][serial].get("disabled") and awake:
-                    # A peer may already have yielded at the budget boundary.
-                    # Let that healthy slot take over when the serial owner retires.
                     replacement = min(awake)
                     active[pool.submit(invoke, replacement, take_serial=True)] = replacement
                     continue
@@ -279,7 +249,6 @@ def run_research(command, request_file, env, profile, count=2, *, host=None):
         stopped.set()
         raise
     finally:
-        # Each researcher stops its own worker group on the stop event; a repeated cancel waits for them.
         with launcher.cancellation_held():
             stopped.set()
             pool.shutdown(wait=True, cancel_futures=True)

@@ -1,8 +1,3 @@
-"""Continuously saved, reviewed companies (leads.json); unfinished research stays in results.json.
-
-This is the handoff for the later stages: every row is keyed by company.domain, and every qualification
-check names one of the saved criteria by criterion_id.
-"""
 
 from datetime import datetime, timezone
 from itertools import islice
@@ -59,17 +54,6 @@ def read(run_file, document):
 
 
 def signal_candidates(document, run_file):
-    """Held companies for signal research downstream, in the leads row shape plus open_signals.
-
-    Each carries everything a lead row does and passes the checks a lead passes apart from signal coverage: its
-    identity, industry and description, a quote-checked account_fit, every required filter, size and attribute passed
-    with quote-checked evidence, and it is not an excluded or resembling-excluded company. A held row without them is
-    skipped, never filled in. hold_reason keeps TYCHE's reason for holding it. Its required signals were not found:
-    under the any mode none passed, under the all mode not every one passed, whether unknown or failed (an event dated
-    outside the window fails). open_signals gives each such signal's status, claim and event dates, and client_caveats
-    the caveats code writes from its cited passages, as for a lead. At most the request's signal_candidates_max, bound
-    at startup from request-options.json, in review order. They are not qualified and never count toward the target.
-    """
     limit, rows = document["request"].get("signal_candidates_max") or 0, []
     by_criterion = {c["id"]: c for c in criteria(document["request"])}
     for index, held, row, open_ids in _signal_holds(document):
@@ -90,13 +74,10 @@ def signal_candidates(document, run_file):
 
 
 def _signal_holds(document):
-    """(index, held row, lead-shaped row, open signal ids) for each held company whose saved statuses pass every
-    filter, size and attribute check while its required signals were not found (unknown or failed), in review order.
-    Evidence is not checked."""
     request = document["request"]
     wanted = criteria(request)
     fit = [c["id"] for c in wanted if c["kind"] in ("filter", "size", "attribute")]
-    every_signal = {c["id"] for c in wanted if c["kind"] == "signal"}  # Preferred ones never hold or clear a company.
+    every_signal = {c["id"] for c in wanted if c["kind"] == "signal"}
     signals = [c["id"] for c in wanted if c["kind"] == "signal" and c["importance"] == "required"]
     mode = request.get("signal_match_mode", "any")
     for index, held in enumerate(document.get("unresolved", []) if signals else []):
@@ -104,7 +85,7 @@ def _signal_holds(document):
         checks = [c for c in held.get("qualification_checks", []) if isinstance(c, dict)]
         status = {cid: {c.get("status") for c in checks if c.get("criterion_id") == cid} for cid in fit + signals}
         passed = [cid for cid in signals if "pass" in status[cid]]
-        open_ids = [cid for cid in signals if cid not in passed]  # Unknown or failed: not found either way.
+        open_ids = [cid for cid in signals if cid not in passed]
         if (held.get("stage") != "account" or not isinstance(company, dict) or not company.get("domain")
                 or any(c.get("status") == "fail" for c in checks if c.get("criterion_id") not in every_signal)
                 or any(status[cid] != {"pass"} for cid in fit) or not open_ids or (mode == "any" and passed)):
@@ -115,17 +96,12 @@ def _signal_holds(document):
 
 
 def candidate_gaps(document, run_file, scopes):
-    """{company key: errors} for each held company in scopes that only a required signal holds but that the
-    acceptance checks keep from export as a signal candidate, for at most the slots the bound leaves open; else {}.
-    An excluded company is never a candidate, so it gets none: correcting it could only waive the exclusion."""
     request = document["request"]
     limit = request.get("signal_candidates_max") or 0
     holds = [(index, row) for index, _, row, _ in _signal_holds(document)] if limit and scopes else []
     checked = {key: candidate_fit_errors(document, row, f"unresolved[{index}]", run_file)
                for index, row in holds if (key := _company_key(row)) in scopes and not excluded_company(request, row)}
     gaps = {key: errors for key, errors in checked.items() if errors}
-    # A corrected hold is saved after every other hold, so the others and this call's clean holds export first; it
-    # can take only a slot they leave open. The others' evidence is read only when they could leave fewer than gaps.
     slots = limit - (len(checked) - len(gaps)) if gaps else 0
     others = [(index, row) for index, row in holds if _company_key(row) not in scopes]
     if len(others) > slots - len(gaps):
@@ -141,11 +117,6 @@ def pending(run_file, document, scopes=None):
 
 
 def export_view(run_file, document):
-    """Validate a read-only projection of unchanged, already reviewed leads.
-
-    An operational spending block does not invalidate their evidence. This is
-    deliberately not finalization and never changes the ledger or run status.
-    """
     saved = read(run_file, document)
     current = {_company_key(row): row for row in document["accepted"]}
     rows = [row for row in saved["leads"] if current.get(_company_key(row)) == row]
@@ -171,7 +142,6 @@ def review_ref(run_file, document, scopes=None):
 
 
 def preflight(run_file, document):
-    # Check the whole accepted set so uniqueness/owner checks span earlier saves.
     scoped = dict(document, unresolved=[], rejected=[])
     errors = (qualification_errors(scoped, run_file=run_file)
               + accepted_errors(scoped, run_file=run_file))
@@ -193,7 +163,6 @@ def status(run_file, document, scopes=None):
 
 
 def write_snapshot(path, document):
-    """Readers see the old complete snapshot or the new complete snapshot."""
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -210,12 +179,6 @@ def write_snapshot(path, document):
 
 
 def update(run_file, *, approval=None, scopes=None, findings=()):
-    """Retain unchanged confirmed rows; add new rows only with exact review approval.
-
-    The existing results lock prevents reviews in another process from racing
-    publication. The JSON itself stores the approved snapshot, so saving a lead
-    requires no second approval file or final export to commit it.
-    """
     result = {}
 
     def publish(document):
@@ -228,8 +191,6 @@ def update(run_file, *, approval=None, scopes=None, findings=()):
                 raise ValueError("Confirmed lead review changed; review the current packet")
             ledger = budget_guard.load_ledger(run_file)
             errors = budget_guard.audit_ledger(run_file, document, state=ledger, allow_pending=True)
-            # Match save_review: a spending pause must not discard completed
-            # research. Keep consistency checks and the unchanged ledger block.
             errors = [error for error in errors if error != ledger.get("blocked")]
             errors += preflight(run_file, dict(document, accepted=waiting) if scopes is not None else document)
             if errors:
@@ -237,15 +198,11 @@ def update(run_file, *, approval=None, scopes=None, findings=()):
             approved = {_company_key(row) for row in waiting}
             rows = [row for row in document["accepted"]
                     if _company_key(row) in approved or previous.get(_company_key(row)) == row]
-        # An unrelated unfinished candidate or later provider error does not
-        # invalidate an unchanged, already reviewed lead.
         retained = {_company_key(row) for row in rows if previous.get(_company_key(row)) == row}
         reviewed = {f["target"]: f for f in saved.get("review_findings", []) if f["target"] in retained}
         reviewed.update({f["target"]: f for f in findings})
-        # The client caveats code writes from each row's cited passages, as the workbook and report.md show them.
         by_id = {c["id"]: c for c in criteria(document["request"])}
         caveats = {row["company"]["domain"]: caveats_for(row, document["request"]["as_of_date"], by_id) for row in rows}
-        # Only a run bound with request-options.json exports candidates, so every other run's file stays as it was.
         research = ({"signal_candidates_max": document["request"]["signal_candidates_max"],
                      "signal_candidates": signal_candidates(document, run_file)}
                     if "signal_candidates_max" in document["request"] else {})

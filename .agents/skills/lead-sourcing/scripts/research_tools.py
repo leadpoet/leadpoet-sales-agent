@@ -1,4 +1,3 @@
-"""Run-bound research tools. Existing helpers own dispatch, persistence and gates."""
 
 import copy
 import hashlib
@@ -46,12 +45,6 @@ WRITING_REQUIREMENTS = {
     "description": "Exactly two factual sentences about the business: what it provides, then customers, specialization or operations. Keep signal activity, inferred needs and diagnostics out of it.",
     "signals": "The workbook shows the cited passages of passed requested signals and optional supporting_findings, with labels, dates and source URLs; claims stay in the saved record. Supporting claims state the fact, without qualification audit notes or generic buying-intent disclaimers. Label background facts as context, not buying activity. Supporting findings never satisfy a requested qualification by themselves. Preserve the activity's facts and status. Sources repeats each cited excerpt with its URL; full captured pages stay in receipts.",
 }
-# A signal's own parts, shared by the signal guidance and the review so the two cannot drift. A live run read
-# "workflows" and "use cases" as "named operational workflows". test10/01r passed "invests in private funds" on firms
-# managing their own funds, which QA and the blind labels withheld, as earlier runs passed vendors as buyers.
-# The fund example below is the one request-specific example kept on purpose (2026-10-03): both neutral wordings
-# replayed worse (an adviser placing client money held, a firm's stated "interest" passed). Replay any replacement
-# first: measurements/2026-10-03-example-cleanup in the 050c campaign folder.
 SIGNAL_ELEMENTS = ("The role, action, object and any qualifier a signal names are elements too; the stated facts can "
                    "show a judgement word such as core or complex without the word itself. 'Named' workflows need a "
                    "named workflow (such as "
@@ -61,37 +54,26 @@ SIGNAL_ELEMENTS = ("The role, action, object and any qualifier a signal names ar
                    "signal names: building a requirement into a product is not automating a workflow; being a fund's "
                    "manager, adviser or sponsor is not investing in other managers' funds, though allocating its own or "
                    "its clients' money to them is; and selling a product or service is not buying or using one.")
-# Whose offer a company's own site shows. A live run held OBI because its own shop names OBI E-Commerce GmbH, its
-# e-commerce company, as the seller. Offers elsewhere and third-party marketplace sellers are unchanged. Kept word
-# for word in references/workflow-rules.md.
 OWN_SITE_OFFER = ("On the company's own site (its saved domain), an offer sold by one of its own group entities that "
                   "runs this same business (such as its e-commerce arm) counts as the company's; a third-party "
                   "marketplace seller, a franchisee, a member store or a group company trading under another brand is a "
                   "separate business, and a shared brand name alone does not make a franchisee or member store a group "
                   "entity.")
-# Who performs an activity a requirement names. test10/05r passed "running substantial campaigns across ... channels"
-# for two retailers on their retail-media pages, which sell ad space and audiences to advertisers. Shared by the
-# attribute guidance and the review, and kept word for word in references/workflow-rules.md.
 OWN_OPERATION = ("Who does the work, and for whom, decides operations: a product, service or software this company offers "
                  "that enables an activity does not show that it performs that activity, and selling others the means for "
                  "their own activity (such as ad space, media or audiences sold to advertisers) does not show that it does "
                  "that activity itself. When a requirement is itself a service for others (such as placing nurses or "
                  "providing IT support), performing that service meets it.")
-# Gavin's date rule (2026-10-03), shared by the signal guidance, the review and references/workflow-rules.md.
 DATE_RULE = ("Date an event by the most precise date its source gives: a news story that reports it as new dates it to the "
              "article, a recap of an earlier event does not, and a listing still open when captured, such as a vacancy or "
              "tender, is current, dated by the capture whenever it was first posted. A site build/deployment timestamp "
              "or page-modification timestamp alone does not date the reported event. A window the request gives is a "
              "requirement: an event dated inside it passes, one dated wholly outside it fails, and one whose date range "
              "straddles the window's edge stays unknown, never rejected. With no window, the date is not a requirement.")
-# Reused for stage filters, stage attributes and the fresh review; only the request defines its stage meaning.
 CURRENT_STAGE_RULE = ("For a requested latest/current funding stage, check current funding status before detailed "
                       "qualification; a historical round alone does not establish it is still latest. Reuse credible "
                       "current evidence and resolve later completed priced-equity rounds, acquisitions or IPOs; "
                       "plans or debt do not change that stage unless requested, and missing proof stays unknown.")
-# What kind of business a company is. A live run accepted retailers of a kind the request did not list because they
-# also sold some of the requested goods. Shared by the filter and attribute guidance and the review, and kept word
-# for word in references/workflow-rules.md.
 COMPANY_KIND = ("A requested kind of business, such as a company type or an industry, is met by the company's own "
                 "business, what it is and mainly does, in any wording: a synonym, a translation or a narrower kind of a "
                 "requested one counts, and so do one of several main businesses and a chain of that kind the company runs "
@@ -102,10 +84,6 @@ COMPANY_KIND = ("A requested kind of business, such as a company type or an indu
                 "inside another kind of business does not make it that kind. When a check names kinds of business and "
                 "none of the company's main businesses is "
                 "one of them, that check fails; when its kind is unclear, keep it unknown.")
-# Every qualifier of a required attribute or signal, as the signal element rule above does for signals. Three live runs
-# in a row withheld companies on a compound attribute whose passages never stated one qualifier: the tools used
-# (test10/03), labour-intensive work (04), campaigns and offline channels (05). The tooling sentences were reviewed on
-# their own first.
 QUALIFIER_ELEMENTS = ("Every qualifier a required attribute or signal names is an element its saved passages must state "
                       "for this company, in its own words or in specifics that show it; a judgement word such as "
                       "substantial or complex can be shown by stated facts. Examples after e.g. or such as illustrate the "
@@ -126,7 +104,6 @@ QUALIFIER_ELEMENTS = ("Every qualifier a required attribute or signal names is a
                       "busy, manual or multi-role "
                       "process with no named tools does not show its tooling. When a qualifier is not stated, keep the "
                       "requirement unknown rather than inferring it.")
-# How to judge each kind of criterion; shown beside the saved criteria in inspect(field='requirements').
 SIZE_RANGE_AGREEMENT = ("Two credible, current workforce figures or ranges for the same company that both lie wholly inside "
                         "the requested bounds do not make range fit unknown merely because their numbers differ; "
                         "check what each counts. Do not compare a LinkedIn member count with a headcount band as "
@@ -190,7 +167,6 @@ SIGNAL_CANDIDATE_GAPS = ("Only a required signal holds this company, but these a
 
 
 def signal_candidate_guidance(bound):
-    """Only a run bound with request-options.json exports signal candidates, so only it reads this."""
     return (f"This run exports up to {bound} companies held only because their required signals were not found, for "
             "signal research after TYCHE, when everything else passes the acceptance checks. A signal failed by its "
             "evidence (an event dated outside the window, say) counts as not found: hold such a company, never reject it "
@@ -203,7 +179,6 @@ def signal_candidate_guidance(bound):
             "take budget or time the target still needs.")
 
 
-# Gavin's rule, in ARETE's "Likely" contract v1: only a standing trait may be exported as likely, never an event.
 LIKELY_TRAIT = ("This signal is a standing trait: what the company is, uses or does. Search for a source that confirms it "
                 "first. When none does but this company's own captured facts make it likely, keep status unknown and add "
                 "support likely with a one-line support_reason giving the inference, citing at least one captured passage "
@@ -213,16 +188,9 @@ LIKELY_TRAIT = ("This signal is a standing trait: what the company is, uses or d
                 "research and never counts as a lead.")
 
 
-KIND_FILTERS = ("icp:company_types", "icp:industries")  # The filters that name kinds of business; geographies never do.
+KIND_FILTERS = ("icp:company_types", "icp:industries")
 
 
-# Leadpoet's scorer re-reads its required attribute's one quote on its page (a quote no longer there fails), then
-# treats it as a locator: its judge validates every part from the company's own sources and may combine up to three
-# (qualification/scoring/company_evidence_investigator.py). Under that rule a 2026-10-10 review passed 22 of 23
-# published attribute claims, including 10 of the 11 a review requiring one passage to state every part had failed;
-# the other quote's "Posted 2 Days Ago" no longer matched its page. So the published passage states the attribute's
-# distinctive part and the company's other saved sources may state the rest. The stage line is published as its own
-# evidence list, so the rule names only the attributes the host publishes as one quote.
 SINGLE_PASSAGE_ATTRIBUTE = ("This run publishes this attribute as one passage. The scorer checks that the quote is still "
                             "on its page, then validates every part from this company's own sources, starting from that "
                             "passage. Cite on this check the one passage that states the attribute's distinctive part "
@@ -236,9 +204,6 @@ SINGLE_PASSAGE_ATTRIBUTE = ("This run publishes this attribute as one passage. T
 
 
 def criterion_note(request, criterion):
-    """What one criterion adds to its kind's rules: a kind-of-business filter adds COMPANY_KIND, a run that exports
-    signal candidates adds to each required signal how to keep such a company exportable, a required trait signal
-    adds when it may be likely, and an attribute the host publishes as one passage says so."""
     candidates = request.get("signal_candidates_max")
     required = criterion["importance"] == "required"
     return " ".join(part for part in (
@@ -249,14 +214,11 @@ def criterion_note(request, criterion):
 
 
 def criterion_guidance(request, criterion):
-    """A criterion's complete rules: its kind's rules, then its own note."""
     note = criterion_note(request, criterion)
     return CRITERION_GUIDANCE[criterion["kind"]] + (" " + note if note else "")
 
 
 def requirements_view(request):
-    """The saved criteria. A criterion's guidance names its kind's rules in judging_rules and adds only its own
-    note, so a reply that lists many criteria or checks carries each kind's rules once."""
     views = []
     for criterion in criteria(request):
         note = criterion_note(request, criterion)
@@ -265,7 +227,6 @@ def requirements_view(request):
 
 
 def judging_rules(request):
-    """How to judge each kind of criterion the request has, once per kind."""
     return {kind: CRITERION_GUIDANCE[kind] for kind in dict.fromkeys(c["kind"] for c in criteria(request))}
 
 
@@ -315,11 +276,10 @@ SOURCE = obj({"ref": REFERENCE, "refs": {"type": "array", "items": REFERENCE, "m
     "state": {"enum": ["exhausted", "continuable", "blocked"]},
     "reason": STRING, "continuations": {"type": "array", "items": REFERENCE}}, ("state", "reason"))
 class OperationalBlock(ValueError):
-    """A saved provider/setup failure, distinct from correctable research inputs."""
+    pass
 
 
 class ReferenceError(ValueError):
-    """A saved selection needs correction; never guess a replacement."""
 
     def __init__(self, reference, reason):
         self.reference = reference
@@ -327,7 +287,7 @@ class ReferenceError(ValueError):
 
 
 class SitePageError(ValueError):
-    """A selected LinkedIn record is not the company's own page, so its size, HQ and link are not the company's."""
+    pass
 
 
 REVIEW_FINDINGS = {"type": "array", "items": obj({
@@ -342,8 +302,6 @@ PROVIDER_CREDIT_LIMITS = {**obj({provider: {"type": "number", "minimum": 0}
     "description": "Optional limits explicitly requested in provider credits, not dollars. Zero disables that provider. Omit for a dollar-only budget; max_usd supplies the normal allowance."}
 
 
-# Advertise the existing request layout; normalize_request still owns defaults, host bindings and semantics.
-# Keep host-bound and legacy resume fields available rather than narrowing previously accepted requests.
 REQUEST = {**OBJECT, "additionalProperties": False, "properties": {
     "target_count": {"type": "integer", "minimum": 1},
     "icp": {**OBJECT, "additionalProperties": False, "properties": {
@@ -401,24 +359,19 @@ TOOLS = {
         obj({"commentary": STRING, "review_ref": STRING, "review_findings": REVIEW_FINDINGS})),
 }
 RUN_TARGETS = {"run", ".", "current run", "current_run", "run:current", "request", "the run"}
-# Review fields a stray token was seen on (2026-10-24); a judgment such as status or decision is never among them.
 GARBLED_REVIEW_FIELDS = {"ref", "industry", "sub_industry", "description", "hq_country", "hq_state", "website",
                          "text", "date", "date_basis", "event_date"}
 REVIEW_EVIDENCE_INPUTS = set(TOOLS["tyche_review"][1]["properties"]["companies"]["items"]["properties"]
                              ["qualification_checks"]["items"]["properties"]["evidence"]["items"]["properties"])
-# Company fields a review supplies itself; a made-up variant of one (industry_value) names that field.
 COMPANY_REVIEW_FIELDS = ("sub_industry", "industry", "description", "hq_country", "hq_state", "canonical_name", "website")
 COMPANY_INPUTS = (set(TOOLS["tyche_review"][1]["properties"]["companies"]["items"]["properties"]["company"]["properties"])
                   | COMPANY_FIELDS)
-SOURCE_KEYS = SOURCE_FIELDS  # A saved source's own fields, which a review sometimes copies flat into evidence.
-# Keys a model used for the quoted passage instead of text (text_value, text_body, quote).
+SOURCE_KEYS = SOURCE_FIELDS
 TEXT_VARIANT = re.compile(r"(?:text|quote|excerpt|passage).+|quote|excerpt|passage", re.I)
-CONTACT_KEY = re.compile(r"mail|phone|contact|person|author|name|linkedin|profile", re.I)  # Keeps its own refusal.
+CONTACT_KEY = re.compile(r"mail|phone|contact|person|author|name|linkedin|profile", re.I)
 
 
 def native_tool_card(server="tyche"):
-    """The exact exec call for each native tool, for the worker's standing instructions. Codex lists MCP tools only
-    in exec's ALL_TOOLS, so without this a worker printed that whole list again after each context compaction."""
     calls = []
     for name, (_, schema) in TOOLS.items():
         inputs = [key + ("" if key in schema.get("required", []) else "?") for key in schema["properties"]]
@@ -429,7 +382,6 @@ def native_tool_card(server="tyche"):
 
 
 def validate(value, schema, path="input", root=None):
-    """Validate the small shared tool schemas; provider contracts remain native."""
     root = schema if root is None else root
     kinds = {"object": isinstance(value, dict), "array": isinstance(value, list),
              "string": isinstance(value, str), "integer": type(value) is int,
@@ -471,7 +423,6 @@ def validate(value, schema, path="input", root=None):
 
 
 def refuse_long_quote(text, label):
-    """Evidence text is a quoted passage: a whole page never rides along into saved rows."""
     if isinstance(text, str) and len(text) > EVIDENCE_TEXT_LIMIT:
         raise ValueError(f"{label}: text is {len(text):,} characters. Quote the passage that supports the claim, "
                          f"at most {EVIDENCE_TEXT_LIMIT:,} characters, copied exactly as captured (tyche_inspect "
@@ -479,17 +430,13 @@ def refuse_long_quote(text, label):
 
 
 def tolerant_arguments(name, arguments):
-    """A lookup page URL given as a bare host and path gets https:// (provider page readers require a scheme),
-    instead of a refusal that costs a model turn. Anything else is left for the normal validation."""
     if not isinstance(arguments, dict):
         return arguments
-    # Some open-weight models send an array or object argument as its JSON text (MiMo V2.6 Flash sent tyche_start's
-    # request that way six times on 2026-10-24). That text has one meaning, so decode it instead of refusing the call.
     kinds = {"array": list, "object": dict}
     encoded = [key for key, value in arguments.items() if isinstance(value, str)
                and TOOLS[name][1]["properties"].get(key, {}).get("type") in kinds]
     def constant(text):
-        raise ValueError(text)  # NaN and Infinity are not JSON values, so such text keeps its refusal.
+        raise ValueError(text)
     for key in encoded:
         try:
             decoded = json.loads(arguments[key], parse_constant=constant)
@@ -497,30 +444,29 @@ def tolerant_arguments(name, arguments):
             continue
         if isinstance(decoded, kinds[TOOLS[name][1]["properties"][key]["type"]]):
             arguments = {**arguments, key: decoded}
-    # DeepSeek V4.1 Flash sent tyche_inspect({"query": "", "target": ""}) to mean "no query" dozens of times on 2026-10-24.
-    # An optional text input that may not be empty has no empty meaning, so a blank one is treated as not given. A blank
-    # search term keeps its refusal when a row ref is given: without the term, the same call would return the whole saved
-    # text instead. Without a ref, a term can never apply.
     searched = isinstance(arguments.get("ref"), str) and bool(arguments["ref"].strip())
     blank = [key for key, value in arguments.items() if isinstance(value, str) and not value.strip()
              and key not in TOOLS[name][1].get("required", []) and (key != "term" or not searched)
              and TOOLS[name][1]["properties"].get(key, {}).get("minLength", 0) >= 1]
     if blank:
         arguments = {key: value for key, value in arguments.items() if key not in blank}
-    # The same model named the run itself as an inspect target ("run", ".", "current run") 14 times. No company has that
-    # name, and inspect without a target reads the run.
     if name == "tyche_inspect" and str(arguments.get("target", "")).strip().lower() in RUN_TARGETS:
         arguments = {key: value for key, value in arguments.items() if key != "target"}
-    # It also sent tyche_inspect({"refresh": true}) 19 times in four ICPs. refresh only rereads a tool description; the run
-    # overview it asked for is always read fresh.
     if name == "tyche_inspect" and arguments.get("refresh") is True and not any(
             arguments.get(key) for key in ("tool", "ref", "target", "query", "recover", "term")):
         arguments = {key: value for key, value in arguments.items() if key != "refresh"}
+    if name == "tyche_inspect" and arguments.get("ref") and sum(
+            arguments.get(key) is not None for key in ("target", "tool", "query", "recover")):
+        field = arguments.get("field")
+        company = isinstance(field, str) and (field == "evidence_review" or field.startswith("evidence_review."))
+        if company and arguments.get("target") and arguments.get("term") is None:
+            arguments = {key: value for key, value in arguments.items() if key != "ref"}
+        else:
+            arguments = {key: value for key, value in arguments.items()
+                         if key not in ("target", "tool", "query", "recover", "refresh")}
+    if name == "tyche_inspect" and arguments.get("ref") and arguments.get("term") is not None and arguments.get("refresh"):
+        arguments = {key: value for key, value in arguments.items() if key != "refresh"}
     if name == "tyche_lookup" and isinstance(arguments.get("checks"), list):
-        # DeepSeek V4.1 Flash on Fireworks sent "inputs": {} in all 2,526 checks of tc36 (2026-10-25) and wrote the inputs
-        # into approach instead. Without a hosted search tool in the request, its arguments are decoded against the tool
-        # schema, where an object with no declared fields can only be empty. Text can carry any inputs, so inputs also
-        # come as JSON text, in inputs_json or in inputs itself.
         def unpacked(check):
             if not isinstance(check, dict) or not ("inputs_json" in check or isinstance(check.get("inputs"), str)):
                 return check
@@ -559,12 +505,6 @@ def tolerant_arguments(name, arguments):
             for i in indexes:
                 arguments["checks"][i]["inputs"]["url"] = "https://" + arguments["checks"][i]["inputs"]["url"]
     if name == "tyche_review" and isinstance(arguments.get("companies"), list):
-        # DeepSeek V4.1 Flash sometimes ends a key with a stray token ("industry染", "date回", "hq_state that", "text ")
-        # and then copies that key into its next reviews: 27 calls in five ICPs on 2026-10-24, one loop of 12 for one
-        # company. Such a key names nothing else, so inside the companies it means the descriptive or evidence field
-        # before the stray text (trailing space, a non-ASCII token, or one more word), when that field is absent and no
-        # other key in the object reads the same way. Judgments such as status or decision are never renamed; free-form
-        # web observations are left alone. The value is validated as usual.
         def garbled(key):
             match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*|\s*[^\x00-\x7f]\S*| [A-Za-z]+)", key)
             return match[1] if match and match[1] in GARBLED_REVIEW_FIELDS and match[1] != key else None
@@ -582,8 +522,6 @@ def tolerant_arguments(name, arguments):
             return isinstance(value, dict) and any(garbled(k) or any_garbled(v) for k, v in value.items())
         if any_garbled(arguments["companies"]):
             arguments = {**arguments, "companies": repaired(arguments["companies"])}
-        # Two shapes that cost a refused review turn in 2026-10 Arena runs (39 and 16 of ~1,100 refusals): a check's
-        # stated reason is its claim, and a company's own source decisions belong with the call's sources.
         def renamed(check):
             return isinstance(check, dict) and "reason" in check and "claim" not in check
         def misplaced(company):
@@ -599,22 +537,10 @@ def tolerant_arguments(name, arguments):
                         check["claim"] = check.pop("reason")
                 if misplaced(company) and isinstance(arguments.get("sources", []), list):
                     arguments["sources"] = arguments.get("sources", []) + company.pop("sources")
-        # DeepSeek V4.1 Flash extended evidence field names into made-up keys (text_basis, date_observed, textHere: 109
-        # times in eight runs on 2026-10-24) and resent them, although each refusal named the saved fields. Such a key
-        # can never be saved, so drop it when the entry also carries the field it extends: the passage or date the
-        # model chose is still there. Without that field (text_quote alone), a key naming contact data, a url or source
-        # variant, or another criterion, the call keeps its refusal.
-        # On 2026-10-25 (tc35, eight ICPs) it went further: 360 of 554 reviews named company fields <field>_value,
-        # <field>_body, <field>_placeholder and so on, with the field itself absent in 1,158 of 1,162 such keys, and 352
-        # of those reviews were refused for a missing description or industry, never for the key. Evidence entries
-        # carried date_value, source_provider and similar copies of what their ref already selects. So a variant of a
-        # receipt-owned date or source field is dropped from evidence with a ref, an empty variant of any field is
-        # dropped, and the one filled variant of an absent company field, event_date or fit_claim takes that field's
-        # name. A text variant without text is left for the review, which checks it against the selected receipt.
         kept = REVIEW_EVIDENCE_INPUTS | EVIDENCE_FIELDS | {"fit_claim"}
-        def contact(key, field=""):  # The words a variant adds to its field (canonical_name_value adds only _value).
+        def contact(key, field=""):
             return CONTACT_KEY.search(key[len(field):] if key.startswith(field) else key)
-        blank = lambda value: value is None or isinstance(value, str) and not value.strip()  # Carries nothing.
+        blank = lambda value: value is None or isinstance(value, str) and not value.strip()
         def base(key, bases):
             return next((b for b in bases if key.startswith(b) and key != b), None)
         def stray(entry, key):
@@ -623,7 +549,6 @@ def tolerant_arguments(name, arguments):
             return key not in kept and field is not None and (blank(entry[key]) or not contact(key, field) and (
                 field in entry or field in ("date_basis", "date", "source")))
         def named(entry, bases, owned):
-            """The one filled variant of each absent field takes its name; empty variants are dropped."""
             variants = {}
             for key in entry:
                 if key not in owned and (field := base(key, bases)):
@@ -669,7 +594,6 @@ def tolerant_arguments(name, arguments):
 
 
 def compact(value, depth=0):
-    """Bound presentation only; expose omitted data through inspect(ref, field)."""
     if isinstance(value, str):
         return value if len(value) <= 1800 else value[:1800] + "… [truncated; inspect a specific field]"
     if isinstance(value, list):
@@ -685,7 +609,6 @@ def compact(value, depth=0):
 
 
 def contract_view(value, path=""):
-    """Presentation only. Preserve constraints; bound descriptive help and lists."""
     if isinstance(value, dict):
         return {k: contract_view(v, f"{path}.{k}" if path else k) for k, v in value.items()}
     if isinstance(value, list):
@@ -716,20 +639,15 @@ class ResearchTools:
         self.readonly = readonly
         self.environment = dict(os.environ if environment is None else environment)
         self._review_packet_ref = None
-        self._local = threading.local()  # Per-call review notes: one instance serves concurrent tool calls.
+        self._local = threading.local()
         self._catalog_lock = threading.RLock()
         self._review_lock = threading.RLock()
         self._dispatch_slots = threading.BoundedSemaphore(3)
         self.worker = self.environment.get("TYCHE_WORKER_ID")
         self.generation = self.environment.get("TYCHE_WORKER_GENERATION")
-        # Arena sets this: a refused accept is saved as a hold, and a company refused this many reviews in a row is
-        # held. Unset (product runs), a refused accept saves nothing and refusals are not counted.
         limit = self.environment.get("TYCHE_REVIEW_REFUSAL_LIMIT", "")
         self.refusal_limit = int(limit) if limit.isdigit() else 0
-        self._refusals = {}  # Company target -> refused reviews in a row (Arena).
-        # Arena sets this: a review packet shows at most this many companies and names the rest for inspection.
-        # Leadpoet refuses reasoning text over 32,000 characters; DeepSeek exceeded it after 5 of 8 replayed
-        # five-company packets and none of 6 one-company packets (2026-10-26). Unset (product runs), all companies.
+        self._refusals = {}
         shown = self.environment.get("TYCHE_REVIEW_PACKET_COMPANIES", "")
         self.packet_companies = int(shown) if shown.isdigit() else 0
 
@@ -739,7 +657,7 @@ class ResearchTools:
         if not self.worker:
             result = {"claimed": True, "target": coordination.company_key(target), "mode": "single_worker"}
         else:
-            with coordination.locked(self.path):  # No judgment is saved under the old key while the claim moves.
+            with coordination.locked(self.path):
                 result = coordination.claim(self.path, self.worker, self.generation, target,
                                             [company_url] if company_url else [], rekey_from=self._named_by_record(target))
         if result.get("rekeyed_from"):
@@ -752,16 +670,10 @@ class ResearchTools:
         return result
 
     def _named_by_record(self, target):
-        """This worker's open claims with no saved judgment whose LinkedIn getter under that claim returned one record
-        naming target as the company's website, for a page the claimed company's own captured site names. Without
-        parallel workers a review may use that record's domain directly; a worker's claim moves there instead.
-        2026-10-26 Arena: rangewaterre.com's own homepage named the page whose record names liverangewater.com, every
-        review under the old key was refused as another company's record, and the company was held. A page found by a
-        search or guessed from a name can be a namesake's, so only the company's own site can move its claim."""
         try:
             key = coordination.company_key(target)
         except ValueError:
-            return set()  # The claim itself refuses it with the precise error.
+            return set()
         state = coordination.snapshot(self.path) if self.path.exists() else None
         if not state or key.startswith("linkedin.com/"):
             return set()
@@ -782,22 +694,18 @@ class ResearchTools:
                 if company_links.names_page(route["scope"], row.get("company_linkedin_url"), key, pages):
                     found.add(route["scope"])
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                continue  # An unreadable receipt or page never blocks a claim; it only cannot move one.
+                continue
         return found
 
     def _former_scopes(self, target):
-        """The keys a worker's claim on target had before it moved to the website its LinkedIn record names."""
         state = coordination.snapshot(self.path) if self.worker else None
         return list((state or {}).get("claims", {}).get(target, {}).get("rekeyed_from", []))
 
     def _claim_scopes(self, target):
-        """target and, with parallel workers, the other keys its claim covers: a moved claim keeps its earlier lookups."""
         state = coordination.snapshot(self.path) if self.worker else None
         return {target} | {key for key, canonical in (state or {}).get("aliases", {}).items() if canonical == target}
 
     def _record_first(self, target, company_url, name):
-        """The LinkedIn company record decided about half of 2026-10 Arena candidates (band or HQ outside the request)
-        but came first for under a third; read it first, in one call, before company-specific research."""
         scopes = self._claim_scopes(target)
         if any(r.get("scope") in scopes and r.get("tool") == "harvestapi_get_company" and r.get("operation") == "execute"
                for r in self._document()["routes"]):
@@ -806,15 +714,13 @@ class ResearchTools:
         inputs = {"url": page} if page else {"search": name.strip()} if isinstance(name, str) and name.strip() else None
         why = ("Read this company's LinkedIn record first: its band, headquarters and website settle many companies in one "
                "call, and the reply compares them with the request.")
-        if inputs is None:  # Never a runnable placeholder: it would be a paid search for the placeholder text.
+        if inputs is None:
             return {"why": why + " Run harvestapi_get_company with its LinkedIn company page url or a search by its name."}
         check = {"target": target, "phase": "account_verification", "provider": "deepline", "tool": "harvestapi_get_company",
                  "purpose": "LinkedIn company record: size band, headquarters and website", "inputs": inputs}
         return {"lookup": {"checks": [check]}, "why": why}
 
     def _seen(self, *values):
-        """The refusal for a company an earlier run for this request already saw (request-options.json seen_companies):
-        a continuation sources only companies it has not seen, before any call or save."""
         request = self._document().get("request", {}) if self.path.exists() else {}
         seen = {company_domain(v) for v in request.get("seen_companies") or [] if isinstance(v, str)}
         hit = next((company_domain(v) for v in values if isinstance(v, str) and v.strip() and company_domain(v) in seen), None)
@@ -832,13 +738,11 @@ class ResearchTools:
         arguments = tolerant_arguments(name, arguments)
         schema = TOOLS[name][1]
         if name == "tyche_start":
-            # Request options/exclusions are bound inside start before normalize_request validates them.
-            # Publish their layout without rejecting a transcription the authoritative bindings replace.
             schema = {**schema, "properties": {**schema["properties"], "request": OBJECT}}
         validate(arguments, schema)
         if self.readonly and (name != "tyche_inspect" or any(k in arguments for k in ("tool", "query", "recover"))):
             raise ValueError("This read-only startup check cannot research or change a run")
-        refuse_earlier_results(self.path)  # Before any tool reads, reconciles or writes an earlier run.
+        refuse_earlier_results(self.path)
         try:
             with coordination.worker_context(self.path, self.worker, self.generation):
                 if self.worker:
@@ -865,14 +769,12 @@ class ResearchTools:
 
     def _execute(self, request, capture):
         if budget.unpriced_slot_needed(request):
-            # Wait for the run's one unpriced slot before taking a provider slot, so a waiting call never holds
-            # one back from priced calls, and the checks below see the run as it is after the wait.
             try:
                 budget.await_unpriced_slot(self.path, time.monotonic() + budget.UNPRICED_SLOT_WAIT_SECONDS)
             except budget.UnpricedSlotTaken as exc:
                 return budget.unsent_coordination_refusal("deepline", exc)
             except (ValueError, OSError, KeyError, TypeError):
-                pass  # Nothing was sent; reserve() decides under the lock.
+                pass
         with self._dispatch_slots, coordination.provider_slot(self.path):
             if self.worker:
                 try:
@@ -884,8 +786,6 @@ class ResearchTools:
                                 or deadline is not None and datetime.now(timezone.utc) >= deadline):
                             raise ValueError("Shared target or deadline reached; no new provider call dispatched")
                 except ValueError as exc:
-                    # The route was planned before waiting for a provider slot.
-                    # Save proof it was never sent; do not leave an ambiguous call.
                     return {"status": "provider_error", "request_sent": False, "results": [],
                             "error": {"stage": "coordination", "message": str(exc)}}, 2
             if self.execute:
@@ -897,7 +797,7 @@ class ResearchTools:
         document = budget.read_object(self.path)
         if error := schema_error(document):
             raise ValueError(error)
-        budget.load_ledger(self.path)  # Check the bound run identity on reads too.
+        budget.load_ledger(self.path)
         return document
 
     def _description(self, tool, *, refresh=False):
@@ -918,10 +818,9 @@ class ResearchTools:
     _price = staticmethod(provider_pricing.call_credits)
 
     def _operational_block(self):
-        """A spending block saved in the ledger; no single tool is mandatory for company research."""
         if not self.path.exists():
             return None
-        self._document()  # Check the bound run identity.
+        self._document()
         return budget.load_ledger(self.path).get("blocked")
 
     def _clear_operational_status(self):
@@ -982,7 +881,6 @@ class ResearchTools:
                 if saved_request is not None and saved_request["icp"].get("exclusions", []) != exclusions:
                     raise ValueError("request-exclusions.json differs from the saved exclusions; preserve this run's criteria")
                 request["icp"]["exclusions"] = exclusions
-            # request-options.json is bound the same way: the caller sets these options, the model never does.
             options_file, from_file, traits_from_file, seen_from_file = self.path.parent / "request-options.json", False, False, False
             attributes_from_file = single_from_file = workbook_from_file = False
             if options_file.exists() or options_file.is_symlink():
@@ -997,8 +895,6 @@ class ResearchTools:
                                                                                      "single_source_attributes", "workbook"}:
                     raise ValueError("request-options.json may hold only signal_candidates_max, trait_signals, seen_companies, "
                                      "max_duration_seconds, required_attributes, max_usd, single_source_attributes and workbook")
-                # A host that reads results.json only (ARETE) takes no workbook: finish validates and hashes the results
-                # and skips the workbook and its preview.
                 if "workbook" in request_options and request_options["workbook"] is not False:
                     raise ValueError("request-options.json workbook may only be false; omit it to deliver the workbook")
                 if saved_request is not None and saved_request.get("workbook", True) != request_options.get("workbook", True):
@@ -1010,7 +906,7 @@ class ResearchTools:
                     if type(bound_usd) not in (int, float):
                         raise ValueError("request-options.json max_usd must be a finite nonnegative number")
                     budget.amount(bound_usd, "request-options.json max_usd")
-                    options["max_usd"] = bound_usd  # The caller's total cap overrides the model's transcription.
+                    options["max_usd"] = bound_usd
                 bound_attributes = request_options.get("required_attributes")
                 if "required_attributes" in request_options:
                     research_input.strings(bound_attributes, "request-options.json required_attributes")
@@ -1043,7 +939,6 @@ class ResearchTools:
                     raise ValueError("request-options.json differs from the saved run's options; preserve this run's settings")
                 if "seen_companies" in request_options:
                     request["seen_companies"], seen_from_file = request_options["seen_companies"], True
-                # The host's time limit is bound as written: a model that saved null ran a live run with no deadline.
                 if "max_duration_seconds" in request_options:
                     limit = request_options["max_duration_seconds"]
                     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -1052,8 +947,7 @@ class ResearchTools:
                     if saved_request is not None and saved_request.get("max_duration_seconds") != limit:
                         raise ValueError("request-options.json differs from the saved run's options (max_duration_seconds); "
                                          "preserve this run's settings")
-                    request["max_duration_seconds"] = limit  # The model's own value, null included, never replaces it.
-                # An explicit host/user single-passage requirement names its text here.
+                    request["max_duration_seconds"] = limit
                 single = request_options.get("single_source_attributes", [])
                 if not isinstance(single, list) or not all(isinstance(t, str) and t.strip() for t in single):
                     raise ValueError("request-options.json single_source_attributes must be a list of required attribute texts")
@@ -1107,7 +1001,6 @@ class ResearchTools:
                 if request.get("original_text", original) != original:
                     raise ValueError("original_text must match the bound original request; omit request.original_text because the launcher supplies it. If this run already exists, use tyche_inspect() to resume without reconstructing its request")
                 request["original_text"] = original
-            # Reject malformed requests before anything is saved.
             research_input.normalize_request(request, self.path, saved=saved_request)
             if self.path.exists():
                 runner.start_run(self.path, {"request": request, **options})
@@ -1121,7 +1014,6 @@ class ResearchTools:
             options["started_at"] = original or os.environ.get("TYCHE_RUN_STARTED_AT") or datetime.now(timezone.utc).isoformat()
             closing = research_input.closing_window(options.get("closing_seconds"), request.get("max_duration_seconds"))
             if closing:
-                # Decide once from the settled start, before anything is written.
                 closes = research_closes({"request": {"max_duration_seconds": request.get("max_duration_seconds")},
                                           "stop_check": {"started_at": options["started_at"], "closing_seconds": closing}})
                 if datetime.now(timezone.utc) >= closes:
@@ -1132,8 +1024,6 @@ class ResearchTools:
             return self.inspect()
 
     def lookup(self, checks):
-        # A worker's batch stays on one company: DeepSeek V4.1 Flash sent 64 of its 72 refused batches on 2026-10-24 as
-        # several checks for its current company. Discovery and other companies wait, as before.
         if self.worker and len(checks) > 1 and (any(c.get("phase") != "account_verification" for c in checks)
                                                 or len({str(c.get("target", "")).strip().lower() for c in checks}) > 1):
             raise ValueError("Parallel workers look up one current company at a time; submit one check, or "
@@ -1146,9 +1036,6 @@ class ResearchTools:
         if self.execute is None and budget.load_ledger(self.path)["version"] == 2:
             ledger = budget.load_ledger(self.path)
             from billing_reconciliation import exact_reads_available, reconcile
-            # A held call with no catalog price is read again by its ID, so its bill replaces the hold and frees
-            # the run's one unpriced slot during the run (read cooldowns apply). Without the API key no such
-            # read can run, and the slot stays taken until the run ends.
             if budget.spending_stop(ledger) == "billing_pending" or (
                     any(call.get("unknown_charge") for call in budget.awaiting_unpriced_bill(ledger).values())
                     and exact_reads_available()):
@@ -1188,7 +1075,10 @@ class ResearchTools:
                             return any(point_input(v) for v in value)
                         return isinstance(value, dict) and (bool(selectors & value.keys()) or any(point_input(v) for v in value.values()))
                     point_tool = re.search(r"(?:^|_)(?:get|enrich|lookup|validate|verify)(?:_|$)", item.get("tool", ""))
-                    if item["target"] != "discovery" or point_tool or point_input(item["inputs"]):
+                    seed_list = (item.get("tool") == "contextdev_get_web_competitors"
+                                 and isinstance(item.get("inputs"), dict)
+                                 and set(item["inputs"]) <= {"domain", "numCompetitors"})
+                    if item["target"] != "discovery" or (not seed_list and (point_tool or point_input(item["inputs"]))):
                         raise ValueError("Discovery is for broad searches. Claim the company and use account_verification for point lookups.")
                 else:
                     aliases = [v for k, v in item["inputs"].items() if item.get("tool") == "harvestapi_get_company"
@@ -1200,7 +1090,6 @@ class ResearchTools:
                 if not item.get("tool"):
                     raise ValueError("Deepline lookup requires the selected tool ID")
                 contract = self._description(item.get("tool"))
-                # The saved description's output fields can identify a person tool under an unfamiliar id.
                 refusal = runner.contact_work_refusal(tool=item["tool"], provider=provider, operation="execute",
                                                       payload=item["inputs"], contract=contract)
                 if refusal:
@@ -1211,13 +1100,6 @@ class ResearchTools:
                 except ValueError as exc:
                     empty = "; inputs arrived empty: send them as JSON text of one object in inputs_json" if not item["inputs"] else ""
                     raise ValueError(f"input.checks[{index}].inputs ({item['tool']}): {exc}{empty}. No paid call was made.") from exc
-                # A documented whole-call price bounds admission under both policies. A run that
-                # refuses unpriced calls, as the local launcher asks, stops here with the same
-                # unsent pricing refusal as the reserved policy; under `hold`, a call Deepline
-                # bills from usage is planned at its provisional hold, which the locked dispatch
-                # sets again. Otherwise, under actual cost, a call nobody can price is billed as
-                # before, and a call the model could have priced through its inputs, or one with
-                # malformed pricing, is refused.
                 try:
                     cost = self._price(contract, item["inputs"], item.get("max_cost_credits"))
                 except budget.BudgetError:
@@ -1225,7 +1107,6 @@ class ResearchTools:
                 except ValueError:
                     ledger = budget.load_ledger(self.path)
                     if budget.holds_unpriced(ledger) and provider_pricing.unpriced(contract) and not item.get("status_read"):
-                        # The one-at-a-time slot is taken at dispatch, which waits for it.
                         cost = float(budget.unpriced_hold(ledger, item["tool"], contract, slot=False)[0])
                     elif (ledger["version"] != 2 or budget.refuses_unpriced(ledger) or item.get("status_read")
                             or provider_pricing.inputs_can_bound(contract)):
@@ -1292,7 +1173,6 @@ class ResearchTools:
         return view
 
     def _record_fit(self, row, scope):
-        """Code's comparison of a LinkedIn company record with the request: presentation only, never a saved judgment."""
         try:
             size = self._document()["request"]["icp"].get("company_size") or {}
         except (OSError, ValueError, KeyError, TypeError):
@@ -1329,13 +1209,11 @@ class ResearchTools:
 
     @staticmethod
     def _catalog_facts(row):
-        """Small selection hints from the saved search row; describe still owns execution."""
         keys = ("toolId", "id", "displayName", "description", "provider", "callable", "connected", "disabled", "disabledReason")
         facts = {key: row[key] for key in keys if key in row}
         pricing = row.get("pricing")
         label = pricing.get("displayText") if isinstance(pricing, dict) else None
         if isinstance(label, str) and 0 < len(label) <= 120:
-            # Do not call a row free based on presentation text alone.
             if label.strip().casefold() != "free" or (
                     type(pricing.get("creditsPerUnit")) in (int, float) and pricing["creditsPerUnit"] == 0
                     and type(pricing.get("usdPerUnit")) in (int, float) and pricing["usdPerUnit"] == 0):
@@ -1376,8 +1254,6 @@ class ResearchTools:
         return value
 
     def _description_view(self, contract):
-        # Execution still uses the complete saved contract. The researcher needs
-        # native inputs and pricing, not duplicate SDK/getter implementation help.
         keys = ("toolId", "id", "description", "inputSchema", "pricing", "billingSource", "connected", "callable",
                 "disabled", "disabledReason", "asyncGetAction", "asyncFlow", "defaultExecutionMode")
         view = {k: contract_view(contract[k], k) for k in keys if k in contract}
@@ -1432,8 +1308,6 @@ class ResearchTools:
         rid = reference.split(":")[0]
         matching = [r for r in routes if r["route_id"] == rid]
         if not matching:
-            # Suggest saved IDs despite a typo or a name-to-domain scope change.
-            # Resolution remains exact; suggestions never select evidence.
             nearby = get_close_matches(rid, [r["route_id"] for r in routes], n=3, cutoff=.9)
             matching = [r for candidate in nearby for r in routes if r["route_id"] == candidate]
         scopes = {target, "discovery"} if web_alias else {target}
@@ -1464,7 +1338,6 @@ class ResearchTools:
 
     @staticmethod
     def _receipt_projection(saved):
-        # Reproject the complete captured response without changing the receipt, its indexes, or paid request.
         body = saved
         if (saved.get("provider") == "deepline" and saved.get("operation") == "execute"
                 and saved.get("receipt_status") == "complete"):
@@ -1497,7 +1370,6 @@ class ResearchTools:
     def _evidence_date(self, row, value):
         date, basis = source_date(row)
         if not date and basis == "observed_current":
-            # Compare with the same observation date that _evidence saves.
             date = self._document()["request"]["as_of_date"]
         if not date and basis != "observed_current":
             raise ValueError("Selected source has no publication/event date; keep it unknown or select a dated source.")
@@ -1529,9 +1401,6 @@ class ResearchTools:
         own = row.get("evidence_text") or row.get("text") or row.get("snippet")
         variants = []
         if "text" not in value and "evidence_text" not in value:
-            # A passage sent under another name (text_value, text_body: tolerant_arguments) is the quote, checked as
-            # text is; of several, the one that is a passage of the selected source. Dropping an unmatched one would
-            # quote a short page whole instead. Variants too short to be a passage are dropped.
             variants = [k for k in value if TEXT_VARIANT.fullmatch(k) and not CONTACT_KEY.search(k)]
             quotes = {}
             for key in variants:
@@ -1563,10 +1432,8 @@ class ResearchTools:
             value = {"evidence_" + k if k in {"url", "date", "date_basis", "text"} else k: v for k, v in value.items()}
         evidence.update(value)
         quoted = evidence.get("evidence_text" if signal else "text")
-        # A structured record keeps its own saved text (a LinkedIn description may exceed the cap).
         if not (quoted == own and source.get("tool") in deepline.STRUCTURED_RECORD_TOOLS):
             if not supplied and isinstance(own, str) and len(own) > EVIDENCE_TEXT_LIMIT:
-                # Said plainly: "text is 10,974 characters" made DeepSeek rename its quote key in 175 refusals (tc35).
                 raise ValueError(f"Evidence {reference!r} has no text, so it would quote the whole saved page "
                                  f"({len(own):,} characters). Add text: the passage that supports the claim, at most "
                                  f"{EVIDENCE_TEXT_LIMIT:,} characters copied exactly as captured (tyche_inspect shows "
@@ -1580,7 +1447,6 @@ class ResearchTools:
         return evidence
 
     def _attribution(self, value):
-        """Bind a selected discovery result to its saved receipt."""
         if not isinstance(value, dict):
             return copy.deepcopy(value)
         source = value.get("source") or {}
@@ -1607,7 +1473,6 @@ class ResearchTools:
         return attribution
 
     def _harvest(self, value, target):
-        """Company identity from a selected LinkedIn company getter receipt; receipt-owned fields cannot be overridden."""
         value = copy.deepcopy(value)
         if "ref" not in value:
             return value
@@ -1637,14 +1502,10 @@ class ResearchTools:
         facts = {"domain": target, "canonical_name": row.get("company"), "linkedin_url": row.get("company_linkedin_url"),
                  "website": company_website({"domain": target, "website": row.get("website")}),
                  "employee_range": row.get("employee_range"), "employee_range_evidence": evidence}
-        # Missing optional HQ fields are not contrary evidence; the reviewer may supply them from other sources.
         facts.update({k: v for k, v in self._record_hq(row).items() if v})
-        # A record without a size still identifies the company; its missing range clears a stale one.
         facts = {k: v for k, v in facts.items() if v is not None or k == "employee_range"}
         conflicts = sorted(key for key in facts.keys() & value.keys() if facts[key] != value[key])
         if conflicts and set(conflicts) <= {"hq_country", "hq_state"}:
-            # HQ comes from the getter when it identifies headquarters; restating it differently was the most common
-            # refused review (79 of ~1,100). Keep the record's HQ and say so; identity conflicts are still refused.
             self._review_notes.append(f"{target}: kept the selected LinkedIn record's headquarters ("
                                       + ", ".join(f"{k}={facts[k]!r}" for k in conflicts) + ") instead of the supplied "
                                       + ", ".join(f"{k}={value[k]!r}" for k in conflicts) + ".")
@@ -1659,7 +1520,6 @@ class ResearchTools:
 
     @staticmethod
     def _fetched_as(saved):
-        """The LinkedIn company page a getter was asked for (its url or universalName input), or None for a search."""
         payload = ((saved.get("attempt") or {}).get("request") or {}).get("payload") or {}
         if isinstance(payload.get("url"), str):
             return payload["url"]
@@ -1667,20 +1527,13 @@ class ResearchTools:
         return f"https://www.linkedin.com/company/{name.strip()}/" if isinstance(name, str) and name.strip() else None
 
     def _not_site_page(self, target, row, saved):
-        """Why a getter record cannot give target its size, HQ and LinkedIn link, or None. LinkedIn is the source of
-        truth for size, but a company can have several pages: RangeWater has four, and the 2026-10-26 Arena run held
-        rangewaterre.com at 51-200 from a page found by search while its own site named the 1,001-5,000 page the field
-        used. So when the company's own captured site names a page, only that page's record counts. When it names
-        none, two pages listing the website are not compared: in saved runs that only split a company from an
-        acquisition's old page (HPE and Zerto, Nuvei and Pivotal Payments)."""
         mine = company_links.record_pages(row, self._fetched_as(saved))
         try:
             named = company_links.site_pages(target, list(company_links.run_pages(self.path, self._document()["routes"])))
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            return None  # An unreadable page never blocks a review; it only cannot refuse one.
+            return None
         if not named or mine & named.keys():
             return None
-        # A getter asked for the page the site names may return this same record under a newer name.
         for route in self._document()["routes"]:
             if (route.get("tool") != "harvestapi_get_company" or route.get("operation") != "execute"
                     or route.get("provider_status") != "ok"):
@@ -1700,15 +1553,13 @@ class ResearchTools:
                 "page: omit company.ref and leave size unknown. No identity was changed.")
 
     def _recheck_site_page(self, item, target, previous):
-        """A record selected before the company's own site was captured is checked again at each later review. When the
-        site now names another page, code clears the record's size, link and matching HQ instead of keeping them."""
         evidence = previous["employee_range_evidence"]
         try:
             _, _, saved = self._resolve(evidence["source"]["route_id"] + ":0")
             row = next(r for r in self._receipt_projection(saved).get("results", [])
                        if isinstance(r, dict) and r.get("company_linkedin_url") == evidence.get("evidence_url"))
         except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, StopIteration):
-            return  # Validation re-reads the receipt; an unreadable one is reported there.
+            return
         if not (refusal := self._not_site_page(target, row, saved)):
             return
         supplied = item.get("company", {})
@@ -1716,7 +1567,6 @@ class ResearchTools:
         cleared.update({key: None for key, value in self._record_hq(row).items()
                         if value and previous.get(key) == value and key not in supplied})
         item["company"] = {**supplied, **cleared}
-        # A size check citing the cleared record would cite a record that is no longer the company's selected one.
         rid = evidence["source"]["route_id"]
         def cites(check):
             return isinstance(check, dict) and check.get("criterion_id") == "icp:company_size" and any(
@@ -1744,8 +1594,6 @@ class ResearchTools:
                     hq_state=hq.get("geographicArea"))
 
     def _observe_web(self, item):
-        # A new passage from the same URL is another observation, not a rewrite
-        # of its immutable receipt. Identical handoffs still reuse one receipt.
         observed = dict(item["response"], operation=item.get("operation", "search_query"))
         digest = hashlib.sha256(json.dumps(observed, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
         spec = dict(provider="public_web", scope=item["target"], phase="account_discovery" if item["target"] == "discovery" else "account_verification",
@@ -1774,7 +1622,6 @@ class ResearchTools:
         if review_ref is not None and (companies or web or sources):
             raise ValueError("Approve review_ref separately from changed findings; changes need a fresh evidence packet")
         self._local.notes = []
-        # Direct calls get the same input checks as the tool, so no other decision or field can be saved.
         validate(list(companies), {"type": "array", "items": COMPANY}, "input.companies")
         validate(list(web), {"type": "array", "items": WEB}, "input.web")
         for index, source in enumerate(sources):
@@ -1784,13 +1631,9 @@ class ResearchTools:
             supplied = item.get("company") if isinstance(item.get("company"), dict) else {}
             if refusal := self._seen(item["target"], supplied.get("domain"), supplied.get("website")):
                 raise ValueError(refusal)
-        # A web observation is saved under its target, so a seen company's is refused before anything is saved too.
         if refusal := self._seen(*(item["target"] for item in web if item["target"] != "discovery")):
             raise ValueError(refusal)
-        # Expansion of partial company updates and the existing atomic save
-        # share one lock; concurrent reviews cannot overwrite newer fields.
         with coordination.worker_context(self.path, self.worker, self.generation), coordination.locked(self.path), self._review_lock:
-            # A claimed target in worker mode, a canonical company key otherwise.
             companies = [dict(item, target=self._owned(item["target"], focus=True)) for item in companies]
             web = [dict(item, target=self._owned(item["target"])) if item["target"] != "discovery" else item for item in web]
             aliases = {}
@@ -1815,7 +1658,6 @@ class ResearchTools:
                      for row in self._document().get(state, []) if runner._company_key(row) == target), {})
 
     def _reuse_company(self, item):
-        """Recover an unambiguous domain-matched getter selection, never a search guess."""
         value = item.get("company", {})
         if "ref" in value:
             return None
@@ -1823,7 +1665,7 @@ class ResearchTools:
         previous = self._saved_company(target)
         if (previous.get("employee_range_evidence") or {}).get("source"):
             self._recheck_site_page(item, target, previous)
-            return None  # Preserve the already selected company while patching other fields.
+            return None
         choices, scopes = {}, self._claim_scopes(target)
         for route in document["routes"]:
             if (route.get("scope") not in scopes or route.get("tool") != "harvestapi_get_company"
@@ -1840,9 +1682,9 @@ class ResearchTools:
                 self._review_notes.append(f"{target}: did not reuse saved LinkedIn record {reference}. {exc}")
                 continue
             except ValueError:
-                continue  # Auto-selection never blocks a review; an explicit company.ref keeps the precise error.
+                continue
             identity = json.dumps({k: v for k, v in facts.items() if k != "employee_range_evidence"}, sort_keys=True)
-            choices[identity] = reference  # Identical repeated receipts need no new decision.
+            choices[identity] = reference
         if len(choices) == 1:
             reference = next(iter(choices.values()))
             item["company"] = {**value, "ref": reference}
@@ -1852,31 +1694,28 @@ class ResearchTools:
         return None
 
     def _bind_linkedin(self, item):
-        """Code saves the company's LinkedIn page from its own captured pages when no getter supplied it."""
         document, target = self._document(), item["target"]
         supplied = item.get("company", {})
         company = {**self._saved_company(target), **supplied}
         if company.get("employee_range_evidence"):
             if company.get("linkedin_url_evidence"):
-                item.setdefault("company", {})["linkedin_url_evidence"] = None  # The selected getter owns the link now.
+                item.setdefault("company", {})["linkedin_url_evidence"] = None
             return
         try:
             bound = company_links.bind(company, company_links.run_pages(self.path, document["routes"]),
                                        document["request"]["as_of_date"])
         except (OSError, ValueError, KeyError, TypeError):
-            bound = None  # An unreadable receipt leaves the link unproved rather than blocking the review.
+            bound = None
         if supplied.get("linkedin_url") and (not bound or supplied["linkedin_url"] != bound["linkedin_url"]):
             raise ValueError("company.linkedin_url needs proof: select company.ref from its saved HarvestAPI getter, or "
                              "capture a page on the company's own site that links it; code then saves it. Search "
                              "results and database rows never bind. Omit linkedin_url. No company was saved.")
-        if bound:  # Not a claim alias: companies whose sites link the same group page stay separate companies.
+        if bound:
             item.setdefault("company", {}).update(bound)
         elif company.get("linkedin_url_evidence"):
-            item.setdefault("company", {}).update(linkedin_url=None, linkedin_url_evidence=None)  # No longer proved.
+            item.setdefault("company", {}).update(linkedin_url=None, linkedin_url_evidence=None)
 
     def _review(self, companies, web, sources, aliases):
-        # Validate selected provider facts before persisting attached web
-        # observations. Input corrections should not create partial web saves.
         def check_attached_web(value, target):
             if isinstance(value, dict):
                 match = re.fullmatch(r"web:(\d+):(\d+)", str(value.get("ref", "")))
@@ -1907,25 +1746,20 @@ class ResearchTools:
             if reference := self._reuse_company(item):
                 reused_companies[target] = reference
             if "company" in item:
-                # Code writes these from company.ref or the company's own captured pages; a review may only echo or clear them.
                 supplied, saved = item["company"], self._saved_company(target)
                 owned = ("linkedin_url_evidence",) + (() if "ref" in supplied else ("employee_range", "employee_range_evidence"))
                 if written := [k for k in owned if supplied.get(k) is not None and supplied[k] != saved.get(k)]:
                     raise ValueError("company." + ", company.".join(written) + " are written by code from company.ref "
                                      "or the company's own captured pages; omit them. No company was saved.")
                 item["company"] = self._harvest(item["company"], target)
-                # Only the getter's own page identifies a company across workers; a site may link a shared group page.
                 keys = ("domain", "website") + (("linkedin_url",) if item["company"].get("employee_range_evidence") else ())
                 identity = [item["company"].get(k) for k in keys if item["company"].get(k)]
-                # A selected getter (or one reused automatically) can name a seen company's LinkedIn page.
                 if refusal := self._seen(*identity):
                     raise ValueError(refusal)
                 self._owned(target, identity)
             if item["decision"] == "accept":
                 self._bind_linkedin(item)
         if web:
-            # Check existing date rules before persisting attached observations.
-            # A rejected judgment must not force a receipt-reconstruction cycle.
             document = self._document()
             def preview_evidence(value):
                 match = re.fullmatch(r"web:(\d+):(\d+)", str(value.get("ref", "")))
@@ -2000,8 +1834,6 @@ class ResearchTools:
                     [r.split(":")[0] for r in source.get("continuations", [])]))
         for route in routes.values():
             route["reason"] = "\n".join(route.pop("reasons"))
-        # A reviewed point lookup has no next page. Keep discovery and batch
-        # source decisions explicit; do not close work merely because it ran.
         closed = {r["route_id"] for r in self._document()["stop_audit"].get("route_frontier", []) if r.get("state") == "exhausted"}
         for item in companies:
             selections = [item.get("company", {})]
@@ -2027,7 +1859,7 @@ class ResearchTools:
                                    "reason": "Selected single-result lookup reviewed and saved"}
         self._save_review(updates, list(routes.values()))
         if self.worker:
-            saved_as = {c["scope"]: c["state"] for c in updates}  # A corrected rejection is held, not closed.
+            saved_as = {c["scope"]: c["state"] for c in updates}
             for item in companies:
                 decision = "hold_account" if saved_as.get(item["target"]) == "unresolved" else item["decision"]
                 coordination.reviewed(self.path, self.worker, self.generation, item["target"], decision)
@@ -2046,8 +1878,6 @@ class ResearchTools:
             result["signal_candidate_gaps"] = gaps
         return result
 
-    # The validator's own corrections for a one-company save, applied by code instead of costing a refused review turn
-    # (57 and 20 of ~1,100 refusals in 2026-10 Arena runs). Each turns a rejection into what the message asks for.
     _LINKEDIN_SIZE_FAIL = "LinkedIn evidence alone (a page, posts or the company record) never fails company size"
     _UNEVIDENCED_REJECT = "not_icp_fit requires an evidenced required failure; unknown is unresolved"
 
@@ -2058,8 +1888,6 @@ class ResearchTools:
         return self._local.notes
 
     def _open_fit(self, change):
-        """True when a required filter, size or attribute check is not yet passed with evidence after this change, so a
-        held company can be neither a published stand-in nor a signal candidate."""
         try:
             document = self._document()
             row = research_input.company_update(document, change)["row"]
@@ -2076,10 +1904,7 @@ class ResearchTools:
         except ValueError as exc:
             if not (self.refusal_limit and len(updates) == 1 and updates[0]["state"] == "accepted"
                     and not self._saved_as(updates[0]["scope"], ("accepted", "rejected"))):
-                raise  # A saved acceptance or rejection is never changed by a refused accept.
-            # Arena: DeepSeek answers a refused accept with patches (50 of 78 account_fit refusals in tc35 were patches
-            # without the account_fit the refused accept had carried), so what validates is saved as a hold for the
-            # patch to build on. The accept itself stays refused.
+                raise
             try:
                 self._save_corrected([self._held_fit(dict(updates[0], state="unresolved"))], routes)
             except ValueError:
@@ -2088,15 +1913,12 @@ class ResearchTools:
                              "held (hold_account). Send decision accept again with only the corrections.") from exc
 
     def _held_after_refusals(self, companies, exc):
-        """Arena: after the limit of refused reviews in a row for one company, save it held and move on. In tc35 one
-        company was refused 220 times in 22 minutes, while only 2 of 76 companies were accepted after 6 or more
-        refusals in a row. Returns the review result, or None to keep the refusal."""
         limit = self.refusal_limit
         if not limit or len(companies) != 1 or isinstance(exc, OperationalBlock):
             return None
         target = companies[0]["target"]
         if self._saved_as(target, ("accepted", "rejected")):
-            return None  # Refused changes to a saved acceptance or rejection never hold it.
+            return None
         count = self._refusals[target] = self._refusals.get(target, 0) + 1
         if count < limit:
             return None
@@ -2118,9 +1940,6 @@ class ResearchTools:
         return any(runner._company_key(row) == target for state in states for row in document.get(state, []))
 
     def _held_fit(self, change):
-        """A refused accept's change to save held, with each passing filter, size or attribute check whose evidence
-        the accept gate refuses (a quote not on its page, another company's record) left unknown: holds skip that
-        gate, and a held company whose fit all passed can be published as a stand-in (tyche_arena/output.py)."""
         change = copy.deepcopy(change)
         document = self._document()
         row = research_input.company_update(document, change)["row"]
@@ -2133,7 +1952,7 @@ class ResearchTools:
                 refused = any(qualification_evidence_error(item, "", document, company, check, self.path)
                               for item in check.get("evidence") or [])
             except Exception:
-                refused = True  # Unproven either way: the hold keeps it open.
+                refused = True
             if refused:
                 check["status"] = "unknown"
                 self._review_notes.append(f"{change['scope']}: held with {check['criterion_id']} unknown: its "
@@ -2143,15 +1962,13 @@ class ResearchTools:
     def _save_corrected(self, updates, routes):
         for change in updates:
             if former := self._former_scopes(change["scope"]):
-                change["former_scopes"] = former  # The stop check counts the lookups saved under those keys.
-        corrected = set()  # Each correction at most once, so a save is attempted at most three times.
+                change["former_scopes"] = former
+        corrected = set()
         while True:
             try:
                 return runner.save_review(self.path, {"companies": updates, "routes": routes})
             except ValueError as exc:
                 message, change = str(exc), updates[0] if len(updates) == 1 else None
-                # save_review joins one problem per saved-row path. Correct only when every problem is the one the
-                # correction removes (a failed size check's own evidence checks go with it); others need the reviewer.
                 problems = re.split(r"; (?=[a-z_]+\[\d+\])", message)
                 size_only = all(self._LINKEDIN_SIZE_FAIL in p or re.match(r"[a-z_]+\[\d+\]\.qualification_checks\."
                                                                            r"icp:company_size\b", p) for p in problems)
@@ -2167,8 +1984,6 @@ class ResearchTools:
                                               "evidence alone never fails size.")
                 elif (self._UNEVIDENCED_REJECT in message and change["state"] == "rejected" and "hold" not in corrected
                       and self._open_fit(change)):
-                    # Only while a fit check is open: a held company whose fit all passed can be published as a
-                    # stand-in or exported as a signal candidate, so that rejection still needs its evidenced failure.
                     change["state"], corrected = "unresolved", corrected | {"hold"}
                     self._review_notes.append(f"{change['scope']}: saved as held (hold_account), not rejected: no "
                                               "required check failed with evidence, and a required fit check is still open.")
@@ -2176,12 +1991,9 @@ class ResearchTools:
                     raise
 
     def _candidate_gaps(self, scopes):
-        """What keeps each company held only for a required signal from export for signal research, returned with
-        its hold while the run exports fewer than its bound, so the worker can correct it while the company is current.
-        Under the guidance alone, live holds rarely met the acceptance checks (test10/09s exported 1 of 10)."""
         try:
             gaps = confirmed_leads.candidate_gaps(self._document(), self.path, scopes) if scopes else {}
-        except Exception:  # The hold is already saved: any failure here only leaves this advice out.
+        except Exception:
             return []
         strip = lambda error: re.sub(r"^(?:accepted\[0\]|unresolved\[\d+\])[.:]?\s*", "", error)
         return [{"target": target, "next": SIGNAL_CANDIDATE_GAPS, "errors": list(dict.fromkeys(map(strip, errors)))}
@@ -2228,7 +2040,6 @@ class ResearchTools:
                 "blocked_actions": decision.get("blocked_actions", {}), "operational_block": self._operational_block()}
 
     def _company_candidates(self, document, stop, owned):
-        """Company-only advice: held companies and their named required gaps."""
         candidates = []
         for row in document.get("unresolved", []):
             if row.get("stage") != "account":
@@ -2253,7 +2064,6 @@ class ResearchTools:
         return candidates[:3]
 
     def _completion_candidates(self, document, stop):
-        """Derived advice only: the LLM still chooses the next useful research action."""
         if runner.sourcing_target_met(document):
             return []
         return self._company_candidates(document, stop, self._owned_scopes())
@@ -2266,7 +2076,6 @@ class ResearchTools:
 
     @staticmethod
     def _field_view(value, offset, limit):
-        """Page the selected value before compacting; reads never change saved state."""
         if isinstance(value, list):
             return {"value": compact(value[offset:offset + limit]), "total": len(value),
                     "next_offset": offset + limit if offset + limit < len(value) else None}
@@ -2277,7 +2086,6 @@ class ResearchTools:
 
     @staticmethod
     def _find_saved_text(value, source, ref, field, term, offset, limit):
-        """Locate literal text in one retained field; excerpts remain exact source slices."""
         windows = []
         next_offset = None
         previous_end = 0
@@ -2297,7 +2105,7 @@ class ResearchTools:
                 "note": "These excerpts only locate saved text. Quote characters from the decoded windows[].text string; preserve any backslashes actually present in that string instead of copying its JSON display escapes. Inspect surrounding source context when qualification, status or entity scope is unclear; no match does not prove a fact false."}
 
     def _inspect(self, target=None, ref=None, field=None, term=None, tool=None, query=None, recover=None, offset=0, limit=10, refresh=False):
-        limit = min(limit, 10)  # Bound read-only pages without rejecting larger requested sizes.
+        limit = min(limit, 10)
         if term is not None:
             if not isinstance(term, str) or not term.strip() or len(term) > SOURCE_FIND_TERM_LIMIT:
                 raise ValueError("term must be a nonblank literal string of at most 80 characters")
@@ -2345,8 +2153,6 @@ class ResearchTools:
                 try:
                     return self._field_view(self._field(receipt["result"], field), offset, limit)
                 except ValueError as exc:
-                    # DeepSeek V4.1 Flash asked a route for a row field (`facts`, `markdown`) dozens of times on
-                    # 2026-10-24. A route with a single row has one such field, so read it there.
                     rows = self._receipt_projection(receipt["result"]).get("results", [])
                     if len(rows) != 1:
                         raise ValueError(f"{exc} Row fields are read from a row ref: {ref}:0 to {ref}:{len(rows) - 1}."
@@ -2354,8 +2160,6 @@ class ResearchTools:
                     ref = ref + ":0"
             value, source, saved = self._resolve(ref)
             if term is not None and field is None:
-                # Use the same captured body as evidence review, never a snippet,
-                # raw alternate representation, or agent-recorded observation.
                 if content_kind(value, saved) != "captured_page" or not isinstance(value.get("evidence_text"), str) or not value["evidence_text"].strip():
                     raise ValueError("term requires a string field unless the captured page has evidence_text")
                 field = "evidence_text"
@@ -2365,8 +2169,6 @@ class ResearchTools:
                 except ValueError:
                     if field != "facts" and not field.startswith("facts."):
                         raise
-                    # Lookup displays row fields inside `facts`; saved row refs
-                    # select that row directly. Keep a real `facts` field first.
                     field = field.removeprefix("facts.") if field != "facts" else None
                     selected = self._field(value, field) if field else value
                 value = selected
@@ -2384,7 +2186,7 @@ class ResearchTools:
         if target:
             document, target = self._document(), company_domain(target)
             state = coordination.snapshot(self.path) if self.worker else None
-            target = (state or {}).get("aliases", {}).get(target, target)  # A moved claim answers to its earlier keys.
+            target = (state or {}).get("aliases", {}).get(target, target)
             scopes = self._claim_scopes(target)
             rows = [r for state in ("accepted", "unresolved", "rejected") for r in document.get(state, []) if runner._company_key(r) == target]
             routes = [r for r in document["routes"] if r.get("scope") in scopes]
@@ -2408,8 +2210,6 @@ class ResearchTools:
                     "recent_sources": [{"ref": r["route_id"], "purpose": r.get("request_summary"),
                                         "phase": r.get("phase"), "status": r.get("provider_status"), "rows": r.get("rows_returned")} for r in routes]}
             if field:
-                # Preserve response-wrapper paths while accepting record fields
-                # directly, as researchers use them in review inputs.
                 try:
                     selected = self._field(value, field)
                 except (KeyError, IndexError, TypeError, ValueError):
@@ -2462,8 +2262,6 @@ class ResearchTools:
                 return {"value": runner.strategy_reminder(self._document())}
             document = self._document()
             if field == "review_ref":
-                # DeepSeek V4.1 Flash asked for the review_ref of a packet it had been given 15 times in one ICP on
-                # 2026-10-24. The ref is shown only after this session returned its packet; tyche_review returns both.
                 scopes = self._owned_scopes()
                 waiting = confirmed_leads.pending(self.path, document, scopes)
                 expected = confirmed_leads.review_ref(self.path, document, scopes) if waiting else None
@@ -2476,9 +2274,6 @@ class ResearchTools:
                     "tyche_review() with no arguments returns the packet of completed leads awaiting confirmation, with "
                     "its review_ref." if waiting else "No completed lead awaits confirmation. tyche_review returns a "
                     "packet with its review_ref when an accept needs confirming; tyche_finish returns the final one.")}
-            # The skill names parallel.current_company, and inspect's plain view shows blocked_actions and errors; such
-            # fields live in that overview, not in the saved run (DeepSeek V4.1 Flash asked for them 32 times). Its
-            # companies and pending lists show only their first rows, so those are not read from it.
             head = field.split(".")[0]
             if head not in document and head not in {"companies", "pending"} and head in (overview := self._overview()):
                 return self._field_view(self._field(overview, field), offset, limit)
@@ -2496,7 +2291,6 @@ class ResearchTools:
                 "request_review": "Compare original_text with these interpreted must-haves and preferences before paid research. Company types, industries, geographies, company size, required attributes, signals and exclusions each have a criterion_id; put other non-signal must-haves in icp.required_attributes. Only the user can change the criteria.", **self._overview()}
 
     def _company_review(self, row, sources, receipts=None):
-        """Show the judgment under review beside its requirement and saved evidence."""
         receipts = {} if receipts is None else receipts
         captured_texts = {}
         cited_quotes = {}
@@ -2544,7 +2338,6 @@ class ResearchTools:
                     text_field = next((k for k in ("evidence_text", "text", "snippet")
                                        if isinstance(result.get(k), str) and result[k] == source_text), None)
                     if sources[ref]["content_kind"] == "captured_page" and text_field:
-                        # Article conclusions and qualifications often follow the compact discovery preview.
                         sources[ref].update(text=source_text[:SOURCE_TEXT_PAGE_SIZE], total_characters=len(source_text))
                         captured_texts[ref] = (source_text, text_field)
                         quote = value.get("evidence_text", value.get("text"))
@@ -2561,12 +2354,11 @@ class ResearchTools:
                     raise ValueError("The selected URL is absent from the saved receipt; select its actual source")
                 view["source_refs"] = matches
                 if shared_text:
-                    view.pop("text", None)  # Identical excerpt is already in sources; retain distinct interpretations.
+                    view.pop("text", None)
             except (ValueError, OSError, KeyError) as exc:
                 view["source_error"] = str(exc)
             return view
         company = row.get("company", row.get("candidate", {}))
-        # The packet carries each kind's full rule once; each check keeps its short rule pointer.
         requirements = {r["id"]: r for r in requirements_view(self._document()["request"])} if self.path.exists() else {}
         checks = [{"requirement": requirements.get(check.get("criterion_id")),
                    "evidence": [evidence(e, company_fact=not check.get("signal")) for e in check.get("evidence", [])],
@@ -2702,11 +2494,8 @@ class ResearchTools:
                 **guidance, "companies": companies}
 
     def _checked_review_findings(self, document, findings):
-        """Require attributable findings, not a mechanical claim-truth verdict."""
         targets = [runner._company_key(row) for row in document.get("accepted", [])]
         if findings is None:
-            # On 2026-10-24 an fp4 OpenRouter endpoint dropped this array from DeepSeek's calls; "requires array" alone
-            # did not tell the model the field never arrived, and it resent the same call 43 times.
             raise ValueError("review_findings did not arrive: this call carried review_ref without it. Call again with "
                              "review_ref and review_findings, one {target, source_refs, finding} per company, for "
                              f"targets {json.dumps(targets)}. If the array keeps arriving empty, send review_findings "
@@ -2730,7 +2519,6 @@ class ResearchTools:
         return findings
 
     def review_delivery(self, document, review_ref=None, review_findings=None):
-        """Review and approve one exact evidence snapshot; caller holds the tool lock."""
         if self.environment.get("TYCHE_FINALIZATION_ONLY") == "0":
             return {"status": "review_handoff", "delivery_allowed": False,
                     "next": "Research is ready for final review. End this invocation now. The launcher will review the saved evidence and writing in a fresh context, then export or resume research within the same budget and clock. No user approval, repeated lookup or manual handoff file is needed."}
@@ -2754,8 +2542,6 @@ class ResearchTools:
         failure = {"status": "export_failed", "delivery_allowed": False,
                    "failure_kind": "export_timeout", "stage": stage, "error": str(error)[-9000:],
                    "next": "Preserve saved evidence and review. Verify exporter exit and local state before resuming finish. Do not rewrite findings or repeat research to repair this infrastructure failure."}
-        # spawnSync has reaped its timed-out child. An outer timeout only proves
-        # the Node parent stopped, so it cannot promise descendant cleanup.
         if child_stopped:
             try:
                 with write_lock(self.path):
@@ -2768,7 +2554,6 @@ class ResearchTools:
         return failure
 
     def export_partial(self):
-        """Save reviewed work on an operational exit; never reconcile or dispatch."""
         try:
             if not confirmed_leads.status(self.path, self._document())["confirmed_count"]:
                 return {"exported": False, "partial": True, "delivery_allowed": False,
@@ -2793,8 +2578,6 @@ class ResearchTools:
                     "next": "Save company judgments. Continue your own useful research while stop=continue; otherwise end this invocation. The supervisor stops all researchers before one final review/export."}
         with coordination.locked(self.path), self._review_lock:
             result = self._finish(commentary, review_ref, review_findings)
-        # The exporter validates and finalizes in a separate process, which
-        # needs this same file lock. Its fingerprint check detects later edits.
         return self._export() if result is None else result
 
     def _finish(self, commentary, review_ref, review_findings=None):
@@ -2838,7 +2621,6 @@ class ResearchTools:
             (self.path.parent / "research-commentary.md").write_text(commentary + "\n", encoding="utf-8")
 
     def _workbook(self):
-        """False when the host bound workbook false in request-options.json: it takes results.json only."""
         try:
             return json.loads(self.path.read_text()).get("request", {}).get("workbook", True) is not False
         except (OSError, ValueError):
@@ -2854,8 +2636,6 @@ class ResearchTools:
         except subprocess.TimeoutExpired as exc:
             return self._export_timeout(exc)
         if result.returncode:
-            # A saved-file mismatch is an exporter failure, not evidence that
-            # the researcher should replace otherwise valid source receipts.
             try:
                 failure = json.loads((result.stderr or result.stdout).strip().splitlines()[-1])
             except (ValueError, IndexError):
@@ -2870,8 +2650,6 @@ class ResearchTools:
             return {"status": "needs_repair", "delivery_allowed": False,
                     "errors": [(result.stderr or result.stdout)[-9000:]], "progress": self._overview(),
                     "next": "Correct the named saved fields or source reviews with tyche_review, then finish again. Do not read implementation code or repeat an unchanged final review."}
-        # The final launcher pass adds closed model usage without rewriting
-        # research prose or changing the validated results/workbook.
         report = subprocess.run([self.environment.get("TYCHE_WORKSPACE_PYTHON", "python3"),
             str(Path(__file__).resolve().parents[4] / "scripts/run_costs.py"), str(self.path)],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, env=self.environment)

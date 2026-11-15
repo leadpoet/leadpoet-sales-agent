@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Record dispatches and stop at observed spend; retain historical ledger rules."""
 
 import argparse
 import copy
@@ -28,11 +27,11 @@ class BudgetError(ValueError):
 
 
 class PlanChanged(BudgetError):
-    """Progress changed before spending; the proven-unsent check may be replanned."""
+    pass
 
 
 class UnpricedSlotTaken(BudgetError):
-    """Another unpriced call's exact bill is unread, so this one was not sent; dispatch may wait for that bill."""
+    pass
 
 
 def amount(value, name):
@@ -48,7 +47,6 @@ def amount(value, name):
 
 
 def report_amount(value):
-    """Project canonical money to the existing numeric report contract."""
     return float(amount(value, "report amount"))
 
 
@@ -87,7 +85,6 @@ def load_ledger(run_file):
 
 
 def run_fingerprint(run_file):
-    """Bind saved state to its original location, including after path rewrites."""
     return hashlib.sha256(str(Path(run_file).resolve(strict=True)).encode("utf-8")).hexdigest()
 
 
@@ -102,8 +99,6 @@ def check_run_identity(run_file, state):
 
 @contextmanager
 def transaction(path):
-    # Batch workers share this process. Serialize only ledger writes, never I/O
-    # to a provider. Keep the existing fail-closed lock for other processes.
     with locked(path), _TRANSACTION_LOCK:
         with _file_transaction(path) as state:
             yield state
@@ -111,7 +106,6 @@ def transaction(path):
 
 @contextmanager
 def _file_transaction(path):
-    # The enclosing OS lock releases on process exit; preserve legacy lock evidence.
     lock = path.with_name(path.name + ".lock")
     if os.path.lexists(lock):
         raise FileExistsError("Legacy write lock requires verified recovery: " + str(lock))
@@ -143,11 +137,6 @@ def _dispatch_lock(run_file, route_id):
 
 
 def _dispatch_active(state, route_id, call):
-    """An OS lease distinguishes live parallel work from a crashed dispatch.
-
-    No PID reuse, time-based expiry, state mutation or provider call is needed.
-    Historical calls without a lease remain uncertain on continuation.
-    """
     if not call.get("dispatch_lease"):
         return False
     path = _dispatch_lock(state["run_file"], route_id).with_suffix(".write.lock")
@@ -167,9 +156,6 @@ def _dispatch_active(state, route_id, call):
                 msvcrt.locking(fd, msvcrt.LK_NBRLCK, 1)
         except (BlockingIOError, PermissionError):
             return True
-        # A report may hold a snapshot taken just before settlement released
-        # the lease. It was live at that snapshot, not an orphan. Reservations
-        # always re-read under the ledger transaction before enforcing the cap.
         latest = load_ledger(state["run_file"])["calls"].get(route_id, {})
         return latest.get("actual_credits") is not None or latest.get("actual_usd") is not None
     finally:
@@ -177,7 +163,6 @@ def _dispatch_active(state, route_id, call):
 
 
 def _initial_state(run_file, document, *, max_usd=None, scrapingdog_usd_per_credit=None, unpriced_calls=None):
-    """Validate initialization before writing either the run or its ledger."""
     request = document["request"]
     target = count(request["target_count"], "target_count")
     if target == 0:
@@ -208,7 +193,7 @@ def _initial_state(run_file, document, *, max_usd=None, scrapingdog_usd_per_cred
     if unpriced_calls not in (None, *UNPRICED_CALLS):
         raise BudgetError("unpriced_calls must be refuse or hold when set")
     if unpriced_calls and actual_cost:
-        state["unpriced_calls"] = unpriced_calls  # Saved once with the run; see refuses_unpriced.
+        state["unpriced_calls"] = unpriced_calls
     check_limits(document, state)
     return state
 
@@ -225,12 +210,6 @@ def initialize(run_file, **options):
 
 
 def create_run(run_file, document, **options):
-    """Create a run and ledger recoverably; never reset an existing ledger.
-
-    The run lock covers both writes. Ledger-first persistence lets a retry
-    verify its original caps after interruption before the run file was saved.
-    No provider can dispatch until both files exist.
-    """
     run_file = Path(run_file).resolve()
     ledger = run_file.with_name(run_file.name + ".budget.json")
     initial = _initial_state(run_file, document, **options)
@@ -245,15 +224,11 @@ def create_run(run_file, document, **options):
             if (ledger.exists() and not state) or (not saved and state.get("calls")):
                 raise BudgetError("existing ledger needs its saved run; reconcile missing state before continuing")
             if state:
-                # Older ledgers have no initialization metadata; the existing
-                # run's request above is authoritative for their resume.
                 compare = {key: value for key, value in initial.items() if key not in {"calls", "blocked"}
                            and not (saved and key.startswith("initial_") and key not in state)}
                 if any(state.get(key) != value for key, value in compare.items()):
                     raise BudgetError("initialization settings differ from the saved ledger; preserve its original caps")
             else:
-                # The ledger is written first, so a saved run without one lost it: rebuilding
-                # could drop its calls or its saved settings.
                 if saved:
                     raise BudgetError("existing research has no ledger; reconcile it before continuing")
                 state.update(initial)
@@ -280,13 +255,10 @@ def check_limits(document, state):
 
 
 def model_cost_summary(directory, active_model_receipt=None, *, exact=False):
-    """Read run-owned response costs once each, including interrupted workers."""
     directory = Path(directory).resolve()
     total, seen, missing = Decimal(0), {}, []
     active_model_receipt = active_model_receipt or os.environ.get("TYCHE_ACTIVE_MODEL_RECEIPT")
     active = []
-    # List first, then wait for registry publication: a concurrently created receipt
-    # must not appear after the live-generation snapshot and look abandoned.
     paths = sorted((directory / "model-usage").glob("*.json"))
     from run_coordination import snapshot
     workers = (snapshot(directory / "results.json") or {}).get("workers", {})
@@ -308,7 +280,6 @@ def model_cost_summary(directory, active_model_receipt=None, *, exact=False):
             if not identity:
                 raise BudgetError("model response has no identity")
             cost = response.get("estimated_base_usd")
-            # Historical exact estimates can be read without rewriting receipts.
             old = response.get("standard_api_equivalent_usd", {})
             if cost is None and old.get("minimum") == old.get("maximum"):
                 cost = old.get("minimum")
@@ -331,33 +302,15 @@ UNPRICED_CALLS = ("refuse", "hold")
 
 
 def refuses_unpriced(state):
-    """True when this actual-cost run admits a paid call only with a whole-call bound.
-
-    The local launcher asks for it at start and the ledger saves it, so every provider
-    charge is admitted against the cap. Under `refuse` a call with no documented price
-    is refused. Under `hold` an unpriced Deepline call gets a provisional hold as its
-    bound (unpriced_hold), and any other call with no bound is refused the same way. A
-    host that does not ask, and any run saved before the setting existed, bills such a
-    call as before.
-    """
     return state.get("version") == 2 and state.get("unpriced_calls") in UNPRICED_CALLS
 
 
 def holds_unpriced(state):
-    """True when this run admits an unpriced Deepline call at a provisional hold (unpriced_calls: hold)."""
     return state.get("version") == 2 and state.get("unpriced_calls") == "hold"
 
 
-# Under unpriced_calls: hold, an unpriced Deepline call is admitted at a provisional hold, the first of: the most
-# Deepline billed for one call of the tool in 60 days (pricing.observedMax), this run's highest bill for the tool,
-# or this default (10 credits, $1.00, ARETE's UNPRICED_CALL_USD). Deepline's public rate card is a base rate, not a
-# ceiling (page read: 0.01 on the card, billed up to 0.014), so it is never the hold. The exact bill replaces it.
 UNPRICED_HOLD_CREDITS = Decimal("10")
-# Why an unpriced call that returned with no final bill is held at its hold: its bill is read again by its ID.
 UNPRICED_HOLD = "unpriced_hold"
-# An unpriced call that finds the run's one unpriced slot taken waits this long for the earlier call's bill, which
-# Deepline usually returns final in that call's reply. The wait holds no lock, and a lookup waits before it takes a
-# provider slot.
 UNPRICED_SLOT_WAIT_SECONDS = 30
 UNPRICED_SLOT_POLL_SECONDS = .2
 UNPRICED_SLOT_TAKEN = ("Another call with no catalog price is still waiting for its exact bill, and this run sends one "
@@ -374,32 +327,27 @@ def _billed_credits(call, state):
 
 
 def awaiting_unpriced_bill(state):
-    """Unpriced calls admitted at a hold whose exact bill is not read yet: {route: call}. A run has at most one."""
     return {rid: call for rid, call in state["calls"].items()
             if call.get("admission_bound_source") and _billed_credits(call, state) is None}
 
 
 def hold_unpriced(call):
-    """Hold an unpriced call that has no final bill at its hold, never pending; its bill is read by ID where it can be."""
     hold_unknown_charge(call)
     call["hold_reason"] = UNPRICED_HOLD
 
 
 def orphaned_unpriced(state, rid, call):
-    """An unpriced call with no bill and no hold whose dispatch is no longer live: its worker stopped mid-call."""
     return (rid in awaiting_unpriced_bill(state) and not _held(call)
             and not (call.get("state") == "in_flight" and _dispatch_active(state, rid, call)))
 
 
 def hold_overruns(state):
-    """Unpriced calls billed above their hold: {route: call}. Each counts in full; its tool is refused from then on."""
     return {rid: call for rid, call in state["calls"].items() if call.get("admission_bound_source")
             and (billed := _billed_credits(call, state)) is not None
             and billed > amount(call["admission_bound_credits"], "unpriced hold")}
 
 
 def unpriced_hold_refusal(state, tool, contract):
-    """Why this run never holds this unpriced tool, or None. Each reason stands for the rest of the run."""
     from provider_pricing import chooses_quantity
     if contract.get("billingSource") != "managed_by_deepline":
         return ("This tool has no catalog price and Deepline does not bill it (billingSource is not "
@@ -414,27 +362,19 @@ def unpriced_hold_refusal(state, tool, contract):
 
 
 def unpriced_hold_amount(state, tool, contract):
-    """(credits, source) of the provisional hold; a missing or nonpositive figure falls through to the next source."""
     observed = (contract.get("pricing") or {}).get("observedMax")
     observed = observed.get("creditsPerCall") if isinstance(observed, dict) else None
     try:
         if observed is not None and amount(observed, "observed maximum") > 0:
             return amount(observed, "observed maximum"), "observed_max"
     except BudgetError:
-        pass  # A malformed figure is no figure.
+        pass
     bills = [billed for call in state["calls"].values() if call.get("admission_bound_source") and call.get("tool") == tool
              and (billed := _billed_credits(call, state)) is not None and billed > 0]
     return (max(bills), "run_max_bill") if bills else (UNPRICED_HOLD_CREDITS, "default")
 
 
 def unpriced_hold(state, tool, contract, *, slot=True):
-    """The provisional hold that admits one unpriced Deepline call under unpriced_calls: hold: (credits, source).
-
-    One at a time: while another unpriced call's exact bill is unread (in flight, or held because its reply
-    had no final bill), this one is not admitted, so the run never carries more than one unknown bill and an
-    overshoot is at most one call's bill above its hold. Nothing is sent then; dispatch waits for the slot
-    (await_unpriced_slot). Planning passes slot=False and leaves the slot to dispatch.
-    """
     if not holds_unpriced(state) or not isinstance(tool, str) or not tool:
         raise BudgetError("This run admits a paid call only with a documented whole-call price bound, and this "
                           "call has none. No request was sent. Use a priced tool or option.")
@@ -446,25 +386,18 @@ def unpriced_hold(state, tool, contract, *, slot=True):
 
 
 def _catalog_route(document, provider, tool):
-    """This run's latest successful description of the tool, or None."""
     return next((r for r in reversed(document.get("routes", []))
                  if r.get("provider") == provider and r.get("operation") == "describe"
                  and r.get("provider_status") == "ok" and r.get("tool") == tool), None)
 
 
 def _unpriced_contract(run_file, catalog, tool):
-    """The tool's saved description when it publishes no rate (held under hold), else None."""
     from provider_pricing import unpriced
     contract = _described_contract(run_file, catalog["route_id"], tool)
     return contract if contract is not None and unpriced(contract) else None
 
 
 def unpriced_slot_needed(request):
-    """Whether this Deepline execute request would be admitted at an unpriced hold, taking the run's one slot.
-
-    Read without a lock, so a lookup can wait for the slot before it takes a provider slot; reserve() decides
-    again under the lock. Any doubt reads as False and leaves the decision to reserve().
-    """
     spend = request.get("spend")
     if request.get("operation") != "execute" or not isinstance(spend, dict) or not request.get("tool"):
         return False
@@ -480,7 +413,6 @@ def unpriced_slot_needed(request):
 
 
 def unsent_coordination_refusal(provider, error):
-    """The result of a call proven unsent and never reserved, so the same request may be retried."""
     return {"status": "config_error", "error_stage": "coordination", "provider": provider,
             "error": {"message": str(error)}, "request_sent": False}, 2
 
@@ -492,19 +424,11 @@ def _described_contract(run_file, route_id, tool):
     return matches[0] if len(matches) == 1 else None
 
 
-# The billing basis of a priced call held at its documented bound because no bill can name it (unbillable).
 UNKNOWN_CHARGE_BASIS = "unknown_charge_at_bound"
 
 
 def unbillable(call, reply):
-    """A priced Deepline call that returned with no billing correlation id: no bill can ever name it.
-
-    It is counted at its documented price bound as a disclosed unknown charge instead of staying pending,
-    which would stop every later paid call and the delivery for good. A call with an id stays pending so
-    billing can still settle it, and a call without a documented bound keeps waiting for evidence.
-    """
     return (call.get("provider") == "deepline" and call.get("admission_bound_credits") is not None
-            # A free call is proven free from its catalog contract instead (billing_reconciliation.settle_free_calls).
             and amount(call["admission_bound_credits"], "call price bound") > 0
             and not call.get("tariff") and call.get("actual_credits") is None and call.get("actual_usd") is None
             and not (isinstance(reply, dict) and (reply.get("job_id") or reply.get("request_id"))))
@@ -519,12 +443,6 @@ def _held(call):
 
 
 def open_call_bounds(state):
-    """Documented price bounds of priced calls with no bill yet: {route: (usd, credits)}.
-
-    They gate admission only, under their own key. Reservations, routes, totals and stop
-    decisions are untouched and count what was actually billed. Tariff holds are already
-    in the totals, and calls saved before bounds existed have none.
-    """
     return {rid: (amount(call["admission_bound_credits"], "call price bound")
                   * amount(state["usd_per_credit"][call["provider"]], "USD rate"),
                   amount(call["admission_bound_credits"], "call price bound"))
@@ -588,7 +506,6 @@ def _actual_cost_summary(state, active_model_receipt=None):
 
 
 def actual_cost_summary(state, active_model_receipt=None):
-    """JSON report boundary; enforcement retains exact decimal amounts."""
     def display(value):
         if isinstance(value, Decimal):
             return float(value)
@@ -607,7 +524,7 @@ def observed_credits(call, state):
         return amount(call["actual_usd"], "billed USD") / amount(state["usd_per_credit"][call["provider"]], "USD rate")
     if _held(call):
         return amount(call["held_credits"], "documented credit hold")
-    return Decimal(0)  # Unknown bills are handled by spending_stop's pending check.
+    return Decimal(0)
 
 
 STOP_MESSAGE = ("This run has spent its budget and is stopping. Call no more tools: end your turn now with a one-line "
@@ -615,15 +532,12 @@ STOP_MESSAGE = ("This run has spent its budget and is stopping. Call no more too
 
 
 def stop_request_path(run_file, receipt):
-    """One worker's stop request, beside its usage receipt (model-usage/<receipt>.json): keyed by the receipt, so a
-    later worker of the same run is never refused by an earlier one's request, and never read as a receipt."""
     if not isinstance(receipt, str) or not receipt or "/" in receipt or receipt.startswith("."):
         raise ValueError("invalid model receipt identity")
     return Path(run_file).resolve().parent / "model-usage" / f"{receipt}.stop"
 
 
 def request_stop(run_file, receipt, reason, *, at=None):
-    """Ask one worker to end its turn: its tools refuse every call from now on. The first request stands."""
     path = stop_request_path(run_file, receipt)
     try:
         saved = json.loads(path.read_text())
@@ -639,7 +553,6 @@ def request_stop(run_file, receipt, reason, *, at=None):
 
 
 def stop_requested(run_file, receipt=None):
-    """The stop request of this worker (its receipt, else TYCHE_ACTIVE_MODEL_RECEIPT), or None."""
     receipt = receipt or os.environ.get("TYCHE_ACTIVE_MODEL_RECEIPT")
     if not receipt:
         return None
@@ -651,7 +564,6 @@ def stop_requested(run_file, receipt=None):
 
 
 def spending_stop(state, *, accepted_count=None, active_model_receipt=None):
-    """A stopping threshold, not a guarantee against in-flight overshoot."""
     if state.get("blocked"):
         return state["blocked"]
     totals = _actual_cost_summary(state, active_model_receipt)
@@ -676,7 +588,6 @@ def spending_stop(state, *, accepted_count=None, active_model_receipt=None):
 
 
 def check_allowance(state, provider, bound, accepted_count, *, documented_tariff=False):
-    """Use the same affordability calculation for planning and locked dispatch."""
     if state["version"] == 2:
         if Decimal(state["credit_limits"][provider]) == 0:
             raise BudgetError(f"{provider} is disabled by its zero credit cap")
@@ -685,16 +596,11 @@ def check_allowance(state, provider, bound, accepted_count, *, documented_tariff
         totals = _actual_cost_summary(state)
         before = amount(totals.get("budget_total_usd", totals["total_usd"]), "total")
         if bound is None:
-            # A documented ScrapingDog tariff is that call's bound; reserve holds and checks it.
             if refuses_unpriced(state) and not documented_tariff:
                 raise BudgetError("This run admits a paid call only with a documented whole-call price bound, and this "
                                   "call has none. No request was sent. Use a priced tool or option.")
-            # The provider publishes no whole-call price. It is billed as before; its
-            # actual charge is the one provider exposure this admission cannot bound.
             return dict(provider=provider, actual_credits=None, actual_usd=None,
                         state="in_flight", total_before_usd=str(before), accepted_leads_before_call=accepted_count)
-        # Recorded charges, the bounds of calls still in flight or unbilled, and this
-        # call's bound must fit together. Settling replaces a bound with the actual charge.
         price = amount(bound, "maximum call cost")
         open_bounds = open_call_bounds(state)
         committed = (before + sum((usd for usd, _ in open_bounds.values()), Decimal(0))
@@ -726,8 +632,6 @@ def check_allowance(state, provider, bound, accepted_count, *, documented_tariff
         credits[name] += charge
         usd += (charge * amount(state["usd_per_credit"][name], "USD rate")
                 if call["actual_usd"] is None else amount(call["actual_usd"], "receipted USD"))
-        # A review can remove accepted companies. Keep spend at higher historical
-        # counts in the current allowance; a correction never creates credit.
         if name == "deepline" and call["accepted_leads_before_call"] >= accepted_count:
             since_last_lead += charge
     if usd > Decimal(state["usd_limit"]):
@@ -763,7 +667,6 @@ def reserve(spend, provider, *, tool=None, tariff=None, dispatch_lease=False, ex
             calls = state["calls"]
             if route_id in calls:
                 raise BudgetError("route_id already reserved or charged; do not repeat a possibly billed call")
-            # Catch recorded calls made outside the ledger instead of forgetting them.
             if any(row.get("paid_calls", 0) and row.get("route_id") not in calls for row in document.get("routes", [])):
                 raise BudgetError("paid route missing from ledger; reconcile billing before further execution")
             catalog = None
@@ -773,7 +676,6 @@ def reserve(spend, provider, *, tool=None, tariff=None, dispatch_lease=False, ex
             if catalog and holds_unpriced(state):
                 contract = _unpriced_contract(spend["run_file"], catalog, tool)
                 if contract is not None:
-                    # The hold is set here, under the lock, from the saved description and this ledger.
                     hold = unpriced_hold(state, tool, contract)
                     bound = hold[0]
             calls[route_id] = check_allowance(state, provider, bound, len(accepted),
@@ -783,7 +685,6 @@ def reserve(spend, provider, *, tool=None, tariff=None, dispatch_lease=False, ex
             if state["version"] == 2 and dispatch_lease:
                 calls[route_id]["dispatch_lease"] = True
             if state["version"] == 2 and provider == "deepline" and execution_key:
-                # Saved before dispatch, so a lost response can still be named and settled.
                 calls[route_id]["idempotency_key"] = execution_key
             if provider == "scrapingdog" and tariff:
                 calls[route_id]["tariff"] = tariff
@@ -811,7 +712,7 @@ def reserve(spend, provider, *, tool=None, tariff=None, dispatch_lease=False, ex
 
 def price_overrun(call, state):
     if state["version"] == 2:
-        return False  # New runs record the actual charge; a bill above its bound only reduces headroom.
+        return False
     bound = amount(call["maximum_credits"], "reserved bound")
     return ((call["actual_credits"] is not None and amount(call["actual_credits"], "charge") > bound)
             or (call["actual_usd"] is not None and amount(call["actual_usd"], "USD charge") >
@@ -871,7 +772,6 @@ def _reconciled_receipt(run_file, receipt_file, route_id, call):
 
 
 def reconcile_overruns(run_file, receipt_files, *, pricing_note):
-    """Operator recovery after pricing repair; preserve bills, bounds and caps."""
     if not isinstance(pricing_note, str) or not pricing_note.strip() or not receipt_files:
         raise BudgetError("provide saved receipts and a note describing the pricing repair")
     document = read_object(Path(run_file).resolve(strict=True))
@@ -893,7 +793,6 @@ def reconcile_overruns(run_file, receipt_files, *, pricing_note):
         errors = audit_ledger(run_file, document, state=updated)
         if errors:
             raise BudgetError("; ".join(errors))
-        # Zero additional spend still includes every uncertain call and the existing per-next-lead limit.
         for provider in PROVIDERS:
             if amount(updated["credit_limits"][provider], "credit cap") > 0:
                 check_allowance(updated, provider, 0, len(document["accepted"]))
@@ -902,12 +801,11 @@ def reconcile_overruns(run_file, receipt_files, *, pricing_note):
 
 
 def settlement_billing(body):
-    """An upstream failure can be billed; an unfinished response cannot settle."""
     billing = body.get("billing")
     if not isinstance(billing, dict):
         return {}
     if body.get("billing_final") is False:
-        return {}  # New Deepline responses explicitly distinguish unknown prices.
+        return {}
     if billing.get("pricing_status") not in (None, "final"):
         return {}
     if body.get("status") not in {"partial", "timeout"} or body.get("billing_final") is True:
@@ -928,20 +826,10 @@ def guarded_call(request, provider, execute, *, tariff=None, execution_key=None)
         except (ValueError, OSError, KeyError, TypeError) as exc:
             return {"status": "quota_exceeded", "error_stage": "budget", "provider": provider,
                     "error": {"message": str(exc)}, "request_sent": False}, 2
-        # Failures from here may have dispatched. Preserve their lease-backed
-        # reservation; never mislabel an execution exception as request_sent=False.
         return _guarded_call(request, provider, execute, tariff=tariff, execution_key=execution_key)
 
 
 def await_unpriced_slot(run_file, deadline):
-    """Wait until no unpriced call of the run is waiting for its exact bill; raise UnpricedSlotTaken otherwise.
-
-    It reads the ledger without its lock and holds no lock or provider slot, so priced calls go ahead. An earlier
-    call held because its reply had no final bill is read once by its ID after its reply is recorded (read
-    cooldowns apply); a busy reconciler means another waiter is reading it. It gives up at the deadline, and at
-    once when waiting cannot free the slot: that read left the call held, no read can run here (no API key), or
-    the call has no saved reply to read. Nothing is sent while it waits.
-    """
     run_file = Path(run_file).resolve()
     read = False
     while waiting := awaiting_unpriced_bill(load_ledger(run_file)):
@@ -954,7 +842,7 @@ def await_unpriced_slot(run_file, deadline):
             if (read or not billing_reconciliation.exact_reads_available()
                     or not all(rid in routes or _reply_saved(run_file, rid) for rid in held)):
                 raise UnpricedSlotTaken(UNPRICED_SLOT_TAKEN)
-            if held <= routes:  # Its reply is recorded, so its bill can be read by its ID.
+            if held <= routes:
                 status = billing_reconciliation.reconcile(
                     run_file, timeout_seconds=max(1, deadline - time.monotonic()))
                 if not status.get("in_progress"):
@@ -964,12 +852,6 @@ def await_unpriced_slot(run_file, deadline):
 
 
 def _reserve_when_unpriced_slot_frees(spend, provider, **options):
-    """reserve(), except that an unpriced call finding the run's one unpriced slot taken waits for it.
-
-    A lookup waits before it takes a provider slot (research_tools); this wait covers a call whose freed slot
-    another waiting call took first, and dispatch paths with no lookup. reserve() is retried only once the slot
-    looks free, so a waiter never polls under the run lock.
-    """
     deadline = time.monotonic() + UNPRICED_SLOT_WAIT_SECONDS
     while True:
         try:
@@ -979,7 +861,6 @@ def _reserve_when_unpriced_slot_frees(spend, provider, **options):
 
 
 def _reply_saved(run_file, route_id):
-    """Whether a call's receipt holds its reply; the batch writer records the route moments later."""
     try:
         saved = read_object(Path(run_file).parent / "receipts" / (route_id + ".json"))
     except (OSError, ValueError):
@@ -999,8 +880,6 @@ def _guarded_call(request, provider, execute, *, tariff=None, execution_key=None
                 "error": {"message": str(exc)}, "request_sent": False}, 2
     saved_key = None
     if execution_key:
-        # Send the key only when the ledger saved it (actual-cost runs). It is optional:
-        # an unread ledger sends the call without one, as before.
         try:
             if read_object(path)["calls"][route_id].get("idempotency_key") == execution_key:
                 saved_key = execution_key
@@ -1027,8 +906,6 @@ def _guarded_call(request, provider, execute, *, tariff=None, execution_key=None
                     hold_unknown_charge(call)
                     body["spend_receipt"]["unknown_charge"] = call["unknown_charge"]
                 elif call.get("admission_bound_source"):
-                    # A call with no catalog price whose reply has no final bill is held at its hold, not left
-                    # pending (which would stop every later paid call). Its bill is read again by its ID.
                     hold_unpriced(call)
                     body["spend_receipt"]["unknown_charge"] = call["unknown_charge"]
                 else:
@@ -1038,7 +915,6 @@ def _guarded_call(request, provider, execute, *, tariff=None, execution_key=None
 
 
 def audit_ledger(run_file, document, *, state=None, allow_pending=False):
-    """Cross-check dispatch accounting; only draft reviews may retain known pending receipts."""
     errors = []
     try:
         state = load_ledger(run_file) if state is None else state
@@ -1061,8 +937,6 @@ def audit_ledger(run_file, document, *, state=None, allow_pending=False):
                 saved = read_receipt(run_file, rid)["result"]
                 action = saved.get("attempt", {}).get("action", {})
                 planned = frontier.get(rid, {})
-                # Settlement and response capture precede the parent's route
-                # write. Draft reviews may cross that window; final audit may not.
                 if (saved.get("receipt_status") in {"pending", "response_received", "complete"}
                         and (saved.get("receipt_status") != "complete" or saved.get("status") in
                              DETERMINATE_PROVIDER_STATUSES | BLOCKING_PROVIDER_STATUSES)
@@ -1134,7 +1008,6 @@ def audit_ledger(run_file, document, *, state=None, allow_pending=False):
 
 
 def accounting_summary(state):
-    """Report observed bills separately from unresolved call reservations."""
     if state["version"] == 2:
         return actual_cost_summary(state)
     providers = {}

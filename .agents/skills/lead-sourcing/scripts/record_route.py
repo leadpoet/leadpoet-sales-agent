@@ -97,7 +97,6 @@ _WRITE_LOCK = threading.RLock()
 
 @contextmanager
 def write_lock(path):
-    """Acquire once; the OS releases ownership even after forced termination."""
     path = Path(path)
     legacy = path.with_name(path.name + ".lock")
     lock = path.with_name(path.name + ".write.lock")
@@ -113,14 +112,11 @@ def write_lock(path):
         else:
             import msvcrt
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        # Old writers use O_EXCL on .lock. Keep that exclusion, atomically
-        # identifying our sentinel by inode rather than a PID or expiration.
         try:
             os.link(lock, legacy)
         except FileExistsError:
             if not os.path.samestat(legacy.lstat(), identity):
                 raise FileExistsError(f"Legacy state lock requires owner verification: {legacy}")
-            # The OS lock proves no new writer still owns this linked sentinel.
         owns_sentinel = True
         yield
     finally:
@@ -128,20 +124,16 @@ def write_lock(path):
             if owns_sentinel and os.path.lexists(legacy) and os.path.samestat(legacy.lstat(), os.fstat(fd)):
                 legacy.unlink()
         finally:
-            # Never unlink the OS lock inode: another writer may have opened it.
             os.close(fd)
 
 
 def mutate(path, update):
-    # Keep one lock order for worker state and atomic writes. The linked
-    # sentinel also protects against legacy writers across process restarts.
     with locked(path), _WRITE_LOCK, write_lock(path):
         check_current_worker()
         return _mutate(path, update)
 
 
 def _mutate(path, update):
-    """Apply one state update under the existing lock and atomic-write checks."""
     path = Path(path)
     temporary = None
     try:
