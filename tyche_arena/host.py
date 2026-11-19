@@ -52,7 +52,7 @@ PARALLEL_MIN_ALLOWANCE_MICROUSD = 2_000_000
 # Bonus pass: when research ends with the company target met, one Codex session may add an optional later intent
 # signal to the published companies (ArenaHost.bonus_pass). False leaves the run exactly as without the pass.
 BONUS_PASS = True
-BONUS_PASS_MIN_SECONDS = 900           # start only with this much research time left
+BONUS_PASS_MIN_SECONDS = 600           # start only with this much research time left (was 900; Nov 17: runs meeting the target with 10-15 min left never got the pass)
 BONUS_PASS_END_MARGIN_SECONDS = 480    # end this long before the research deadline; final review keeps the rest
 BONUS_PASS_MAX_SECONDS = 900
 BONUS_PASS_RESTART_SECONDS = 240
@@ -70,7 +70,9 @@ BONUS_PASS_PROMPT = (
     "states the later signal, run search_check with tyche_lookup, then capture its best result with capture_check "
     "(set inputs.url to that result's URL). These are the only two paid lookups for that company. When a captured "
     "passage names the company and states the later signal's event and the day it happened, dated on or after "
-    "window_start, call tyche_review(companies=[{target, decision: 'accept', reason, qualification_checks: [{criterion_id, "
+    "window_start, on a page other than its signal_0_page and about a different event than its signal 0 claim (one event "
+    "told twice is dropped from the published row, and the tools refuse a later signal cited from signal 0's own page), "
+    "call tyche_review(companies=[{target, decision: 'accept', reason, qualification_checks: [{criterion_id, "
     "status: 'pass', claim, evidence: [{ref, text, event_date}]}]}]): claim is one plain sentence that opens with the "
     "company's name and prints the day as the page does, text is copied exactly from the captured page (at most 1,000 "
     "characters), event_date is that day as YYYY-MM-DD. Then approve the confirmation packet it returns (tyche_review "
@@ -712,7 +714,9 @@ def bonus_candidates(run_dir):
             saved = [{"ref": r["route_id"] + ":0", **({"signal_0_page": True} if r["route_id"] in first_routes else {})}
                      for r in routes if r.get("scope") == target and r.get("tool") in CAPTURE_TOOLS
                      and r.get("provider_status") == "ok" and r.get("rows_returned") == 1]
-            saved.sort(key=lambda item: not item.get("signal_0_page"))
+            # Signal 0's own page last: a later signal cited from it is dropped as the same event told twice
+            # (output.company_row) and tools._bonus_pass_item refuses it; its other same-site pages still count.
+            saved.sort(key=lambda item: bool(item.get("signal_0_page")))
             base = {"target": target, "phase": "account_verification", "provider": "deepline"}
             entries.append({
                 "target": target, "name": name, "criterion_id": cid, "criterion": signal, "window_start": start,

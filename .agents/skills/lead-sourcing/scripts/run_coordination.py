@@ -338,10 +338,16 @@ def _focus_seconds(state, worker, current):
     return max(0.0, (datetime.now(timezone.utc) - max(started)).total_seconds())
 
 
-def _focus(state, worker, target):
+def _focus(state, worker, target, finishing=False):
     current = state["workers"][worker].get("current_company")
     if should_yield(state, worker):
         raise WorkerYield("Near the shared budget cutoff, this worker has finished its company. End this invocation now; the remaining worker continues. Do not poll or start another company.")
+    released = state["claims"].get(target) or {}
+    if (finishing and current and current != target and released.get("worker") == worker
+            and released.get("focus_released_after_seconds") is not None):
+        # A review decision (accept, hold or reject) may finish the worker's own company that a focus release set
+        # aside without waiting another 480 s; focus stays on the current company, and lookups keep the 480 s rule.
+        return
     if current and current != target:
         held = _focus_seconds(state, worker, current) if FOCUS_RELEASE_SECONDS else None
         if held is None or held < FOCUS_RELEASE_SECONDS:
@@ -430,7 +436,7 @@ def claim(run_file, worker, generation, target, aliases=(), *, allow_owned_compl
     return result
 
 
-def require_claim(run_file, worker, generation, target, aliases=(), *, focus=False):
+def require_claim(run_file, worker, generation, target, aliases=(), *, focus=False, finishing=False):
     state = snapshot(run_file)
     check_worker(state, worker, generation)
     key = company_key(target)
@@ -446,7 +452,7 @@ def require_claim(run_file, worker, generation, target, aliases=(), *, focus=Fal
     if focus:
         def activate(state):
             check_worker(state, worker, generation)
-            _focus(state, worker, canonical)
+            _focus(state, worker, canonical, finishing=finishing)
         update(run_file, activate)
     return canonical
 

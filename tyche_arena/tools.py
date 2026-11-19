@@ -174,6 +174,17 @@ BONUS_PASS_REFUSAL = ("Bonus pass: {reason} Nothing was saved. If no captured pa
                       "company, save nothing for it and go on to the next company.")
 
 
+
+def _bonus_page_key(url):
+    """A URL compared as one page: lower-case host without www., path without a trailing slash, no query or fragment."""
+    try:
+        parts = urlsplit(str(url or "").strip())
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower().removeprefix("www.")
+    return host + parts.path.rstrip("/") if host else ""
+
+
 def _host(url):
     try:
         host = (urlsplit(str(url or "")).hostname or "").lower()
@@ -997,6 +1008,11 @@ class ArenaResearchTools(ResearchTools):
         hosts = {_host(e.get("url") or e.get("evidence_url"))
                  for c in row.get("qualification_checks") or [] if c.get("criterion_id") == "signal:0"
                  for e in c.get("evidence") or [] if isinstance(e, dict)} - {""}
+        # output.company_row drops a later signal cited from signal 0's own URL (the same event told twice), so a bonus
+        # saved from that page was never published and the pass stopped looking for that company. Refuse it here.
+        first_pages = {_bonus_page_key(e.get("url") or e.get("evidence_url"))
+                       for c in row.get("qualification_checks") or [] if c.get("criterion_id") == "signal:0"
+                       for e in c.get("evidence") or [] if isinstance(e, dict)} - {""}
         for evidence in check["evidence"] if isinstance(check["evidence"], list) else [None]:
             if not isinstance(evidence, dict):
                 refuse("each evidence item is an object with ref, text and event_date.")
@@ -1006,6 +1022,10 @@ class ArenaResearchTools(ResearchTools):
                     url = self._resolve(str(evidence["ref"]))[0].get("url") or url
                 except (ReferenceError, ValueError, OSError, KeyError, TypeError, AttributeError):
                     pass
+            if url and _bonus_page_key(url) in first_pages:
+                refuse("that page is signal 0's own page: a later signal from it is published as the same event told "
+                       "twice and dropped. Cite a different page about a different event, or save nothing for this "
+                       "company.")
             host = _host(url)
             if host and not (_on_host(host, domain) or host in hosts
                              or any(_on_host(host, wire) for wire in BONUS_WIRE_HOSTS)):

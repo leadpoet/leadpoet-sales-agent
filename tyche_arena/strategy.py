@@ -8,8 +8,9 @@ COVERAGE_STRATEGY = (
     'the whole company. So once signal 0 and every other check of a company have passed, and more than fifteen '
     'minutes of research remain, before accepting it look for intent signal 1, unless it is a hiring signal, in '
     'pages already captured '
-    "and in at most two more lookups: first the page that proves signal 0 and other pages on the same site (a "
-    "bonus on the same site verified 86% of the time against 62% elsewhere, and one page may prove both signals), "
+    "and in at most two more lookups: first other pages on the same site as the page that proves signal 0 (a "
+    "bonus on the same site verified 86% of the time against 62% elsewhere), never signal 0's own page, because a "
+    "later signal cited from that page is published as the same event told twice and dropped, "
     "then the company's own newsroom or blog, or a press wire, dated inside that signal's own age limit and showing "
     'the company itself doing the event. Funding, launch, regulatory approval and market expansion bonuses verify '
     'most often; never use a leadership change, and for a partnership the partner must be the kind the signal '
@@ -48,8 +49,9 @@ COVERAGE_STRATEGY = (
     'changelog, release notes or blog post counts and is often the only dated source, so check those pages; for a '
     'hiring event cite the exact URL of one open posting whose title names the requested role family, never a board'
     ' or search list. A recent posting passes far more often than an older one, so take the newest. Its own '
-    'applicant-tracking page is best (for Greenhouse the boards-api.greenhouse.io/v1/boards/<board>/jobs/<id> URL '
-    'also counts), then a job site naming the company, role and city. A posting with no printed date still counts, '
+    'applicant-tracking posting page is best (for Greenhouse the boards.greenhouse.io or job-boards.greenhouse.io '
+    'posting page, never the boards-api.greenhouse.io JSON feed, which verified 3 of 20 because the judge cannot tell '
+    'whose posting it is), then a job site naming the company and role such as builtin.com. A posting with no printed date still counts, '
     'and a linkedin.com/jobs/view page is the last choice but counts too, because the judge reads the posting. It '
     'mostly cannot open jobs.lever.co, jobvite or myworkdayjobs pages: when a posting is only there, cite the same '
     "posting's own page on the company's careers site (never the /careers or /jobs index) or another job site, or prefer a candidate whose posting is on a "

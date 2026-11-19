@@ -10,7 +10,7 @@ import re
 import subprocess
 import threading
 import time
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import budget_guard as budget
 import company_links
@@ -275,6 +275,24 @@ SOURCE = obj({"ref": REFERENCE, "refs": {"type": "array", "items": REFERENCE, "m
     "description": "Saved lookups sharing this reviewed decision and reason; use ref or refs."},
     "state": {"enum": ["exhausted", "continuable", "blocked"]},
     "reason": STRING, "continuations": {"type": "array", "items": REFERENCE}}, ("state", "reason"))
+
+# n15c: Leadpoet company_fit_decision._LINKEDIN_SLUG_RE (origin/main 04e85d7ac), applied to the casefolded page name.
+JUDGE_LINKEDIN_SLUG = re.compile(r"[a-z0-9][a-z0-9._%+-]{0,99}")
+
+
+def _linkedin_company_slug(url):
+    """The casefolded /company/<slug> page name of a LinkedIn company URL, or None when it is not one."""
+    match = re.search(r"linkedin\.com/company/([^/?#\s]+)", str(url or ""), re.I)
+    if not match:
+        return None
+    slug = match.group(1).casefold()
+    decoded = unquote(slug)
+    # company_fit_decision.observed_linkedin_ampersand_slug accepts an '&' page name only in this exact form.
+    if "&" in decoded and re.fullmatch(r"[a-z0-9][a-z0-9_.&-]{0,99}", decoded, re.ASCII):
+        return None
+    return slug
+
+
 class OperationalBlock(ValueError):
     pass
 
@@ -727,9 +745,10 @@ class ResearchTools:
         return hit and (f"{hit} was already seen in an earlier run for this request (request-options.json seen_companies); "
                         "skip it and continue with another company. Nothing was claimed, called or saved.")
 
-    def _owned(self, target, aliases=(), *, focus=False):
+    def _owned(self, target, aliases=(), *, focus=False, finishing=False):
         if self.worker:
-            return coordination.require_claim(self.path, self.worker, self.generation, target, aliases, focus=focus)
+            return coordination.require_claim(self.path, self.worker, self.generation, target, aliases, focus=focus,
+                                              finishing=finishing)
         return company_domain(target)
 
     def call(self, name, arguments):
@@ -1187,6 +1206,16 @@ class ResearchTools:
                     "next": "This record's website is not the claimed domain, so it does not identify the company; do not "
                             "select it. You may fetch once more with the LinkedIn page the company's own captured page links. "
                             "A missing record never holds the company."}
+        slug = _linkedin_company_slug(row.get("company_linkedin_url"))
+        if slug is not None and not JUDGE_LINKEDIN_SLUG.fullmatch(slug):
+            # n15c: Leadpoet's judge refuses a LinkedIn company address whose slug does not start with a letter or digit
+            # (company_fit_decision._linkedin_slug -> identity_unresolved, a terminal mismatch): judgedb Nov 1-14,
+            # EQ Bank (/company/-eqbank) failed identity 11 of 11 across entries.
+            return {"identifies_target": False, "record_linkedin": row.get("company_linkedin_url"),
+                    "next": "Leadpoet's judge rejects this LinkedIn company address (its page name must start with a "
+                            "letter or digit), so a company published with it always fails identity. Do not select it; "
+                            "use another LinkedIn company page the company's own site links, or reject this company "
+                            "and claim the next candidate."}
         fit = {"identifies_target": True}
         hq = next((r for r in row.get("locations") or [] if isinstance(r, dict) and r.get("headquarter") is True), None)
         if hq:
@@ -1634,7 +1663,7 @@ class ResearchTools:
         if refusal := self._seen(*(item["target"] for item in web if item["target"] != "discovery")):
             raise ValueError(refusal)
         with coordination.worker_context(self.path, self.worker, self.generation), coordination.locked(self.path), self._review_lock:
-            companies = [dict(item, target=self._owned(item["target"], focus=True)) for item in companies]
+            companies = [dict(item, target=self._owned(item["target"], focus=True, finishing=True)) for item in companies]
             web = [dict(item, target=self._owned(item["target"])) if item["target"] != "discovery" else item for item in web]
             aliases = {}
             try:

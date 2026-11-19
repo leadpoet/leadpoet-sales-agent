@@ -243,18 +243,24 @@ _ACTIVITY_NOUNS = ((r"\bhiring\b", "hiring"), (r"\blaunch", "launch"), (r"\bpart
 _GLOSS_TAIL = re.compile(r",\s+(?:thereby\s+|further\s+)?(?:expanding|marking|making|bringing|increasing|strengthening|"
                          r"extending|reinforcing|signal(?:l)?ing|reflecting|underscoring|positioning|demonstrating|"
                          r"highlighting|furthering|broadening|deepening|boosting|enhancing|supporting|enabling|allowing|"
-                         r"helping|growing|adding|cementing|solidifying)\b[^.;]*(?=[.;]?\s*$)", re.I)
+                         r"helping|growing|adding|cementing|solidifying|letting)\b[^.;]*(?=[.;]?\s*$)", re.I)
+# A trailing descriptive clause or appositive (", which combines ...", ", a major platform update ...") is one more
+# fact for Leadpoet's paragraph check (11-15: Poshmark, Capital on Tap, Stanwell failed this way, per the 11-16
+# challenger sub-36a8a45d). Removed only when the cited passage does not contain it and no year would be lost.
+_DESCRIPTIVE_TAIL = re.compile(r",\s+(?:which|a|an)\s+[^.;]*(?=[.;]?\s*$)", re.I)
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 _INTENSIFIERS = ("officially", "successfully", "significantly", "strategically", "rapidly", "further")
 
 
 def _unglossed(claim, passage):
     """The claim without an interpretive tail or intensifier the cited passage does not itself contain."""
     text, source = str(claim or ""), " ".join(str(passage or "").casefold().split())
-    match = _GLOSS_TAIL.search(text)
-    if match and " ".join(match.group(0).strip(" ,.;").casefold().split()) not in source:
-        trimmed = text[:match.start()].rstrip(" ,;")
-        if len(trimmed.split()) >= 5:
-            text = trimmed + "."
+    for pattern in (_GLOSS_TAIL, _DESCRIPTIVE_TAIL):
+        match = pattern.search(text)
+        if match and " ".join(match.group(0).strip(" ,.;").casefold().split()) not in source:
+            trimmed = text[:match.start()].rstrip(" ,;")
+            if len(trimmed.split()) >= 5 and (not _YEAR.search(match.group(0)) or _YEAR.search(trimmed)):
+                text = trimmed + "."
     for word in _INTENSIFIERS:
         if word not in source:
             text = re.sub(rf"\b{word}\s+(?=[a-z])", "", text, flags=re.I)
@@ -387,6 +393,13 @@ def intent_details(name, rows, icp, company, industry_proven=False, passages="")
     # its saved sub_industry first, else its saved industry. Otherwise the clause names no offering.
     labels = [_one_line(company.get("sub_industry")), _one_line(company.get("industry"))]
     what = next((label for label in labels if label and label_in_passages(label, passages)), "") if industry_proven else ""
+    # A passed industry check is itself the independent evidence for the company's own reviewed label, so name it even
+    # when no captured passage repeats the label word for word. The generic "expand its business" clause failed the
+    # judge's ICP-connection check on its only judged use in round arena-2026-11-14 (RapidCanvas:
+    # paragraph_relevance_ungrounded, paragraph_icp_connection_missing), while every other entry, the baseline
+    # included, named an offering. Never the request's wording: an unproven industry still names no offering.
+    if not what and industry_proven:
+        what = next((label for label in labels if label), "")
     noun = next((word for pattern, word in _ACTIVITY_NOUNS if re.search(pattern, signal, re.I)), "activity")
     if not what:
         parts.append(f"This {noun} may help {name} expand its business.")
