@@ -761,7 +761,7 @@ class _Receipt:
         self.save()
 
 
-def run(icp):
+def run(icp, *, assigned_model=None):
     runtime, checkpoint = require_lab()
     limit = int(os.environ.get("LAB_ARENA_COMPANY_LIMIT") or icp.get("max_companies") or 5)
     if not 1 <= limit <= 5:
@@ -782,7 +782,7 @@ def run(icp):
     watcher = threading.Thread(target=publisher.watch, daemon=True)
     watcher.start()
     try:
-        _research(runtime, run_dir, run_file, request_file, publisher, guard, research_deadline, response_deadline)
+        _research(runtime, run_dir, run_file, request_file, publisher, guard, research_deadline, response_deadline, assigned_model=assigned_model)
     except Exception as exc:
         print(json.dumps({"tyche_arena_error": type(exc).__name__, "detail": str(exc)[:500]}),
               file=sys.stderr, flush=True)
@@ -814,13 +814,13 @@ def run(icp):
     return rows
 
 
-def _research(runtime, run_dir, run_file, request_file, publisher, guard, research_deadline, response_deadline):
+def _research(runtime, run_dir, run_file, request_file, publisher, guard, research_deadline, response_deadline, *, assigned_model=None):
     started_at = datetime.now(timezone.utc).isoformat()
     workers = research_workers(run_file)
 
     @contextlib.contextmanager
     def configured_session():
-        with runtime.session(model=MODEL, reasoning_effort=REASONING_EFFORT, web_search=WEB_SEARCH,
+        with runtime.session(model=assigned_model or MODEL, reasoning_effort=REASONING_EFFORT, web_search=WEB_SEARCH,
                              request_guard=guard, response_deadline=response_deadline) as session, \
                 contextlib.ExitStack() as relays:
             session.update(
@@ -830,7 +830,8 @@ def _research(runtime, run_dir, run_file, request_file, publisher, guard, resear
                 **({"TYCHE_BONUS_PASS": "enabled"} if BONUS_PASS else {}))
             config = Path(session["CODEX_HOME"]) / "config.toml"
             config.write_text("developer_instructions = " + json.dumps(instructions()) + "\n"
-                              + model_route(compaction_limit(config.read_text()), session, relays)
+                              + (compaction_limit(config.read_text()) if assigned_model else
+                                 model_route(compaction_limit(config.read_text()), session, relays))
                               + tool_configuration(run_file, research_deadline, response_deadline))
             yield session
 
