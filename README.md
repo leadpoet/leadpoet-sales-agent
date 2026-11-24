@@ -8,3 +8,5 @@ The operator calls `harness.run_task(task, model=assigned_model, ...)` on an exa
 The workflow runner is adapted from Poet9B's run loop and mock worlds. The host constructs training scenarios using its guarded builders, grades terminal world state, and retains the original messages and tool results privately. Reference answers and grader notes are never part of the model input. Public source contains no held-out scenario packs or operational credentials.
 
 Run the offline control with `python -m unittest discover -s tests` from this directory. It exercises a real mock-world write, a tool continuation, a final answer, an incorrect returned model, and research dispatch.
+
+For synthetic workflows the operator can pass a verified pre-turn checkpoint to `run_task`. The next model sees the original conversation and tools. The harness restores the simulated files, world and action history before the next call. An optional recorder receives the full tool result and the state before each decision, including the last state when inference fails. The operator controls storage and consent.
